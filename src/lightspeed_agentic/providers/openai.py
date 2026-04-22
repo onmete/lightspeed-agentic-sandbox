@@ -106,10 +106,26 @@ def _build_shell_executor(cwd: str, patterns: list[str] | None) -> Any:
     return executor
 
 
+def _ensure_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI strict mode requires additionalProperties:false on every object."""
+    schema = dict(schema)
+    if schema.get("type") == "object":
+        schema.setdefault("additionalProperties", False)
+        if "properties" in schema:
+            schema["properties"] = {
+                k: _ensure_strict_schema(v) for k, v in schema["properties"].items()
+            }
+    if schema.get("type") == "array" and "items" in schema:
+        schema["items"] = _ensure_strict_schema(schema["items"])
+    return schema
+
+
 def _build_output_schema(schema: dict[str, Any]) -> Any:
     """Wrap raw JSON Schema for the OpenAI SDK's AgentOutputSchemaBase."""
     from agents.agent_output import AgentOutputSchemaBase
     from agents.exceptions import ModelBehaviorError
+
+    strict_schema = _ensure_strict_schema(schema)
 
     class RawJsonSchemaOutput(AgentOutputSchemaBase):
         def __init__(self, json_schema: dict[str, Any]) -> None:
@@ -133,7 +149,7 @@ def _build_output_schema(schema: dict[str, Any]) -> Any:
             except json.JSONDecodeError as e:
                 raise ModelBehaviorError(f"Invalid JSON output: {e}") from e
 
-    return RawJsonSchemaOutput(schema)
+    return RawJsonSchemaOutput(strict_schema)
 
 
 class OpenAIProvider(AgentProvider):
