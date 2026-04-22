@@ -47,7 +47,7 @@ class ClaudeProvider(AgentProvider):
             permission_mode="bypassPermissions",
             cwd=options.cwd,
             skills="all",
-            include_partial_messages=options.stream,
+            include_partial_messages=True,
             **({"output_format": {
                 "type": "json_schema",
                 "schema": options.output_schema,

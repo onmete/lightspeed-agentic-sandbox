@@ -1,5 +1,5 @@
 from lightspeed_agentic.factory import create_provider
-from lightspeed_agentic.logging import log_provider_event
+from lightspeed_agentic.logging import EventLogger
 from lightspeed_agentic.types import (
     AgentProvider,
     ContentBlockStopEvent,
@@ -23,5 +23,5 @@ __all__ = [
     "ToolCallEvent",
     "ToolResultEvent",
     "create_provider",
-    "log_provider_event",
+    "EventLogger",
 ]

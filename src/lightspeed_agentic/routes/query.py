@@ -14,7 +14,7 @@ import os
 
 from fastapi import APIRouter
 
-from lightspeed_agentic.logging import log_provider_event
+from lightspeed_agentic.logging import EventLogger
 from lightspeed_agentic.routes.models import QueryRequest, QueryResponse
 from lightspeed_agentic.tools import DEFAULT_ALLOWED_TOOLS
 from lightspeed_agentic.types import DEFAULT_MODEL, AgentProvider, ProviderQueryOptions
@@ -85,11 +85,12 @@ async def _handle_query(
         text = ""
         cost = 0.0
         tokens = 0
+        event_logger = EventLogger(phase)
 
         async def run() -> None:
             nonlocal text, cost, tokens
             async for event in result:
-                log_provider_event(phase, event)
+                event_logger.log(event)
                 if event.type == "result":
                     text = event.text
                     cost = event.cost_usd
