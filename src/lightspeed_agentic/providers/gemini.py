@@ -100,7 +100,7 @@ class GeminiProvider(AgentProvider):
             session_id=session.id,
             new_message=types.Content(
                 role="user",
-                parts=[types.Part.from_text(options.prompt)],
+                parts=[types.Part(text=options.prompt)],
             ),
             run_config=run_config,
         ):
