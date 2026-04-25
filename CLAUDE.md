@@ -64,6 +64,33 @@ async for event in provider.query(ProviderQueryOptions(
         case "result": print(f"\nCost: ${event.cost_usd:.4f}")
 ```
 
+## Development
+
+```bash
+make venv           # create .venv
+make install-all    # editable install with all providers + dev + eval deps
+make test           # unit tests (mocked, no API calls)
+make lint           # ruff check
+make eval           # provider evals (real API calls, skips missing creds)
+make eval-report    # evals + JSON report at evals/report.json
+```
+
+## Eval Framework
+
+`evals/` tests all 4 providers with real API calls:
+
+- **Structured output** — JSON Schema enforcement via native provider mechanisms
+- **Skill invocation** — dummy skills (calculator, lookup, formatter) in `evals/workspace/skills/`
+- **Tool usage** — bash scripts in `evals/workspace/tools/`
+- **Credential auto-detection** — env vars → gcloud/aws CLI fallback
+- **pytest parametrized** — each test runs for every provider with valid credentials
+
+```bash
+make eval                              # all providers
+.venv/bin/pytest evals/ -k "claude"    # single provider
+.venv/bin/pytest evals/ --eval-report=evals/report.json  # JSON report
+```
+
 ## Integration with lightspeed-service
 
 ```toml

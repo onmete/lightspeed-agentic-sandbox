@@ -45,9 +45,13 @@ class DeepAgentsProvider(AgentProvider):
         skills_dir = resolve_skills_dir(options.cwd)
 
         model: Any = options.model
-        if isinstance(model, str) and model.startswith("google_anthropic_vertex:"):
+        use_vertex = (
+            (isinstance(model, str) and model.startswith("google_anthropic_vertex:"))
+            or os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1"
+        )
+        if use_vertex and isinstance(model, str):
             from langchain_google_vertexai.model_garden import ChatAnthropicVertex
-            model_name = model.split(":", 1)[1]
+            model_name = model.split(":", 1)[1] if ":" in model else model
             model = ChatAnthropicVertex(
                 model_name=model_name,
                 project=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", ""),
