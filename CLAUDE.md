@@ -77,18 +77,12 @@ make eval-report    # evals + JSON report at evals/report.json
 
 ## Eval Framework
 
-`evals/` tests all 4 providers with real API calls:
-
-- **Structured output** — JSON Schema enforcement via native provider mechanisms
-- **Skill invocation** — dummy skills (calculator, lookup, formatter) in `evals/workspace/skills/`
-- **Tool usage** — bash scripts in `evals/workspace/tools/`
-- **Credential auto-detection** — env vars → gcloud/aws CLI fallback
-- **pytest parametrized** — each test runs for every provider with valid credentials
+`evals/` runs 60 tests across 6 providers in parallel. See [`evals/README.md`](evals/README.md) for full documentation.
 
 ```bash
-make eval                              # all providers
-.venv/bin/pytest evals/ -k "claude"    # single provider
-.venv/bin/pytest evals/ --eval-report=evals/report.json  # JSON report
+make eval                              # all providers (parallel)
+pytest evals/ -k claude                # single provider
+make eval-report                       # JSON report at evals/report.json
 ```
 
 ## Integration with lightspeed-service
