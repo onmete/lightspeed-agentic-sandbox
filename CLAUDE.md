@@ -77,10 +77,10 @@ make eval-report    # evals + JSON report at evals/report.json
 
 ## Eval Framework
 
-`evals/` runs 60 tests across 6 providers in parallel. See [`evals/README.md`](evals/README.md) for full documentation.
+`evals/` tests the `/v1/agent/analyze` endpoint against 6 live containers — one per provider. A single test validates skill discovery, tool execution, complex structured output, and token verification. See [`evals/README.md`](evals/README.md) for full documentation.
 
 ```bash
-make eval                              # all providers in container (parallel)
+make eval                              # all 6 providers
 make eval EVAL_ARGS="-k claude"        # single provider
 make eval-report                       # JSON report at evals/report.json
 ```

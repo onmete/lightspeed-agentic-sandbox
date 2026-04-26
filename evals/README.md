@@ -1,18 +1,18 @@
 # Evals
 
-End-to-end evaluations that run against the production container image. Each test is independent and runs in parallel.
+End-to-end evaluations that test the `/v1/agent/analyze` HTTP endpoint against live production containers — matching how the operator invokes the agent in production.
 
-> **Note:** On macOS, the eval suite runs all 60 tests in parallel to save time, which spikes memory usage. Ensure the podman machine has at least 8GB: check with `podman info | grep memTotal`, resize with `podman machine set --memory 8192`.
+> **Note:** On macOS, the eval suite runs 6 containers in parallel. Ensure the podman machine has at least 8GB: check with `podman info | grep memTotal`, resize with `podman machine set --memory 8192`.
 
 ## Contents
 
 - [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
 - [Providers & Models](#providers--models)
-- [Test Categories](#test-categories)
 - [Credentials](#credentials)
 - [Running Evals](#running-evals)
 - [Reports](#reports)
-- [Adding Tests](#adding-tests)
+- [Adding Skills & Tools](#adding-skills--tools)
 
 ## Quick Start
 
@@ -20,7 +20,18 @@ End-to-end evaluations that run against the production container image. Each tes
 make eval
 ```
 
-This builds the production container image, mounts `evals/`, forwards credentials, and runs all 60 tests in parallel.
+This builds the production container image, starts 6 live servers (one per provider), runs `test_find_token_skill` against each via HTTP, and tears everything down.
+
+## How It Works
+
+One test (`test_find_token_skill`) validates the entire stack in a single pass:
+
+1. **Skill discovery** — the model is asked to "Find the hidden token using the 'find-token' skill." Each provider's SDK discovers `SKILL.md` from the workspace using its native mechanism.
+2. **Tool execution** — the SKILL.md instructs the model to run `find-token.sh`, which generates two random tokens (`DIAG_*`, `VERIFY_*`) and writes them to a `.hidden_token` file on a shared volume.
+3. **Complex structured output** — the response must conform to `ANALYSIS_WITH_COMPONENTS_SCHEMA`, which mirrors the operator's `AnalysisOutputSchema` with components: nested objects, arrays, enums, booleans, 4 levels deep.
+4. **Token verification** — the test reads `.hidden_token` from the shared volume and verifies both tokens appear in the model's JSON response. The tokens are random per invocation — the model cannot produce them without executing the script.
+
+No prompt hacks, no begging for output format, no telling the model what command to run. The output schema is enforced by each provider's native mechanism.
 
 ## Providers & Models
 
@@ -35,20 +46,9 @@ This builds the production container image, mounts `evals/`, forwards credential
 
 The `deepagents-*` variants run the same deepagents provider (langchain) with different LLM backends.
 
-## Test Categories
-
-10 tests per provider, 60 total:
-
-| Category | Tests | What it validates |
-|---|---|---|
-| **Basic Query** | `test_basic_response`, `test_cost_tracking` | Prompt/response sanity and token usage reporting |
-| **Structured Output** | `test_analysis_schema`, `test_calculation_schema`, `test_schema_with_enum` | JSON schema enforcement — nested objects, required fields, enum constraints |
-| **Skill Invocation** | `test_calculator_skill`, `test_lookup_skill` | Model discovers and uses skills from `workspace/skills/` |
-| **Tool Usage** | `test_greet_tool`, `test_compute_tool_with_structured_output`, `test_lookup_data_tool` | Model invokes bash scripts from `workspace/tools/` and uses their output |
-
 ## Credentials
 
-Providers without valid credentials are automatically skipped. Credential detection order per provider:
+Providers without valid credentials are automatically skipped.
 
 | Provider | Primary | Fallbacks |
 |---|---|---|
@@ -61,7 +61,7 @@ Providers without valid credentials are automatically skipped. Credential detect
 
 ## Running Evals
 
-Evals always run inside the production container image. Use `EVAL_ARGS` to pass pytest flags.
+`evals/run.sh` starts 6 containers, waits for `/health`, runs pytest against them via HTTP, then tears down. Use `EVAL_ARGS` to pass pytest flags.
 
 ```bash
 # All providers
@@ -70,17 +70,11 @@ make eval
 # Single provider
 make eval EVAL_ARGS="-k claude"
 
-# Single test category
-make eval EVAL_ARGS="-k structured_output"
-
-# Single test + single provider
-make eval EVAL_ARGS="-k 'test_greet_tool and gemini'"
-
 # Override model for a run
 ANTHROPIC_MODEL=claude-opus-4-6 make eval EVAL_ARGS="-k claude"
 
-# Sequential with stdout (debugging)
-make eval EVAL_ARGS="-n0 -s"
+# Verbose with stdout (debugging)
+make eval EVAL_ARGS="-s"
 ```
 
 ## Reports
@@ -91,25 +85,21 @@ Generate a JSON report at `evals/report.json`:
 make eval-report
 ```
 
-## Adding Tests
+## Adding Skills & Tools
 
 ```
-evals/
-├── test_basic_query.py          # basic prompt/response tests
-├── test_skill_invocation.py     # skill discovery and usage tests
-├── test_structured_output.py    # JSON schema enforcement tests
-├── test_tool_usage.py           # bash tool invocation tests
-├── schemas.py                   # reusable JSON Schema definitions
-└── workspace/
-    ├── skills/                  # dummy skills (SKILL.md files)
-    └── tools/                   # bash scripts the model invokes
+evals/workspace/
+├── skills/
+│   └── find-token/
+│       ├── SKILL.md              # skill description + usage
+│       └── tools/
+│           └── find-token.sh     # tool script (co-located with skill)
+└── tools/
+    └── find-token.sh             # tool script (workspace root)
 ```
 
-Everything a test needs is plain text and provider-agnostic:
+- **Skills** — add a `SKILL.md` under `workspace/skills/<name>/`. Each provider's SDK discovers and loads them automatically. Co-locate tool scripts in `tools/` within the skill directory.
+- **Tools** — bash scripts that generate random verification tokens, write them to dot-files on the shared volume, and return structured JSON. The test reads the dot-files to verify the model actually executed the script.
+- **Schemas** — JSON Schema dicts in `schemas.py`, passed as `outputSchema` to the `/analyze` endpoint. The provider enforces structured output using its native mechanism.
 
-- **Prompts** — plain text strings for the task (`prompt`) and role/behavior (`system_prompt`). Nothing provider-specific.
-- **Skills** — add a `SKILL.md` under `workspace/skills/<name>/`. Each provider's SDK discovers and loads them automatically.
-- **Tools** — add a bash script under `workspace/tools/`. The model invokes them via shell.
-- **Schemas** — JSON Schema dicts in `schemas.py`. When passed as `output_schema`, the provider enforces structured JSON output using its native mechanism.
-
-Tests are parametrized across all providers automatically — add a test once and it runs for all 6 providers.
+Tests are parametrized across all 6 providers automatically.
