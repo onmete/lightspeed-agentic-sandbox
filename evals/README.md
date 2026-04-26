@@ -106,17 +106,23 @@ This builds the image, mounts `evals/`, and runs `pytest` inside the container. 
 
 ## Adding Tests
 
-Tests live in 4 files matching the categories above:
-
 ```
 evals/
-├── test_basic_query.py
-├── test_skill_invocation.py
-├── test_structured_output.py
-├── test_tool_usage.py
+├── test_basic_query.py          # basic prompt/response tests
+├── test_skill_invocation.py     # skill discovery and usage tests
+├── test_structured_output.py    # JSON schema enforcement tests
+├── test_tool_usage.py           # bash tool invocation tests
+├── schemas.py                   # reusable JSON Schema definitions
 └── workspace/
-    ├── skills/          # dummy skills (SKILL.md files)
-    └── tools/           # bash scripts the model invokes
+    ├── skills/                  # dummy skills (SKILL.md files)
+    └── tools/                   # bash scripts the model invokes
 ```
 
-Each test receives a `provider_name`, `default_model`, `eval_workspace`, and `eval_runner` fixture. The `eval_runner` handles provider setup, event streaming, and result collection. Tests are parametrized across all providers automatically.
+Everything a test needs is plain text and provider-agnostic:
+
+- **Prompts** — plain text strings for the task (`prompt`) and role/behavior (`system_prompt`). Nothing provider-specific.
+- **Skills** — add a `SKILL.md` under `workspace/skills/<name>/`. Each provider's SDK discovers and loads them automatically.
+- **Tools** — add a bash script under `workspace/tools/`. The model invokes them via shell.
+- **Schemas** — JSON Schema dicts in `schemas.py`. When passed as `output_schema`, the provider enforces structured JSON output using its native mechanism.
+
+Tests are parametrized across all providers automatically — add a test once and it runs for all 6 providers.
