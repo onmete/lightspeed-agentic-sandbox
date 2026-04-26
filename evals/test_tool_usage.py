@@ -41,15 +41,18 @@ async def test_greet_tool(
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
 
+    token_file = eval_workspace / ".greet_token"
+    assert token_file.exists(), f"{provider_name} did not run greet.sh (no .greet_token file)"
+    expected_token = token_file.read_text().strip()
+
     tool_outputs = [e.output for e in result.tool_results]
-    has_tool_evidence = (
-        len(result.tool_calls) > 0
-        or any("Alice" in o for o in tool_outputs)
-        or "Alice" in result.result_text
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from greet.sh. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
     )
-    assert has_tool_evidence, (
-        f"{provider_name} did not invoke greet tool or mention Alice. "
-        f"tool_calls={len(result.tool_calls)}, result={result.result_text[:200]}"
+    assert "Alice" in result.result_text, (
+        f"{provider_name} did not mention Alice. result={result.result_text[:200]}"
     )
 
 
@@ -62,9 +65,8 @@ async def test_compute_tool_with_structured_output(
     """Provider runs compute.sh and returns structured output."""
     result = await eval_runner(ProviderQueryOptions(
         prompt=(
-            "Run the compute tool to calculate 42 * 3 by executing: "
-            "bash tools/compute.sh '42 * 3'\n"
-            "Report which tools you used and the output."
+            "Run: bash tools/compute.sh '42 * 3'\n"
+            "Report which tools you used, the output, and the verification token."
         ),
         system_prompt="You are an assistant. Execute bash commands to accomplish tasks.",
         model=default_model,
@@ -76,11 +78,19 @@ async def test_compute_tool_with_structured_output(
     ))
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
-
-    if provider_name == "gemini" and not result.result_text:
-        pytest.xfail("Gemini ADK output_schema disables tools (google/adk-python#5054)")
-
     assert result.result_text, f"{provider_name} returned empty result"
+
+    token_file = eval_workspace / ".compute_token"
+    assert token_file.exists(), f"{provider_name} did not run compute.sh (no .compute_token file)"
+    expected_token = token_file.read_text().strip()
+
+    tool_outputs = [e.output for e in result.tool_results]
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from compute.sh. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
+    )
+
     parsed = json.loads(result.result_text)
     jsonschema.validate(parsed, TOOL_USAGE_SCHEMA)
     assert parsed["success"] is True
@@ -96,7 +106,7 @@ async def test_lookup_data_tool(
     result = await eval_runner(ProviderQueryOptions(
         prompt=(
             "Run: bash tools/lookup-data.sh version\n"
-            "Tell me the version number from the output."
+            "Tell me the version number and verification token from the output."
         ),
         system_prompt="You are an assistant. Execute bash commands to retrieve data.",
         model=default_model,
@@ -108,12 +118,17 @@ async def test_lookup_data_tool(
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
 
+    token_file = eval_workspace / ".lookup_token"
+    assert token_file.exists(), f"{provider_name} did not run lookup-data.sh (no .lookup_token file)"
+    expected_token = token_file.read_text().strip()
+
     tool_outputs = [e.output for e in result.tool_results]
-    has_version = (
-        any("2.1.0" in o for o in tool_outputs)
-        or "2.1.0" in result.result_text
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from lookup-data.sh. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
     )
-    assert has_version, (
-        f"{provider_name} did not find version 2.1.0. "
-        f"tool_outputs={tool_outputs}, result={result.result_text[:200]}"
+    assert "2.1.0" in result.result_text, (
+        f"{provider_name} did not report version 2.1.0. "
+        f"result={result.result_text[:200]}"
     )

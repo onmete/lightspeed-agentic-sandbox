@@ -1,3 +1,5 @@
 #!/bin/bash
 # Usage: bash tools/greet.sh NAME
-echo "Hello, ${1:-World}! The current time is $(date +%H:%M:%S)."
+TOKEN=$(head -c 8 /dev/urandom | base64 | tr -d '=/+')
+echo "GREET_${TOKEN}" > .greet_token
+echo "Hello, ${1:-World}! Verification: GREET_${TOKEN}"
