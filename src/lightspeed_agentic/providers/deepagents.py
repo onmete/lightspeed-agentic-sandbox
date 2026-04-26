@@ -79,6 +79,27 @@ def _resolve_field_type(schema: dict[str, Any], name: str) -> type:
     return _JSON_SCHEMA_TYPE_MAP.get(json_type, str)
 
 
+def _resolve_model(model: str) -> Any:
+    """Map a bare model name to a provider:model string for init_chat_model.
+
+    Deepagents uses langchain's init_chat_model which needs a provider prefix
+    for non-obvious model names (e.g. 'google_genai:gemini-2.5-flash').
+    Bare 'claude-*' and 'gpt-*'/'o1*'/'o3*' are auto-detected by langchain.
+    """
+    if ":" in model:
+        return model
+
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1" and model.startswith("claude"):
+        return f"google_anthropic_vertex:{model}"
+
+    if model.startswith("gemini"):
+        if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+            return f"google_genai:{model}"
+        return f"google_vertexai:{model}"
+
+    return model
+
+
 class DeepAgentsProvider(AgentProvider):
     @property
     def name(self) -> str:
@@ -92,19 +113,7 @@ class DeepAgentsProvider(AgentProvider):
         backend = LocalShellBackend(root_dir=options.cwd, inherit_env=True)
         skills_dir = resolve_skills_dir(options.cwd)
 
-        model: Any = options.model
-        use_vertex = (
-            (isinstance(model, str) and model.startswith("google_anthropic_vertex:"))
-            or os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1"
-        )
-        if use_vertex and isinstance(model, str):
-            from langchain_google_vertexai.model_garden import ChatAnthropicVertex
-            model_name = model.split(":", 1)[1] if ":" in model else model
-            model = ChatAnthropicVertex(
-                model_name=model_name,
-                project=os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", ""),
-                location=os.environ.get("CLOUD_ML_REGION", "us-east5"),
-            )
+        model: Any = _resolve_model(options.model)
 
         agent_kwargs: dict[str, Any] = {
             "model": model,

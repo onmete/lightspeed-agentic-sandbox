@@ -121,6 +121,32 @@ def _check_openai() -> ProviderCredentialStatus:
 
 
 def _check_deepagents() -> ProviderCredentialStatus:
+    model = os.environ.get("DEEPAGENTS_MODEL", "claude-opus-4-6")
+
+    if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
+        if os.environ.get("OPENAI_API_KEY"):
+            return ProviderCredentialStatus(
+                "deepagents", True, "env", f"OPENAI_API_KEY set (model: {model})",
+            )
+        return ProviderCredentialStatus(
+            "deepagents", False, "none",
+            f"OPENAI_API_KEY not set for model {model}",
+        )
+
+    if model.startswith("gemini"):
+        if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+            return ProviderCredentialStatus(
+                "deepagents", True, "env", f"Google API key set (model: {model})",
+                env_vars={"GOOGLE_API_KEY": os.environ.get("GEMINI_API_KEY", "")}
+                if os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY")
+                else {},
+            )
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return ProviderCredentialStatus(
+            "deepagents", True, "env", "ANTHROPIC_API_KEY set",
+        )
+
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     if gac and os.path.isfile(gac):
         return ProviderCredentialStatus(
@@ -135,7 +161,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
 
     return ProviderCredentialStatus(
         "deepagents", False, "none",
-        "No DeepAgents credentials: set GOOGLE_APPLICATION_CREDENTIALS or configure gcloud ADC",
+        "No DeepAgents credentials: set ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, or configure gcloud ADC",
     )
 
 
