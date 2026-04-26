@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lightspeed_agentic.types import (
     AgentProvider,
@@ -57,3 +58,26 @@ async def run_eval(
 
     result.latency_seconds = time.monotonic() - start
     return result
+
+
+def assert_tool_token(
+    eval_workspace: Path,
+    token_file_name: str,
+    result: EvalResult,
+    provider_name: str,
+    script_name: str,
+) -> None:
+    token_file = eval_workspace / token_file_name
+    try:
+        expected_token = token_file.read_text().strip()
+    except FileNotFoundError:
+        raise AssertionError(
+            f"{provider_name} did not run {script_name} (no {token_file_name} file)"
+        )
+
+    tool_outputs = [e.output for e in result.tool_results]
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from {script_name}. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
+    )

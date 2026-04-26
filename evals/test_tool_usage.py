@@ -11,7 +11,7 @@ import pytest
 
 from lightspeed_agentic.types import ProviderQueryOptions
 
-from .runner import EvalResult
+from .runner import EvalResult, assert_tool_token
 from .schemas import TOOL_USAGE_SCHEMA
 
 
@@ -40,17 +40,7 @@ async def test_greet_tool(
     ))
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
-
-    token_file = eval_workspace / ".greet_token"
-    assert token_file.exists(), f"{provider_name} did not run greet.sh (no .greet_token file)"
-    expected_token = token_file.read_text().strip()
-
-    tool_outputs = [e.output for e in result.tool_results]
-    all_text = " ".join(tool_outputs) + " " + result.result_text
-    assert expected_token in all_text, (
-        f"{provider_name} did not report the verification token from greet.sh. "
-        f"expected={expected_token}, result={result.result_text[:200]}"
-    )
+    assert_tool_token(eval_workspace, ".greet_token", result, provider_name, "greet.sh")
     assert "Alice" in result.result_text, (
         f"{provider_name} did not mention Alice. result={result.result_text[:200]}"
     )
@@ -79,17 +69,7 @@ async def test_compute_tool_with_structured_output(
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
     assert result.result_text, f"{provider_name} returned empty result"
-
-    token_file = eval_workspace / ".compute_token"
-    assert token_file.exists(), f"{provider_name} did not run compute.sh (no .compute_token file)"
-    expected_token = token_file.read_text().strip()
-
-    tool_outputs = [e.output for e in result.tool_results]
-    all_text = " ".join(tool_outputs) + " " + result.result_text
-    assert expected_token in all_text, (
-        f"{provider_name} did not report the verification token from compute.sh. "
-        f"expected={expected_token}, result={result.result_text[:200]}"
-    )
+    assert_tool_token(eval_workspace, ".compute_token", result, provider_name, "compute.sh")
 
     parsed = json.loads(result.result_text)
     jsonschema.validate(parsed, TOOL_USAGE_SCHEMA)
@@ -117,17 +97,7 @@ async def test_lookup_data_tool(
     ))
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
-
-    token_file = eval_workspace / ".lookup_token"
-    assert token_file.exists(), f"{provider_name} did not run lookup-data.sh (no .lookup_token file)"
-    expected_token = token_file.read_text().strip()
-
-    tool_outputs = [e.output for e in result.tool_results]
-    all_text = " ".join(tool_outputs) + " " + result.result_text
-    assert expected_token in all_text, (
-        f"{provider_name} did not report the verification token from lookup-data.sh. "
-        f"expected={expected_token}, result={result.result_text[:200]}"
-    )
+    assert_tool_token(eval_workspace, ".lookup_token", result, provider_name, "lookup-data.sh")
     assert "2.1.0" in result.result_text, (
         f"{provider_name} did not report version 2.1.0. "
         f"result={result.result_text[:200]}"
