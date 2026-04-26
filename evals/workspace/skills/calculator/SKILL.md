@@ -1,31 +1,26 @@
 ---
 name: calculator
-description: Perform arithmetic calculations. Use when asked to compute, calculate, or do math. Supports basic operations (add, subtract, multiply, divide) and expressions.
-allowed-tools: Bash(python3:*) Bash(echo:*)
+description: Perform arithmetic calculations and return verified results. The calc.sh script returns a verification token that must be included in your response.
+allowed-tools: Bash(bash:*)
 ---
 
 # Calculator Skill
 
-Evaluate arithmetic expressions using Python.
+Evaluate arithmetic expressions using the calculator script. The script returns a JSON object with the numeric result and a verification token.
 
 ## Usage
 
 ```bash
-python3 -c "print(eval('EXPRESSION'))"
+bash tools/calc.sh 'EXPRESSION'
 ```
+
+## Output Format
+
+The script returns JSON with the numeric result and a unique verification token.
 
 ## Examples
 
 ```bash
-# Addition
-python3 -c "print(eval('2 + 3'))"
-
-# Complex expression
-python3 -c "print(eval('(10 * 5) + 3'))"
+bash tools/calc.sh '2 + 3'
+# Returns: {"result": 5, "token": "CALC_..."}
 ```
-
-## Rules
-
-1. Only use basic arithmetic operators: +, -, *, /, //, %, **
-2. Always use python3 for calculation
-3. Print only the numeric result

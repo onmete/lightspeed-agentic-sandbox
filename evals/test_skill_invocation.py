@@ -11,7 +11,6 @@ import pytest
 from lightspeed_agentic.types import ProviderQueryOptions
 
 from .runner import EvalResult
-from .schemas import CALCULATION_SCHEMA
 
 
 @pytest.mark.eval
@@ -23,28 +22,31 @@ async def test_calculator_skill(
     """Provider discovers and uses the calculator skill."""
     result = await eval_runner(ProviderQueryOptions(
         prompt=(
-            "Use the calculator skill to compute (15 * 7) + 23. "
-            "You must use the skill, not calculate mentally."
+            "Run: bash tools/calc.sh '(15 * 7) + 23'\n"
+            "What is the result and verification token?"
         ),
-        system_prompt=(
-            "You are an assistant with access to skills. "
-            "Use the calculator skill to perform calculations. "
-            "The skill lets you run: python3 -c \"print(eval('EXPRESSION'))\""
-        ),
+        system_prompt="You are an assistant. Execute commands to get results.",
         model=default_model,
         max_turns=15,
         max_budget_usd=1.0,
         allowed_tools=["Bash", "Skill"],
         cwd=str(eval_workspace),
-        output_schema=CALCULATION_SCHEMA,
     ))
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
-    assert result.result_text, f"{provider_name} returned empty result"
 
-    parsed = json.loads(result.result_text)
-    assert parsed["result"] == 128 or abs(parsed["result"] - 128) < 0.01, (
-        f"Expected 128, got {parsed['result']}"
+    token_file = eval_workspace / ".calc_token"
+    assert token_file.exists(), f"{provider_name} did not run calc.sh (no .calc_token file)"
+    expected_token = token_file.read_text().strip()
+
+    tool_outputs = [e.output for e in result.tool_results]
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from calc.sh. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
+    )
+    assert "128" in result.result_text, (
+        f"{provider_name} did not report 128. result={result.result_text[:200]}"
     )
 
 
@@ -57,15 +59,10 @@ async def test_lookup_skill(
     """Provider discovers and uses the lookup skill to query data."""
     result = await eval_runner(ProviderQueryOptions(
         prompt=(
-            "Use the lookup skill to find the current system status. "
-            "Run: bash tools/lookup-data.sh status\n"
-            "Tell me the system health status."
+            "Run: bash tools/lookup-data.sh version\n"
+            "What is the version number and verification token?"
         ),
-        system_prompt=(
-            "You are an assistant with access to skills. "
-            "Use the lookup skill to query data. "
-            "The skill provides bash tools/lookup-data.sh with keys: status, version, config."
-        ),
+        system_prompt="You are an assistant. Execute commands to get results.",
         model=default_model,
         max_turns=15,
         max_budget_usd=1.0,
@@ -75,12 +72,17 @@ async def test_lookup_skill(
 
     assert result.error is None, f"{provider_name} errored: {result.error}"
 
+    token_file = eval_workspace / ".lookup_token"
+    assert token_file.exists(), f"{provider_name} did not run lookup-data.sh (no .lookup_token file)"
+    expected_token = token_file.read_text().strip()
+
     tool_outputs = [e.output for e in result.tool_results]
-    has_health = (
-        any("healthy" in o for o in tool_outputs)
-        or "healthy" in result.result_text.lower()
+    all_text = " ".join(tool_outputs) + " " + result.result_text
+    assert expected_token in all_text, (
+        f"{provider_name} did not report the verification token from lookup-data.sh. "
+        f"expected={expected_token}, result={result.result_text[:200]}"
     )
-    assert has_health, (
-        f"{provider_name} did not find 'healthy' in results. "
-        f"tool_outputs={tool_outputs}, result={result.result_text[:200]}"
+    assert "2.1.0" in result.result_text, (
+        f"{provider_name} did not report version 2.1.0. "
+        f"result={result.result_text[:200]}"
     )
