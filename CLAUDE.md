@@ -84,18 +84,3 @@ make eval                              # all providers (parallel)
 pytest evals/ -k claude                # single provider
 make eval-report                       # JSON report at evals/report.json
 ```
-
-## Integration with lightspeed-service
-
-```toml
-# In lightspeed-service/pyproject.toml
-dependencies = [
-    "lightspeed-agentic[all] @ git+https://github.com/harche/lightspeed-agentic-sandbox",
-]
-```
-
-```python
-# In lightspeed-service router
-from lightspeed_agentic import create_provider
-provider = create_provider()
-```
