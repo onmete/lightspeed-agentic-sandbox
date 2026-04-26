@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from lightspeed_agentic.tools import resolve_skills_dir
 from lightspeed_agentic.types import (
@@ -29,6 +29,54 @@ from lightspeed_agentic.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_JSON_SCHEMA_TYPE_MAP: dict[str, type] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+}
+
+
+def _json_schema_to_pydantic(schema: dict[str, Any], name: str = "OutputModel") -> type:
+    import pydantic
+
+    if "properties" not in schema:
+        raise ValueError(f"Schema {name!r} missing 'properties'")
+
+    props = schema["properties"]
+    required = set(schema.get("required", []))
+    fields: dict[str, Any] = {}
+
+    for field_name, field_schema in props.items():
+        field_type = _resolve_field_type(field_schema, field_name)
+        if field_name in required:
+            fields[field_name] = (field_type, ...)
+        else:
+            fields[field_name] = (field_type | None, None)
+
+    return pydantic.create_model(name, **fields)
+
+
+def _resolve_field_type(schema: dict[str, Any], name: str) -> type:
+    if "type" not in schema and "enum" not in schema:
+        raise ValueError(f"Field {name!r} missing 'type'")
+
+    json_type = schema.get("type", "string")
+
+    if json_type == "object":
+        return _json_schema_to_pydantic(schema, name.title().replace("_", ""))
+
+    if json_type == "array":
+        if "items" not in schema:
+            raise ValueError(f"Array field {name!r} missing 'items'")
+        inner = _resolve_field_type(schema["items"], name + "Item")
+        return list[inner]  # type: ignore[valid-type]
+
+    if "enum" in schema:
+        return Literal[tuple(schema["enum"])]  # type: ignore[valid-type]
+
+    return _JSON_SCHEMA_TYPE_MAP.get(json_type, str)
 
 
 class DeepAgentsProvider(AgentProvider):
@@ -66,10 +114,7 @@ class DeepAgentsProvider(AgentProvider):
         }
 
         if options.output_schema:
-            # langchain ToolStrategy passes dict as args_schema to StructuredTool,
-            # which expects a Pydantic model — convert dict to Pydantic first.
             if isinstance(options.output_schema, dict):
-                from lightspeed_agentic.providers.gemini import _json_schema_to_pydantic
                 agent_kwargs["response_format"] = _json_schema_to_pydantic(options.output_schema)
             else:
                 agent_kwargs["response_format"] = options.output_schema

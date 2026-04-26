@@ -14,6 +14,8 @@ DEFAULT_MODEL = "claude-opus-4-6"
 def stringify(value: Any) -> str:
     if isinstance(value, str):
         return value
+    if hasattr(value, "model_dump"):
+        return json.dumps(value.model_dump(exclude_none=True))
     return json.dumps(value) if value else ""
 
 
