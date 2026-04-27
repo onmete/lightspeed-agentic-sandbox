@@ -42,10 +42,10 @@ image: ## Build production container image
 EVAL_ARGS ?=
 
 eval: image ## Run evals against live containers (use EVAL_ARGS to filter, e.g. EVAL_ARGS="-k claude")
-	bash evals/run.sh $(EVAL_ARGS)
+	PYTEST="$(UV) run pytest" bash evals/run.sh $(EVAL_ARGS)
 
 eval-report: image ## Run evals and generate JSON report
-	bash evals/run.sh --eval-report=evals/report.json $(EVAL_ARGS)
+	PYTEST="$(UV) run pytest" bash evals/run.sh --eval-report=evals/report.json $(EVAL_ARGS)
 
 clean: ## Remove build artifacts and caches
 	rm -rf dist/ build/ *.egg-info .venv .pytest_cache .mypy_cache .ruff_cache
