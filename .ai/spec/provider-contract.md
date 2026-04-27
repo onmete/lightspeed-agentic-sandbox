@@ -45,9 +45,12 @@ types above. They must not:
 - Add business logic (timeouts, budgets, prompt assembly) —
   that belongs in the route layer.
 
-Shared path logic (skills directory resolution, default tool
-lists) lives in a central utility module. Providers call it;
-they do not duplicate it.
+Shared path logic (default tool lists) lives in a central
+utility module. Skills directory resolution is used by
+Gemini, OpenAI, and Deep Agents to find skill files within
+the mounted directory. Claude does not use this resolution —
+it passes the raw skills directory as its working directory
+and relies on the SDK's native `skills="all"` discovery.
 
 ## Structured output
 

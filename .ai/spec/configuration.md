@@ -55,6 +55,12 @@ order:
 This supports multiple packaging conventions without
 requiring configuration changes.
 
+**Note:** Claude does not use this resolution chain. It
+receives the raw skills directory as its working directory
+and relies on its SDK's native skill discovery. The
+subdirectory fallback only applies to Gemini, OpenAI, and
+Deep Agents.
+
 ## Timeouts
 
 | Setting | Default | Used by |
