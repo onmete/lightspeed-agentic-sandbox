@@ -9,8 +9,9 @@ evals.
 ## Quick Commands
 
 ```bash
-make venv                              # create .venv
+make install                           # create/update .venv with dev dependencies via uv
 make install-all                       # install all providers + dev + eval extras
+make lock                              # refresh uv.lock after dependency changes
 make test                              # unit tests only; mocked providers, no API calls
 make lint                              # ruff check src/ tests/ evals/
 make format                            # ruff format + autofix
@@ -89,8 +90,8 @@ helpers.
 - Do not make unit tests hit real model APIs. Live coverage belongs in `evals/`.
 - Do not edit `evals/workspace/skills` or `evals/workspace/tools` without
   checking how `evals/run.sh` copies and mounts them.
-- Do not add `uvicorn` to non-dev dependencies in `pyproject.toml`. The package
-  exposes an ASGI app; process management is a deployment concern.
+- Keep runtime dependencies aligned with the shipped container entrypoint. If
+  the image invokes a module directly, declare it in `pyproject.toml`.
 - Do not turn this file back into a long-form architecture tutorial. It should
   stay focused on how an agent works in this repo.
 

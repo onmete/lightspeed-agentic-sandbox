@@ -10,6 +10,8 @@ FROM registry.redhat.io/rhel9/python-312:latest
 
 USER 0
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
 # Enable EPEL for ripgrep
 RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
 
@@ -77,9 +79,9 @@ RUN dnf install -y --nodocs nodejs && dnf clean all && \
     claude --version
 
 # Install Python package
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY src/ src/
-RUN pip install --no-cache-dir ".[all,eval]"
+RUN uv sync --frozen --no-dev --extra all --extra eval
 
 # dumb-init for proper signal propagation to child processes
 RUN dnf install -y --nodocs dumb-init && dnf clean all
@@ -93,6 +95,7 @@ RUN usermod -d /home/agent -l agent default && \
 ENV SHELL="/bin/bash"
 ENV HOME="/home/agent"
 ENV LIGHTSPEED_SKILLS_DIR="/app/skills"
+ENV PATH="/app/.venv/bin:${PATH}"
 
 USER 1001:1001
 
