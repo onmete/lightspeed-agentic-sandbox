@@ -9,8 +9,8 @@ import pytest
 
 from .credentials import PROVIDER_NAMES, detect_all
 from .report import pytest_addoption, pytest_configure, store_eval_result  # noqa: F401
-from .runner import AnalyzeResult
-from .runner import run_analyze as _run_analyze
+from .runner import RunResult as AnalyzeResult
+from .runner import run_query as _run_query
 
 
 def _parse_env_map(var: str, _cache: dict[str, dict[str, str]] | None = None) -> dict[str, str]:
@@ -71,14 +71,14 @@ def eval_workspace(provider_name: str) -> Path:
 
 @pytest.fixture
 def eval_runner(server_url: str, provider_name: str, request: pytest.FixtureRequest):
-    """Returns an async callable that POSTs to /v1/agent/analyze."""
+    """Returns an async callable that POSTs to /v1/agent/run."""
 
     async def _run(
         query: str,
         system_prompt: str = "You are a helpful assistant.",
         output_schema: dict | None = None,
     ) -> AnalyzeResult:
-        result = await _run_analyze(server_url, query, system_prompt, output_schema)
+        result = await _run_query(server_url, query, system_prompt, output_schema)
         result.provider = provider_name
         store_eval_result(request.node, result)
         return result

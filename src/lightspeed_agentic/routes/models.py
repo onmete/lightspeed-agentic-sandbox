@@ -56,3 +56,24 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel, extra="allow"):
     success: bool
     summary: str
+
+
+class RunRequest(BaseModel):
+    """Step-agnostic request for POST /run.
+
+    The caller (operator) controls behaviour entirely through the payload —
+    the agent has no awareness of which workflow step it is serving.
+    """
+
+    query: str
+    systemPrompt: str | None = None
+    outputSchema: dict[str, Any] | None = None
+    context: QueryContext | None = None
+    timeout_ms: int | None = None
+
+
+class RunResponse(BaseModel, extra="allow"):
+    """Response from POST /run — same shape as QueryResponse."""
+
+    success: bool
+    summary: str
