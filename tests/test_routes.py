@@ -191,15 +191,36 @@ async def test_run_with_output_schema():
 
 
 @pytest.mark.asyncio
-async def test_run_with_timeout():
+async def test_run_with_timeout_applied():
+    """Verify timeout_ms is actually used: a slow provider exceeds a 1ms timeout."""
+    import asyncio
+
+    class SlowProvider(MockProvider):
+        async def query(self, _options):
+            await asyncio.sleep(0.1)
+            async for event in super().query(_options):
+                yield event
+
+    app = _make_app(SlowProvider())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/agent/run",
+            json={"query": "test", "timeout_ms": 1},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is False
+        assert "timed out" in data["summary"].lower()
+
+
+@pytest.mark.asyncio
+async def test_run_with_timeout_default():
+    """Without timeout_ms the server default applies and the fast mock succeeds."""
     app = _make_app(MockProvider())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             "/v1/agent/run",
-            json={
-                "query": "Diagnose",
-                "timeout_ms": 60000,
-            },
+            json={"query": "Diagnose"},
         )
         assert resp.status_code == 200
         assert resp.json()["success"] is True
