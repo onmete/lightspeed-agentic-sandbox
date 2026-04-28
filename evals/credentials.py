@@ -169,19 +169,19 @@ def _check_openai() -> ProviderCredentialStatus:
     )
 
 
-def _check_deepagents() -> ProviderCredentialStatus:
+def _check_deepagents_claude() -> ProviderCredentialStatus:
     model = os.environ.get("DEEPAGENTS_MODEL", "claude-opus-4-6")
 
     if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
         if os.environ.get("OPENAI_API_KEY"):
             return ProviderCredentialStatus(
-                "deepagents",
+                "deepagents-claude",
                 True,
                 "env",
                 f"OPENAI_API_KEY set (model: {model})",
             )
         return ProviderCredentialStatus(
-            "deepagents",
+            "deepagents-claude",
             False,
             "none",
             f"OPENAI_API_KEY not set for model {model}",
@@ -191,7 +191,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
         os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     ):
         return ProviderCredentialStatus(
-            "deepagents",
+            "deepagents-claude",
             True,
             "env",
             f"Google API key set (model: {model})",
@@ -202,7 +202,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
 
     if os.environ.get("ANTHROPIC_API_KEY"):
         return ProviderCredentialStatus(
-            "deepagents",
+            "deepagents-claude",
             True,
             "env",
             "ANTHROPIC_API_KEY set",
@@ -211,7 +211,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     if gac and os.path.isfile(gac):
         return ProviderCredentialStatus(
-            "deepagents",
+            "deepagents-claude",
             True,
             "env",
             "GOOGLE_APPLICATION_CREDENTIALS file (Vertex AI)",
@@ -220,14 +220,14 @@ def _check_deepagents() -> ProviderCredentialStatus:
     ok, _ = _run_quiet(["gcloud", "auth", "application-default", "print-access-token"])
     if ok:
         return ProviderCredentialStatus(
-            "deepagents",
+            "deepagents-claude",
             True,
             "gcloud",
             "gcloud application-default credentials",
         )
 
     return ProviderCredentialStatus(
-        "deepagents",
+        "deepagents-claude",
         False,
         "none",
         "No DeepAgents credentials: set ANTHROPIC_API_KEY, GOOGLE_API_KEY, "
@@ -253,7 +253,7 @@ _CHECKERS = {
     "claude": _check_claude,
     "gemini": _check_gemini,
     "openai": _check_openai,
-    "deepagents": _check_deepagents,
+    "deepagents-claude": _check_deepagents_claude,
     "deepagents-gemini": _check_deepagents_gemini,
     "deepagents-openai": _check_deepagents_openai,
 }

@@ -18,7 +18,7 @@ if [ -f "$GCLOUD_ADC" ]; then
     GCLOUD_MOUNT="-v $GCLOUD_ADC:/tmp/gcloud-adc.json:ro,Z -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-adc.json"
 fi
 
-PROVIDERS=("claude" "gemini" "openai" "deepagents" "deepagents-gemini" "deepagents-openai")
+PROVIDERS=("claude" "gemini" "openai" "deepagents-claude" "deepagents-gemini" "deepagents-openai")
 CONTAINERS=()
 WORKDIRS=()
 OUTDIRS=()
@@ -40,7 +40,7 @@ trap cleanup EXIT
 # Map provider names to LIGHTSPEED_AGENT_PROVIDER values
 provider_env() {
     case "$1" in
-        deepagents-gemini|deepagents-openai) echo "deepagents" ;;
+        deepagents-claude|deepagents-gemini|deepagents-openai) echo "deepagents" ;;
         *) echo "$1" ;;
     esac
 }
@@ -51,7 +51,7 @@ model_env() {
         claude)            echo "-e ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-6}" ;;
         gemini)            echo "-e GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.1-pro-preview}" ;;
         openai)            echo "-e OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.4}" ;;
-        deepagents)        echo "-e DEEPAGENTS_MODEL=${DEEPAGENTS_MODEL:-claude-opus-4-6}" ;;
+        deepagents-claude) echo "-e DEEPAGENTS_MODEL=${DEEPAGENTS_MODEL:-claude-opus-4-6}" ;;
         deepagents-gemini) echo "-e DEEPAGENTS_MODEL=${DEEPAGENTS_GEMINI_MODEL:-gemini-3.1-pro-preview}" ;;
         deepagents-openai) echo "-e DEEPAGENTS_MODEL=${DEEPAGENTS_OPENAI_MODEL:-gpt-5.4}" ;;
     esac

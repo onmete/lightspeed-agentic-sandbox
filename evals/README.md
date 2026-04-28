@@ -40,7 +40,7 @@ No prompt hacks, no begging for output format, no telling the model what command
 | `claude` | `claude-sonnet-4-6` | `ANTHROPIC_MODEL` |
 | `gemini` | `gemini-3.1-pro-preview` | `GEMINI_MODEL` |
 | `openai` | `gpt-5.4` | `OPENAI_MODEL` |
-| `deepagents` | `claude-opus-4-6` | `DEEPAGENTS_MODEL` |
+| `deepagents-claude` | `claude-opus-4-6` | `DEEPAGENTS_MODEL` |
 | `deepagents-gemini` | `gemini-3.1-pro-preview` | `DEEPAGENTS_GEMINI_MODEL` |
 | `deepagents-openai` | `gpt-5.4` | `DEEPAGENTS_OPENAI_MODEL` |
 
@@ -55,7 +55,7 @@ Providers without valid credentials are automatically skipped.
 | `claude` | `ANTHROPIC_API_KEY` | Vertex AI (`CLAUDE_CODE_USE_VERTEX=1` + gcloud ADC), Bedrock (`CLAUDE_CODE_USE_BEDROCK=1` + AWS creds) |
 | `gemini` | `GOOGLE_API_KEY` | `GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` file, gcloud ADC |
 | `openai` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` (keyless endpoints) |
-| `deepagents` | Depends on model | Checks credentials matching the configured `DEEPAGENTS_MODEL` |
+| `deepagents-claude` | Depends on model | Checks credentials matching the configured `DEEPAGENTS_MODEL` |
 | `deepagents-gemini` | Same as `gemini` | — |
 | `deepagents-openai` | Same as `openai` | — |
 
