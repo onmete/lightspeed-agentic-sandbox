@@ -91,13 +91,22 @@ helpers.
   Prefer exercising real route/provider glue over deep mocking of SDK internals.
 - Route tests should build a FastAPI app with `build_router(...)` and use
   `httpx.AsyncClient` plus `ASGITransport`.
-- `make eval` and `make eval-report` are integration-only checks. They build the
+- `tests/e2e/` contains BDD feature tests written in Gherkin (`pytest-bdd`).
+  They verify the service's behavioral contract as defined in `.ai/spec/`. Run
+  with `make e2e`. Features map to specs: `schema_compliance.feature` →
+  `query-api.md`, `chat_sse.feature` → `chat-api.md`,
+  `skill_invocation.feature` → `provider-contract.md`. The E2E suite is
+  standalone — it has its own runner, schemas, credentials, and conftest with no
+  imports from `evals/`.
+- `make eval` and `make eval-report` are model-quality checks. They build the
   container image, start one container per provider, and run evals against live
   `/v1/agent/analyze` endpoints.
-- See [`evals/README.md`](evals/README.md) for eval setup, credential handling,
-  provider coverage, and report details.
-- Evals are container-only. If you change eval workspace fixtures, skills, or
-  mounted tool behavior, verify the corresponding assumptions in `evals/run.sh`.
+- Both `make e2e` and `make eval` use `scripts/start-containers.sh` for container
+  lifecycle. See [`evals/README.md`](evals/README.md) for eval setup, credential
+  handling, provider coverage, and report details.
+- Evals and E2E tests are container-only. If you change workspace fixtures,
+  skills, or mounted tool behavior, verify the corresponding assumptions in
+  `scripts/start-containers.sh`.
 
 ## What To Avoid
 

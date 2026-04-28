@@ -3,7 +3,7 @@ UV := uv
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 IMAGE := lightspeed-agentic-sandbox:latest
 
-.PHONY: install install-all lock test lint format mypy verify eval eval-report image clean help
+.PHONY: install install-all lock test lint format mypy verify eval eval-report e2e image clean help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -19,7 +19,7 @@ lock: ## Refresh uv.lock from pyproject.toml
 	$(UV) lock
 
 test: ## Run unit tests
-	$(UV) run pytest tests/ -v
+	$(UV) run pytest tests/ -v --ignore=tests/e2e
 
 lint: ## Run ruff linter
 	$(UV) run ruff check .
@@ -40,12 +40,16 @@ image: ## Build production container image
 	$(CONTAINER_RUNTIME) build -t $(IMAGE) .
 
 EVAL_ARGS ?=
+E2E_ARGS ?=
 
-eval: image ## Run evals against live containers (use EVAL_ARGS to filter, e.g. EVAL_ARGS="-k claude")
-	PYTEST="$(UV) run pytest" bash evals/run.sh $(EVAL_ARGS)
+eval: image ## Run model-quality evals against live containers (use EVAL_ARGS to filter)
+	PYTEST="$(UV) run pytest" bash scripts/start-containers.sh evals/ -v $(EVAL_ARGS)
 
 eval-report: image ## Run evals and generate JSON report
-	PYTEST="$(UV) run pytest" bash evals/run.sh --eval-report=evals/report.json $(EVAL_ARGS)
+	PYTEST="$(UV) run pytest" bash scripts/start-containers.sh evals/ -v --eval-report=evals/report.json $(EVAL_ARGS)
+
+e2e: image ## Run E2E BDD contract tests against live containers (use E2E_ARGS to filter)
+	PYTEST="$(UV) run pytest" bash scripts/start-containers.sh tests/e2e/ -v $(E2E_ARGS)
 
 clean: ## Remove build artifacts and caches
 	rm -rf dist/ build/ *.egg-info .venv .pytest_cache .mypy_cache .ruff_cache

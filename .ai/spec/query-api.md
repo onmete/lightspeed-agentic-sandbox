@@ -76,3 +76,9 @@ listed.
 Query routes do not use streaming — the provider runs to
 completion and the handler waits for the final result event.
 Streaming is reserved for the chat endpoint.
+
+## Verification
+
+`tests/e2e/features/schema_compliance.feature` — schema
+conformance for all three query endpoints, response wrapping
+behavior.

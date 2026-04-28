@@ -97,3 +97,9 @@ Chat uses a separate budget from query routes: default $1.00
 per message and 30 max turns. These are lower because chat
 is interactive — individual messages should be cheaper and
 faster than autonomous query runs.
+
+## Verification
+
+`tests/e2e/features/chat_sse.feature` — SSE event ordering,
+done event invariant, conversation continuity, tool call
+event structure.

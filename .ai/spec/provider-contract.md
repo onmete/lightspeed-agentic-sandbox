@@ -86,3 +86,9 @@ on SDK support and is not a provider-level requirement yet.
 - Retry or fallback logic — that belongs upstream.
 - Request validation — the route layer validates before
   calling the provider.
+
+## Verification
+
+`tests/e2e/features/skill_invocation.feature` — skill
+discovery, tool execution, structured output conformance
+across all providers.
