@@ -6,6 +6,21 @@ When editing it, optimize for thin provider wrappers, consistent event mapping,
 and tests that stay offline unless you are intentionally running containerized
 evals.
 
+## Behavioral Specs
+
+Before changing code, read the relevant spec in `.ai/spec/`:
+
+| Working on | Read |
+|---|---|
+| Provider adapters | [provider-contract.md](.ai/spec/provider-contract.md) |
+| Query routes (analyze/execute/verify) | [query-api.md](.ai/spec/query-api.md) |
+| Chat endpoint or SSE streaming | [chat-api.md](.ai/spec/chat-api.md) |
+| Deployment, env vars, or defaults | [configuration.md](.ai/spec/configuration.md) |
+
+Specs capture invariants, design decisions, and known quirks that the code
+cannot express about itself. The code and this file cover the "how" — specs
+cover the "why" and the "must."
+
 ## Quick Commands
 
 ```bash
