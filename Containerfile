@@ -79,6 +79,7 @@ RUN dnf install -y --nodocs nodejs && dnf clean all && \
     claude --version
 
 # Install Python package
+COPY LICENSE /licenses/LICENSE
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ src/
 RUN uv sync --frozen --no-dev --extra all --extra eval
