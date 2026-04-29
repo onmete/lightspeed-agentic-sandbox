@@ -173,6 +173,8 @@ spec:
       params:
       - name: input
         value: $(params.prefetch-input)
+      - name: mode
+        value: 'permissive'
       - name: enable-package-registry-proxy
         value: $(params.enable-package-registry-proxy)
       - name: SOURCE_ARTIFACT
