@@ -1,6 +1,6 @@
 # Evals
 
-End-to-end evaluations that test the `/v1/agent/analyze` HTTP endpoint against live production containers — matching how the operator invokes the agent in production.
+End-to-end evaluations that test the `/v1/agent/run` HTTP endpoint against live production containers — matching how the operator invokes the agent in production.
 
 > **Note:** On macOS, the eval suite runs 6 containers in parallel. Ensure the podman machine has at least 8GB: check with `podman info | grep memTotal`, resize with `podman machine set --memory 8192`.
 
@@ -100,6 +100,6 @@ evals/workspace/
 
 - **Skills** — add a `SKILL.md` under `workspace/skills/<name>/`. Each provider's SDK discovers and loads them automatically. Co-locate tool scripts in `tools/` within the skill directory.
 - **Tools** — bash scripts that generate random verification tokens, write them to dot-files on the shared volume, and return structured JSON. The test reads the dot-files to verify the model actually executed the script.
-- **Schemas** — JSON Schema dicts in `schemas.py`, passed as `outputSchema` to the `/analyze` endpoint. The provider enforces structured output using its native mechanism.
+- **Schemas** — JSON Schema dicts in `schemas.py`, passed as `outputSchema` to the `/run` endpoint. The provider enforces structured output using its native mechanism.
 
 Tests are parametrized across all 6 providers automatically.

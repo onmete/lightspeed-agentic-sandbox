@@ -1,8 +1,11 @@
-"""Generic query endpoints — maps to lightspeed-agent/src/agent.ts.
+"""Query endpoints — maps to lightspeed-agent/src/agent.ts.
 
-POST /analyze, /execute, /verify all use the same handler with different
-phase labels. The operator sends {query, systemPrompt, outputSchema, context}
-and the agent runs the LLM and returns {success, summary, ...structured fields}.
+POST /run is the primary step-agnostic endpoint. The operator sends
+{query, systemPrompt, outputSchema, context} and the agent runs the LLM
+and returns {success, summary, ...structured fields}.
+
+POST /analyze, /execute, /verify are deprecated aliases kept for backward
+compatibility during migration.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from typing import Any
 from fastapi import APIRouter
 
 from lightspeed_agentic.logging import EventLogger
-from lightspeed_agentic.routes.models import QueryRequest, QueryResponse
+from lightspeed_agentic.routes.models import QueryRequest, QueryResponse, RunRequest, RunResponse
 from lightspeed_agentic.tools import DEFAULT_ALLOWED_TOOLS
 from lightspeed_agentic.types import DEFAULT_MODEL, AgentProvider, ProviderQueryOptions
 
@@ -130,10 +133,7 @@ async def _handle_query(
         return QueryResponse(success=True, summary=text)
 
 
-# TODO: collapse into a single POST /query with a phase field in the request body.
-# All three endpoints use the same handler — differentiation is entirely in the
-# operator's request (systemPrompt, outputSchema), not here.
-_PHASE_ENDPOINTS = [
+_DEPRECATED_PHASE_ENDPOINTS = [
     ("/analyze", "analysis"),
     ("/execute", "execution"),
     ("/verify", "verification"),
@@ -144,6 +144,8 @@ _PHASE_TIMEOUTS: dict[str, str] = {
     "execution": "execution",
     "verification": "analysis",
 }
+
+_DEFAULT_RUN_PHASE = "run"
 
 
 def register_query_routes(
@@ -166,13 +168,39 @@ def register_query_routes(
     resolved_model = model or os.environ.get(env_var, DEFAULT_MODEL)
     timeouts = {"analysis": analysis_timeout_ms, "execution": execution_timeout_ms}
 
-    for path, phase in _PHASE_ENDPOINTS:
+    async def run_endpoint(req: RunRequest) -> RunResponse:
+        timeout = req.timeout_ms if req.timeout_ms is not None else analysis_timeout_ms
+        result = await _handle_query(
+            QueryRequest(
+                query=req.query,
+                systemPrompt=req.systemPrompt,
+                outputSchema=req.outputSchema,
+                context=req.context,
+            ),
+            _DEFAULT_RUN_PHASE,
+            provider,
+            skills_dir,
+            resolved_model,
+            max_turns,
+            timeout,
+        )
+        return RunResponse(success=result.success, summary=result.summary, **{
+            k: v for k, v in result.model_dump().items() if k not in ("success", "summary")
+        })
 
-        async def endpoint(
+    router.add_api_route("/run", run_endpoint, methods=["POST"], response_model=RunResponse)
+
+    for path, phase in _DEPRECATED_PHASE_ENDPOINTS:
+
+        async def legacy_endpoint(
             req: QueryRequest,
             _phase: str = phase,
             _timeout_key: str = _PHASE_TIMEOUTS[phase],
+            _path: str = path,
         ) -> QueryResponse:
+            logger.warning(
+                "Deprecated endpoint %s called — migrate to POST /run", _path,
+            )
             return await _handle_query(
                 req,
                 _phase,
@@ -183,4 +211,7 @@ def register_query_routes(
                 timeouts.get(_timeout_key, analysis_timeout_ms),
             )
 
-        router.add_api_route(path, endpoint, methods=["POST"], response_model=QueryResponse)
+        router.add_api_route(
+            path, legacy_endpoint, methods=["POST"],
+            response_model=QueryResponse, deprecated=True,
+        )
