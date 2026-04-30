@@ -3,7 +3,8 @@ UV := uv
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 IMAGE := lightspeed-agentic-sandbox:latest
 
-.PHONY: install install-all lock test lint format mypy verify eval eval-report image clean help
+.PHONY: install install-all lock test lint format mypy verify eval eval-report image clean help \
+       requirements bump-deps rpm-lockfile
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -47,6 +48,26 @@ eval: image ## Run evals against live containers (use EVAL_ARGS to filter, e.g. 
 eval-report: image ## Run evals and generate JSON report
 	PYTEST="$(UV) run pytest" bash evals/run.sh --eval-report=evals/report.json $(EVAL_ARGS)
 
+requirements: pyproject.toml ## Generate requirements.txt files for Konflux hermetic builds
+	$(UV) pip compile pyproject.toml --extra all --extra eval \
+		-o requirements.x86_64.txt --generate-hashes \
+		--python-platform x86_64-unknown-linux-gnu --upgrade
+	$(UV) pip compile pyproject.toml --extra all --extra eval \
+		-o requirements.aarch64.txt --generate-hashes \
+		--python-platform aarch64-unknown-linux-gnu --upgrade
+
+bump-deps: ## Upgrade all dependencies and regenerate requirements
+	$(UV) lock --upgrade
+	$(MAKE) requirements
+
+rpm-lockfile: rpms.in.yaml ubi.repo ## Regenerate rpms.lock.yaml (requires podman + Fedora)
+	$(CONTAINER_RUNTIME) run --rm -v "$$(pwd):/workdir:z" -w /workdir \
+		registry.fedoraproject.org/fedora:latest bash -c " \
+		dnf install -y -q python3 python3-pip python3-dnf skopeo rpm && \
+		python3 -m pip install -q --break-system-packages \
+			https://github.com/konflux-ci/rpm-lockfile-prototype/archive/refs/heads/main.zip && \
+		rpm-lockfile-prototype --image registry.redhat.io/rhel9/python-312:latest rpms.in.yaml"
+
 clean: ## Remove build artifacts and caches
-	rm -rf dist/ build/ *.egg-info .venv .pytest_cache .mypy_cache .ruff_cache
+	rm -rf dist/ build/ *.egg-info .venv .pytest_cache .mypy_cache .ruff_cache node_modules/
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

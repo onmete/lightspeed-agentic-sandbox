@@ -30,7 +30,9 @@ spec:
   - name: dockerfile
     value: Containerfile
   - name: hermetic
-    value: "false"
+    value: "true"
+  - name: prefetch-input
+    value: '[{"type": "rpm", "path": "."}, {"type": "pip", "path": ".", "requirements_files": ["requirements.x86_64.txt", "requirements.aarch64.txt"], "requirements_build_files": ["requirements-build.txt"], "binary": {}}, {"type": "npm", "path": "."}, {"type": "generic", "path": "."}]'
   - name: build-platforms
     value:
     - linux/x86_64
@@ -171,6 +173,8 @@ spec:
       params:
       - name: input
         value: $(params.prefetch-input)
+      - name: mode
+        value: 'permissive'
       - name: enable-package-registry-proxy
         value: $(params.enable-package-registry-proxy)
       - name: SOURCE_ARTIFACT

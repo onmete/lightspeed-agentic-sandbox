@@ -1,0 +1,5 @@
+#
+# Build dependencies for hermetic builds.
+# Empty because we use "binary": {} in prefetch-input, which fetches
+# pre-built wheels for all packages. No source compilation needed.
+#

@@ -1,0 +1,9 @@
+{
+  "name": "lightspeed-agentic-sandbox-deps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "npm dependencies for lightspeed-agentic-sandbox container image",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "*"
+  }
+}

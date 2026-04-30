@@ -1,0 +1,33 @@
+---
+metadata:
+  version: "1.0"
+artifacts:
+  # OpenShift CLI (oc + kubectl) — x86_64
+  - download_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz"
+    checksum: "sha256:da31d56b291c2aee47d0ba24cf17a43e0b50dec633234b09483236a79d64adf0"
+    filename: "openshift-client-linux-x86_64.tar.gz"
+
+  # OpenShift CLI (oc + kubectl) — aarch64
+  - download_url: "https://mirror.openshift.com/pub/openshift-v4/aarch64/clients/ocp/stable/openshift-client-linux.tar.gz"
+    checksum: "sha256:f01344022628b3bab46141e3ed7130a405eb30575cb21bb921d92108988786d4"
+    filename: "openshift-client-linux-aarch64.tar.gz"
+
+  # ripgrep 15.1.0 — x86_64 (musl static binary)
+  - download_url: "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz"
+    checksum: "sha256:1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"
+    filename: "ripgrep-x86_64.tar.gz"
+
+  # ripgrep 15.1.0 — aarch64
+  - download_url: "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz"
+    checksum: "sha256:2b661c6ef508e902f388e9098d9c4c5aca72c87b55922d94abdba830b4dc885e"
+    filename: "ripgrep-aarch64.tar.gz"
+
+  # dumb-init 1.2.5 — x86_64
+  - download_url: "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64"
+    checksum: "sha256:e874b55f3279ca41415d290c512a7ba9d08f98041b28ae7c2acb19a545f1c4df"
+    filename: "dumb-init-x86_64"
+
+  # dumb-init 1.2.5 — aarch64
+  - download_url: "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_aarch64"
+    checksum: "sha256:b7d648f97154a99c539b63c55979cd29f005f88430fb383007fe3458340b795e"
+    filename: "dumb-init-aarch64"

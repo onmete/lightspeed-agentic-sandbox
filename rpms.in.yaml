@@ -1,0 +1,27 @@
+packages:
+  - git
+  - jq
+  - wget
+  - nodejs
+  - procps-ng
+  - iproute
+  - bind-utils
+  - net-tools
+  - openssl
+  - lsof
+  - strace
+  - tcpdump
+  - less
+  - vim-minimal
+  - findutils
+  - file
+  - diffutils
+  - skopeo
+  - unzip
+  - tar
+  - gzip
+  - python3.12
+  - python3.12-pip
+contentOrigin:
+  repofiles: ["./ubi.repo"]
+arches: [x86_64, aarch64]

@@ -99,6 +99,48 @@ helpers.
 - Evals are container-only. If you change eval workspace fixtures, skills, or
   mounted tool behavior, verify the corresponding assumptions in `evals/run.sh`.
 
+## Konflux Hermetic Builds
+
+The container image is built in [Konflux](https://konflux-ci.dev/) with hermetic
+builds enabled — all dependencies are prefetched and verified before the build
+starts, with no network access during the build itself.
+
+### Dependency files
+
+| File | Purpose | How to regenerate |
+|---|---|---|
+| `requirements.x86_64.txt` | Python deps with hashes (x86_64) | `make requirements` |
+| `requirements.aarch64.txt` | Python deps with hashes (aarch64) | `make requirements` |
+| `requirements-build.txt` | Build-time deps (empty — we use wheels) | N/A |
+| `rpms.in.yaml` | System RPM package list | Edit manually |
+| `rpms.lock.yaml` | Resolved RPM lockfile | `make rpm-lockfile` |
+| `ubi.repo` | UBI 9 repo definitions for RPM resolution | Rarely changes |
+| `artifacts.lock.yaml` | External binaries (oc, ripgrep, dumb-init) | Edit manually, update checksums |
+| `package.json` / `package-lock.json` | npm deps (claude-code CLI) | `npm install --package-lock-only` |
+
+### Bumping dependencies
+
+```bash
+make bump-deps          # upgrade uv.lock + regenerate requirements.{arch}.txt
+make rpm-lockfile       # regenerate rpms.lock.yaml (needs podman)
+npm update              # update package-lock.json for claude-code
+```
+
+After bumping, commit all changed lockfiles and requirements files together.
+The Konflux pipeline will prefetch the new versions on the next PR.
+
+### Adding a new system package
+
+1. Add the package name to `rpms.in.yaml`
+2. Run `make rpm-lockfile` to regenerate `rpms.lock.yaml`
+3. Add the `dnf install` line to the appropriate section in `Containerfile`
+
+### Adding a new external binary
+
+1. Add an entry to `artifacts.lock.yaml` with the download URL, checksum, and
+   filename (per-arch if needed)
+2. Add the install logic to the generic-fetcher section in `Containerfile`
+
 ## What To Avoid
 
 - Do not add top-level imports of provider SDK packages in `src/lightspeed_agentic/providers/`.
