@@ -71,7 +71,7 @@ def _resolve_field_type(schema: dict[str, Any], name: str) -> Any:
         if "items" not in schema:
             raise ValueError(f"Array field {name!r} missing 'items'")
         item_type = _resolve_field_type(schema["items"], f"{name}_item")
-        return list[item_type]
+        return list[item_type]  # type: ignore[valid-type]
 
     if "enum" in schema:
         return Literal[tuple(schema["enum"])]
