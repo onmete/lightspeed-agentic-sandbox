@@ -57,6 +57,30 @@ class StreamingMockProvider(AgentProvider):
         )
 
 
+class ErrorMockProvider(AgentProvider):
+    """Provider that raises after yielding one event."""
+
+    @property
+    def name(self) -> str:
+        return "error_mock"
+
+    async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+        yield TextDeltaEvent(text="partial ")
+        raise RuntimeError("provider exploded")
+
+
+class TimeoutMockProvider(AgentProvider):
+    """Provider that raises TimeoutError."""
+
+    @property
+    def name(self) -> str:
+        return "timeout_mock"
+
+    async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+        yield TextDeltaEvent(text="start ")
+        raise TimeoutError("too slow")
+
+
 @pytest.fixture
 def mock_provider() -> MockProvider:
     return MockProvider()

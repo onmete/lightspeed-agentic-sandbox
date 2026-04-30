@@ -24,6 +24,7 @@ all = ["lightspeed-agentic[claude,gemini,openai,deepagents]"]
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
+    "pytest-cov>=6.2.1",
     "httpx>=0.28.1",
     "mypy>=1.20.2",
     "ruff>=0.15.12",
@@ -46,6 +47,13 @@ select = ["A", "ARG", "ASYNC", "B", "E", "F", "I", "N", "PT", "RUF", "S", "SIM",
 "evals/**/*.py" = ["S101"]
 "src/lightspeed_agentic/routes/chat.py" = ["N815"]
 "src/lightspeed_agentic/routes/models.py" = ["N815"]
+
+[tool.coverage.run]
+source = ["src/lightspeed_agentic"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 0
 
 [tool.mypy]
 python_version = "3.12"

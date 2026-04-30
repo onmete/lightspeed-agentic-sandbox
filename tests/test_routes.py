@@ -9,9 +9,14 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from lightspeed_agentic.routes import build_router
-from lightspeed_agentic.types import ResultEvent, TextDeltaEvent, ThinkingDeltaEvent
+from lightspeed_agentic.types import (
+    ContentBlockStopEvent,
+    ResultEvent,
+    TextDeltaEvent,
+    ThinkingDeltaEvent,
+)
 
-from .conftest import MockProvider, StreamingMockProvider
+from .conftest import ErrorMockProvider, MockProvider, StreamingMockProvider, TimeoutMockProvider
 
 
 def _ag_ui_events(body: str) -> list[dict]:
@@ -262,3 +267,191 @@ async def test_chat_reasoning_ag_ui():
         assert "REASONING_MESSAGE_CONTENT" in types
         assert "REASONING_MESSAGE_END" in types
         assert "REASONING_END" in types
+
+
+def _chat_json(message: str = "hi") -> dict:
+    return {
+        "message": message,
+        "context": {
+            "remediation": {"name": "r", "namespace": "ns"},
+            "alert": {"name": "a", "status": "firing", "severity": "low"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_run_error_on_exception():
+    """Provider exception emits RunError as terminal event — no RunFinished."""
+    app = _make_app(ErrorMockProvider())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        assert evs[0]["type"] == "RUN_STARTED"
+        assert evs[-1]["type"] == "RUN_ERROR"
+        assert "provider exploded" in evs[-1]["message"]
+        assert not any(e["type"] == "RUN_FINISHED" for e in evs)
+
+
+@pytest.mark.asyncio
+async def test_chat_run_error_on_timeout():
+    """TimeoutError emits RunError with timeout message."""
+    app = _make_app(TimeoutMockProvider())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        assert evs[0]["type"] == "RUN_STARTED"
+        assert evs[-1]["type"] == "RUN_ERROR"
+        assert "timed out" in evs[-1]["message"].lower()
+        assert not any(e["type"] == "RUN_FINISHED" for e in evs)
+
+
+@pytest.mark.asyncio
+async def test_chat_tool_call_id_correlation():
+    """toolCallId is consistent across ToolCallStart, Args, End, and Result."""
+    app = _make_app(StreamingMockProvider())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+
+        starts = [e for e in evs if e["type"] == "TOOL_CALL_START"]
+        assert len(starts) == 1
+        tcid = starts[0]["toolCallId"]
+        assert starts[0]["toolCallName"] == "bash"
+
+        args = [e for e in evs if e["type"] == "TOOL_CALL_ARGS"]
+        assert len(args) == 1
+        assert args[0]["toolCallId"] == tcid
+
+        ends = [e for e in evs if e["type"] == "TOOL_CALL_END"]
+        assert len(ends) == 1
+        assert ends[0]["toolCallId"] == tcid
+
+        results = [e for e in evs if e["type"] == "TOOL_CALL_RESULT"]
+        assert len(results) == 1
+        assert results[0]["toolCallId"] == tcid
+
+
+@pytest.mark.asyncio
+async def test_chat_text_message_lifecycle():
+    """TextMessageStart/Content/End share the same messageId."""
+    provider = MockProvider(
+        events=[
+            TextDeltaEvent(text="chunk1 "),
+            TextDeltaEvent(text="chunk2"),
+            ContentBlockStopEvent(),
+            ResultEvent(text="chunk1 chunk2"),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+
+        start = next(e for e in evs if e["type"] == "TEXT_MESSAGE_START")
+        mid = start["messageId"]
+        assert start["role"] == "assistant"
+
+        contents = [e for e in evs if e["type"] == "TEXT_MESSAGE_CONTENT"]
+        assert len(contents) == 2
+        assert all(c["messageId"] == mid for c in contents)
+        assert contents[0]["delta"] == "chunk1 "
+        assert contents[1]["delta"] == "chunk2"
+
+        end = next(e for e in evs if e["type"] == "TEXT_MESSAGE_END")
+        assert end["messageId"] == mid
+
+
+@pytest.mark.asyncio
+async def test_chat_reasoning_lifecycle_ordering():
+    """Reasoning events appear in the correct AG-UI lifecycle order."""
+    provider = MockProvider(
+        events=[
+            ThinkingDeltaEvent(thinking="thought A"),
+            ThinkingDeltaEvent(thinking="thought B"),
+            TextDeltaEvent(text="answer"),
+            ResultEvent(text="answer"),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        types = [e["type"] for e in evs]
+
+        rs = types.index("REASONING_START")
+        rms = types.index("REASONING_MESSAGE_START")
+        rmc_first = types.index("REASONING_MESSAGE_CONTENT")
+        rme = types.index("REASONING_MESSAGE_END")
+        re_ = types.index("REASONING_END")
+        assert rs < rms < rmc_first < rme < re_
+
+        reasoning_msgs = [e for e in evs if e["type"] == "REASONING_MESSAGE_CONTENT"]
+        assert len(reasoning_msgs) == 2
+        assert reasoning_msgs[0]["delta"] == "thought A"
+        assert reasoning_msgs[1]["delta"] == "thought B"
+
+
+@pytest.mark.asyncio
+async def test_chat_content_block_stop_closes_reasoning():
+    """ContentBlockStop while reasoning is active closes the reasoning lifecycle."""
+    provider = MockProvider(
+        events=[
+            ThinkingDeltaEvent(thinking="think"),
+            ContentBlockStopEvent(),
+            TextDeltaEvent(text="answer"),
+            ResultEvent(text="answer"),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        types = [e["type"] for e in evs]
+        assert "REASONING_END" in types
+        re_idx = types.index("REASONING_END")
+        txt_idx = types.index("TEXT_MESSAGE_START")
+        assert re_idx < txt_idx
+
+
+@pytest.mark.asyncio
+async def test_chat_fence_partial_and_malformed_json():
+    """Partial fence suffix is held back; malformed JSON inside fence is silently dropped."""
+    provider = MockProvider(
+        events=[
+            TextDeltaEvent(text="before`"),
+            TextDeltaEvent(text='``ui:chart\n{"bad json}\n```after'),
+            ContentBlockStopEvent(),
+            ResultEvent(text=""),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        custom = [e for e in evs if e["type"] == "CUSTOM" and e.get("name") == "ui_component"]
+        assert len(custom) == 0
+        contents = [e for e in evs if e["type"] == "TEXT_MESSAGE_CONTENT"]
+        full_text = "".join(c["delta"] for c in contents)
+        assert "before" in full_text
+        assert "after" in full_text
+
+
+@pytest.mark.asyncio
+async def test_chat_fence_unclosed_flushed_as_text():
+    """Unclosed fence at end of stream is flushed as plain text."""
+    provider = MockProvider(
+        events=[
+            TextDeltaEvent(text='start ```ui:viz\n{"partial": true'),
+            ResultEvent(text='start ```ui:viz\n{"partial": true'),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/agent/chat", json=_chat_json())
+        evs = _ag_ui_events(resp.text)
+        custom = [e for e in evs if e["type"] == "CUSTOM"]
+        assert len(custom) == 0
+        contents = [e for e in evs if e["type"] == "TEXT_MESSAGE_CONTENT"]
+        full_text = "".join(c["delta"] for c in contents)
+        assert "start" in full_text
+        assert "viz" in full_text
