@@ -110,7 +110,7 @@ RUN usermod -d /home/agent -l agent default && \
 ENV SHELL="/bin/bash"
 ENV HOME="/home/agent"
 ENV LIGHTSPEED_SKILLS_DIR="/app/skills"
-ENV PYTHONPATH="/opt/app-root/lib64/python3.12/site-packages"
+ENV PYTHONPATH="/app/src:/opt/app-root/lib64/python3.12/site-packages"
 ENV PATH="/usr/local/bin:${PATH}"
 
 USER 1001:1001

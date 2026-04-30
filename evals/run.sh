@@ -82,6 +82,7 @@ for i in "${!PROVIDERS[@]}"; do
         -v "${workdir}:/app/workspace:Z" \
         -v "${outdir}:/app/eval-output:Z" \
         -e EVAL_OUTPUT_DIR="/app/eval-output" \
+        -e PYTHONPATH="/app/src:/opt/app-root/lib64/python3.12/site-packages" \
         $GCLOUD_MOUNT \
         -e LIGHTSPEED_AGENT_PROVIDER="$agent_provider" \
         -e LIGHTSPEED_SKILLS_DIR="/app/workspace" \
