@@ -9,6 +9,18 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "ag-ui-protocol"
+version = "0.1.18"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4c/d7/5711eada86da9bd7684e58645653a1693ef20b66cc3efbb1deeafef80f8d/ag_ui_protocol-0.1.18.tar.gz", hash = "sha256:b37c672c3fd6bac12b316c39f45ad9db9f137bbb885489c79f268507029a22ff", size = 9937, upload-time = "2026-04-21T20:44:59.151Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/74/913c9b8fc566c6da650aecbddf25a5d8186b54138df265eb9eb546f56141/ag_ui_protocol-0.1.18-py3-none-any.whl", hash = "sha256:d151c0f0a34160647f1571163f7185746f4326b15a56d1560de5082a7a0e7a12", size = 12607, upload-time = "2026-04-21T20:45:00.097Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1859,6 +1871,7 @@ name = "lightspeed-agentic"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "ag-ui-protocol" },
     { name = "fastapi" },
     { name = "uvicorn" },
 ]
@@ -1912,6 +1925,7 @@ openai = [
 
 [package.metadata]
 requires-dist = [
+    { name = "ag-ui-protocol", specifier = ">=0.1.18" },
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.1.68" },
     { name = "deepagents", marker = "extra == 'deepagents'", specifier = ">=0.5.3" },
     { name = "fastapi", specifier = ">=0.136.1" },

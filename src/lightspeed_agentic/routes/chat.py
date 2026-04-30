@@ -7,21 +7,44 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncGenerator
-from typing import Any
+from collections.abc import AsyncGenerator, Iterator
+from dataclasses import dataclass
+from typing import Any, Literal
 
+from ag_ui.core import (
+    CustomEvent,
+    EventType,
+    ReasoningEndEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningMessageStartEvent,
+    ReasoningStartEvent,
+    RunErrorEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    TextMessageStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    ToolCallResultEvent,
+    ToolCallStartEvent,
+)
+from ag_ui.encoder import EventEncoder
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from lightspeed_agentic.tools import DEFAULT_ALLOWED_TOOLS
-from lightspeed_agentic.types import AgentProvider, ProviderQueryOptions
+from lightspeed_agentic.types import AgentProvider, ProviderEvent, ProviderQueryOptions
 
 logger = logging.getLogger("lightspeed_agentic")
 
 _MAX_CONVERSATIONS = 100
 _CONVERSATION_TTL_S = 3600
 _MAX_HISTORY_MESSAGES = 20
+
+_FenceMarker = tuple[Literal["text"], str] | tuple[Literal["ui"], str, dict[str, Any]]
 
 
 class _ConversationEntry(BaseModel):
@@ -69,23 +92,18 @@ class ChatRequest(BaseModel, extra="allow"):
     context: dict[str, Any]
 
 
-def _sse_event(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
 _FENCE_OPEN = re.compile(r"```ui:(\w+)\n")
 _FENCE_PARTIAL = re.compile(r"`{1,3}(?:u(?:i(?::(?:\w+)?)?)?)?$")
 
 
 class _FenceBuffer:
+    """Buffers streamed model text; extracts ui:type fenced blocks into structured markers."""
+
     def __init__(self) -> None:
         self.buf = ""
         self.in_fence = False
         self.fence_type = ""
-        self._pending: list[str] = []
-
-    def emit(self, event_str: str) -> None:
-        self._pending.append(event_str)
+        self._pending: list[_FenceMarker] = []
 
     def add(self, text: str) -> None:
         self.buf += text
@@ -102,9 +120,7 @@ class _FenceBuffer:
                 self.in_fence = False
                 try:
                     props = json.loads(json_str)
-                    self._pending.append(
-                        _sse_event("ui_component", {"type": self.fence_type, "props": props})
-                    )
+                    self._pending.append(("ui", self.fence_type, props))
                 except (json.JSONDecodeError, TypeError):
                     pass
                 self.fence_type = ""
@@ -113,7 +129,7 @@ class _FenceBuffer:
                 if m:
                     before = self.buf[: m.start()]
                     if before:
-                        self._pending.append(_sse_event("text", {"content": before}))
+                        self._pending.append(("text", before))
                     self.fence_type = m.group(1)
                     self.buf = self.buf[m.end() :]
                     self.in_fence = True
@@ -121,25 +137,189 @@ class _FenceBuffer:
                     partial = _FENCE_PARTIAL.search(self.buf)
                     safe = len(self.buf) - len(partial.group(0)) if partial else len(self.buf)
                     if safe > 0:
-                        self._pending.append(_sse_event("text", {"content": self.buf[:safe]}))
+                        self._pending.append(("text", self.buf[:safe]))
                         self.buf = self.buf[safe:]
                     break
 
     def flush(self) -> None:
         if self.in_fence:
-            self._pending.append(
-                _sse_event("text", {"content": "```ui:" + self.fence_type + "\n" + self.buf})
-            )
+            self._pending.append(("text", "```ui:" + self.fence_type + "\n" + self.buf))
         elif self.buf:
-            self._pending.append(_sse_event("text", {"content": self.buf}))
+            self._pending.append(("text", self.buf))
         self.buf = ""
         self.in_fence = False
         self.fence_type = ""
 
-    def drain(self) -> list[str]:
+    def drain(self) -> list[_FenceMarker]:
         events = self._pending
         self._pending = []
         return events
+
+
+@dataclass
+class _AgUiStreamState:
+    encoder: EventEncoder
+    thread_id: str
+    run_id: str
+    current_text_message_id: str | None = None
+    last_tool_call_id: str | None = None
+    reasoning_message_id: str | None = None
+    reasoning_message_open: bool = False
+    reasoning_phase_open: bool = False
+
+    def encode_run_started(self) -> str:
+        return self.encoder.encode(
+            RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=self.thread_id,
+                run_id=self.run_id,
+            )
+        )
+
+    def encode_run_finished(self) -> str:
+        return self.encoder.encode(
+            RunFinishedEvent(
+                type=EventType.RUN_FINISHED,
+                thread_id=self.thread_id,
+                run_id=self.run_id,
+                result=None,
+            )
+        )
+
+    def encode_run_error(self, message: str) -> str:
+        return self.encoder.encode(RunErrorEvent(type=EventType.RUN_ERROR, message=message))
+
+    def end_text_if_open(self) -> Iterator[str]:
+        if self.current_text_message_id is None:
+            return
+        mid = self.current_text_message_id
+        self.current_text_message_id = None
+        yield self.encoder.encode(
+            TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=mid)
+        )
+
+    def close_reasoning(self) -> Iterator[str]:
+        if self.reasoning_message_open and self.reasoning_message_id is not None:
+            rid = self.reasoning_message_id
+            yield self.encoder.encode(
+                ReasoningMessageEndEvent(
+                    type=EventType.REASONING_MESSAGE_END,
+                    message_id=rid,
+                )
+            )
+            self.reasoning_message_open = False
+        if self.reasoning_phase_open and self.reasoning_message_id is not None:
+            rid = self.reasoning_message_id
+            yield self.encoder.encode(
+                ReasoningEndEvent(type=EventType.REASONING_END, message_id=rid)
+            )
+            self.reasoning_phase_open = False
+        self.reasoning_message_id = None
+
+    def emit_thinking_delta(self, delta: str) -> Iterator[str]:
+        if not self.reasoning_phase_open:
+            rid = str(uuid.uuid4())
+            self.reasoning_message_id = rid
+            yield self.encoder.encode(
+                ReasoningStartEvent(type=EventType.REASONING_START, message_id=rid)
+            )
+            yield self.encoder.encode(
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START,
+                    message_id=rid,
+                    role="reasoning",
+                )
+            )
+            self.reasoning_phase_open = True
+            self.reasoning_message_open = True
+        if self.reasoning_message_id is None:
+            raise RuntimeError("reasoning_message_id not set for thinking delta")
+        rid = self.reasoning_message_id
+        yield self.encoder.encode(
+            ReasoningMessageContentEvent(
+                type=EventType.REASONING_MESSAGE_CONTENT,
+                message_id=rid,
+                delta=delta,
+            )
+        )
+
+    def encode_fence_markers(self, markers: list[_FenceMarker]) -> Iterator[str]:
+        for marker in markers:
+            if marker[0] == "text":
+                chunk = marker[1]
+                if not chunk:
+                    continue
+                yield from self._emit_text_delta(chunk)
+            else:
+                ui_type = marker[1]
+                props = marker[2]
+                yield from self.end_text_if_open()
+                yield self.encoder.encode(
+                    CustomEvent(
+                        type=EventType.CUSTOM,
+                        name="ui_component",
+                        value={"type": ui_type, "props": props},
+                    )
+                )
+
+    def _emit_text_delta(self, chunk: str) -> Iterator[str]:
+        if not chunk:
+            return
+        if self.current_text_message_id is None:
+            mid = str(uuid.uuid4())
+            self.current_text_message_id = mid
+            yield self.encoder.encode(
+                TextMessageStartEvent(
+                    type=EventType.TEXT_MESSAGE_START,
+                    message_id=mid,
+                    role="assistant",
+                )
+            )
+        else:
+            mid = self.current_text_message_id
+        yield self.encoder.encode(
+            TextMessageContentEvent(
+                type=EventType.TEXT_MESSAGE_CONTENT,
+                message_id=mid,
+                delta=chunk,
+            )
+        )
+
+    def emit_tool_call(self, name: str, input_payload: str) -> Iterator[str]:
+        tcid = str(uuid.uuid4())
+        self.last_tool_call_id = tcid
+        yield self.encoder.encode(
+            ToolCallStartEvent(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id=tcid,
+                tool_call_name=name,
+            )
+        )
+        yield self.encoder.encode(
+            ToolCallArgsEvent(
+                type=EventType.TOOL_CALL_ARGS,
+                tool_call_id=tcid,
+                delta=input_payload,
+            )
+        )
+        yield self.encoder.encode(ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=tcid))
+
+    def emit_tool_result(self, output: str) -> Iterator[str]:
+        tcid = self.last_tool_call_id or str(uuid.uuid4())
+        msg_id = str(uuid.uuid4())
+        yield self.encoder.encode(
+            ToolCallResultEvent(
+                type=EventType.TOOL_CALL_RESULT,
+                message_id=msg_id,
+                tool_call_id=tcid,
+                content=output,
+                role="tool",
+            )
+        )
+
+
+def _closes_reasoning_on_non_thinking_event(event: ProviderEvent) -> bool:
+    return event.type in ("text_delta", "tool_call", "tool_result", "result")
 
 
 def _build_chat_system_prompt(ctx: dict[str, Any]) -> str:
@@ -209,18 +389,22 @@ def register_chat_routes(
             user_prompt = _build_chat_prompt(req.message, conversation.messages)
 
             conversation.messages.append(_ConversationEntry(role="user", content=req.message))
-            # Cap stored messages to prevent unbounded growth
             if len(conversation.messages) > _MAX_HISTORY_MESSAGES * 2:
                 conversation.messages = conversation.messages[-_MAX_HISTORY_MESSAGES * 2 :]
 
-            yield _sse_event("status", {"status": "thinking"})
+            run_id = str(uuid.uuid4())
+            thread_id = conversation.id
+            state = _AgUiStreamState(encoder=EventEncoder(), thread_id=thread_id, run_id=run_id)
+
+            yield state.encode_run_started()
 
             agent_text = ""
             total_cost = 0.0
             fence = _FenceBuffer()
+            stream_failed = False
 
             try:
-                result = provider.query(
+                agen = provider.query(
                     ProviderQueryOptions(
                         prompt=user_prompt,
                         system_prompt=system_prompt,
@@ -232,46 +416,66 @@ def register_chat_routes(
                         stream=True,
                     )
                 )
+                async for event in agen:
+                    if await request.is_disconnected():
+                        break
 
-                async def run() -> AsyncGenerator[str, None]:
-                    nonlocal agent_text, total_cost
-                    async for event in result:
-                        if await request.is_disconnected():
-                            break
-                        match event.type:
-                            case "text_delta":
-                                fence.add(event.text)
-                            case "thinking_delta":
-                                fence.emit(_sse_event("thinking", {"content": event.thinking}))
-                            case "content_block_stop":
-                                fence.flush()
-                            case "tool_call":
-                                fence.emit(
-                                    _sse_event(
-                                        "tool_call", {"name": event.name, "input": event.input}
-                                    )
-                                )
-                            case "tool_result":
-                                fence.emit(_sse_event("tool_result", {"output": event.output}))
-                            case "result":
-                                total_cost = event.cost_usd
-                                agent_text = event.text
-
-                        # Yield accumulated events incrementally
-                        for chunk in fence.drain():
+                    if _closes_reasoning_on_non_thinking_event(event):
+                        for chunk in state.close_reasoning():
                             yield chunk
 
-                async for chunk in run():
-                    yield chunk
+                    if event.type in ("tool_call", "tool_result", "result"):
+                        for chunk in state.end_text_if_open():
+                            yield chunk
+
+                    if event.type == "thinking_delta":
+                        for chunk in state.end_text_if_open():
+                            yield chunk
+
+                    match event.type:
+                        case "text_delta":
+                            fence.add(event.text)
+                        case "thinking_delta":
+                            for chunk in state.emit_thinking_delta(event.thinking):
+                                yield chunk
+                        case "content_block_stop":
+                            fence.flush()
+                            for chunk in state.encode_fence_markers(fence.drain()):
+                                yield chunk
+                            for chunk in state.end_text_if_open():
+                                yield chunk
+                            for chunk in state.close_reasoning():
+                                yield chunk
+                        case "tool_call":
+                            for chunk in state.emit_tool_call(event.name, event.input):
+                                yield chunk
+                        case "tool_result":
+                            for chunk in state.emit_tool_result(event.output):
+                                yield chunk
+                        case "result":
+                            total_cost = event.cost_usd
+                            agent_text = event.text
+
+                    for chunk in state.encode_fence_markers(fence.drain()):
+                        yield chunk
 
             except TimeoutError:
-                yield _sse_event("error", {"message": f"Chat timed out after {timeout_ms}ms"})
+                stream_failed = True
+                yield state.encode_run_error(f"Chat timed out after {timeout_ms}ms")
             except Exception as e:
+                stream_failed = True
                 logger.exception("[agent] Chat error")
-                yield _sse_event("error", {"message": str(e)})
+                yield state.encode_run_error(str(e))
+
+            if stream_failed:
+                return
 
             fence.flush()
-            for chunk in fence.drain():
+            for chunk in state.encode_fence_markers(fence.drain()):
+                yield chunk
+            for chunk in state.end_text_if_open():
+                yield chunk
+            for chunk in state.close_reasoning():
                 yield chunk
 
             if agent_text:
@@ -280,7 +484,7 @@ def register_chat_routes(
                     _ConversationEntry(role="assistant", content=clean_text)
                 )
 
-            yield _sse_event("done", {"conversationId": conversation.id})
+            yield state.encode_run_finished()
             logger.info(
                 "[agent] Chat complete: conversation=%s, cost=$%.4f", conversation.id, total_cost
             )

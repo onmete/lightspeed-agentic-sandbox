@@ -9,9 +9,19 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from lightspeed_agentic.routes import build_router
-from lightspeed_agentic.types import ResultEvent, TextDeltaEvent
+from lightspeed_agentic.types import ResultEvent, TextDeltaEvent, ThinkingDeltaEvent
 
 from .conftest import MockProvider, StreamingMockProvider
+
+
+def _ag_ui_events(body: str) -> list[dict]:
+    """Parse AG-UI JSON payloads from an SSE body (`data:` lines only)."""
+    events = []
+    for line in body.split("\n"):
+        line = line.strip()
+        if line.startswith("data: "):
+            events.append(json.loads(line.removeprefix("data: ")))
+    return events
 
 
 def _make_app(provider) -> FastAPI:
@@ -142,12 +152,18 @@ async def test_chat_endpoint_sse():
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "text/event-stream; charset=utf-8"
 
-        body = resp.text
-        assert "event: status" in body
-        assert "event: text" in body
-        assert "event: tool_call" in body
-        assert "event: tool_result" in body
-        assert "event: done" in body
+        evs = _ag_ui_events(resp.text)
+        assert evs[0]["type"] == "RUN_STARTED"
+        assert "threadId" in evs[0]
+        assert "runId" in evs[0]
+        assert evs[-1]["type"] == "RUN_FINISHED"
+        types = {e["type"] for e in evs}
+        assert "TEXT_MESSAGE_START" in types
+        assert "TEXT_MESSAGE_CONTENT" in types
+        assert "TOOL_CALL_START" in types
+        assert "TOOL_CALL_ARGS" in types
+        assert "TOOL_CALL_END" in types
+        assert "TOOL_CALL_RESULT" in types
 
 
 @pytest.mark.asyncio
@@ -164,16 +180,15 @@ async def test_chat_conversation_continuity():
                 },
             },
         )
-        lines = resp1.text.strip().split("\n")
-        done_line = [line for line in lines if '"conversationId"' in line]
-        assert done_line
-        conv_id = json.loads(done_line[0].replace("data: ", ""))["conversationId"]
+        evs1 = _ag_ui_events(resp1.text)
+        assert evs1[0]["type"] == "RUN_STARTED"
+        thread_id = evs1[0]["threadId"]
 
         resp2 = await client.post(
             "/v1/agent/chat",
             json={
                 "message": "Follow-up",
-                "conversationId": conv_id,
+                "conversationId": thread_id,
                 "context": {
                     "remediation": {"name": "r", "namespace": "ns"},
                     "alert": {"name": "a", "status": "firing", "severity": "low"},
@@ -181,7 +196,9 @@ async def test_chat_conversation_continuity():
             },
         )
         assert resp2.status_code == 200
-        assert conv_id in resp2.text
+        evs2 = _ag_ui_events(resp2.text)
+        assert evs2[0]["type"] == "RUN_STARTED"
+        assert evs2[0]["threadId"] == thread_id
 
 
 @pytest.mark.asyncio
@@ -207,6 +224,41 @@ async def test_chat_ui_fence_parsing():
                 },
             },
         )
-        body = resp.text
-        assert "event: ui_component" in body
-        assert "visualization" in body
+        evs = _ag_ui_events(resp.text)
+        custom = [e for e in evs if e.get("type") == "CUSTOM" and e.get("name") == "ui_component"]
+        assert custom
+        assert custom[0]["value"]["type"] == "visualization"
+        assert custom[0]["value"]["props"]["title"] == "Test"
+
+
+@pytest.mark.asyncio
+async def test_chat_reasoning_ag_ui():
+    """Thinking deltas emit AG-UI reasoning lifecycle events."""
+    provider = MockProvider(
+        events=[
+            ThinkingDeltaEvent(thinking="step one "),
+            ThinkingDeltaEvent(thinking="step two"),
+            TextDeltaEvent(text="Answer."),
+            ResultEvent(text="Answer.", cost_usd=0.0, input_tokens=1, output_tokens=1),
+        ]
+    )
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/agent/chat",
+            json={
+                "message": "Think",
+                "context": {
+                    "remediation": {"name": "r", "namespace": "ns"},
+                    "alert": {"name": "a", "status": "firing", "severity": "low"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        evs = _ag_ui_events(resp.text)
+        types = [e["type"] for e in evs]
+        assert "REASONING_START" in types
+        assert "REASONING_MESSAGE_START" in types
+        assert "REASONING_MESSAGE_CONTENT" in types
+        assert "REASONING_MESSAGE_END" in types
+        assert "REASONING_END" in types

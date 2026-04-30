@@ -18,25 +18,29 @@ invariant — the chat is for investigation and discussion,
 never for execution. The same tools are available, but the
 system prompt restricts their use to read-only operations.
 
-## SSE protocol
+## SSE protocol (AG-UI)
 
-The endpoint returns a `text/event-stream` response. Each
-SSE message has an `event` name and a JSON `data` payload.
+The endpoint returns a `text/event-stream` response. Each SSE
+message is a `data:` line carrying one JSON object. The wire
+format follows the [Agent User Interaction (AG-UI)
+protocol](https://docs.ag-ui.com/): the JSON includes a
+`type` field that discriminates events (see `EventType` in
+the AG-UI Python SDK). Encoding uses `ag_ui.encoder.EventEncoder`.
 
-| Event | Payload | When |
-|---|---|---|
-| status | `{status}` | Stream start ("thinking") |
-| text | `{content}` | Incremental text from the model |
-| thinking | `{content}` | Model reasoning trace |
-| tool_call | `{name, input}` | Model invoked a tool |
-| tool_result | `{output}` | Tool returned output |
-| ui_component | `{type, props}` | Parsed UI fence (see below) |
-| error | `{message}` | Timeout or unhandled error |
-| done | `{conversationId}` | Always the final event |
+| AG-UI event type | When |
+|---|---|
+| `RUN_STARTED` | First event. Carries `threadId` (conversation) and `runId` (this request). |
+| `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CONTENT` / `TEXT_MESSAGE_END` | Assistant text streaming. Start includes `messageId` and `role: "assistant"`. Content carries `delta` (non-empty). End closes the message. |
+| `TOOL_CALL_START` / `TOOL_CALL_ARGS` / `TOOL_CALL_END` | Tool invocation. `toolCallId` and `toolCallName` on start; args stream as `delta` on the args event. |
+| `TOOL_CALL_RESULT` | Tool output. `toolCallId` matches the preceding tool call; includes `messageId` and `role: "tool"`. |
+| `REASONING_START` / `REASONING_MESSAGE_START` / `REASONING_MESSAGE_CONTENT` / `REASONING_MESSAGE_END` / `REASONING_END` | Model reasoning trace (optional — provider-dependent). |
+| `CUSTOM` | Extensible events. UI fence payloads use `name: "ui_component"` and `value: { type, props }`. |
+| `RUN_FINISHED` | Terminal event on success. Carries `threadId` and `runId`. |
+| `RUN_ERROR` | Terminal event on error. Carries `message` (and optional `code`). No `RUN_FINISHED` after an error. |
 
-The `done` event always includes the conversation ID. The
-frontend needs this to continue the conversation in
-subsequent requests.
+The request body still uses `conversationId` (UUID) to
+continue a thread. That value is the AG-UI `threadId` for
+`RUN_STARTED` and `RUN_FINISHED`.
 
 ## UI fence protocol
 
@@ -49,14 +53,16 @@ text output using a fenced block syntax:
 
 When the fence parser encounters this pattern:
 
-1. Text before the fence is emitted as a normal `text` event.
-2. The JSON body is parsed. If valid, a `ui_component` event
-   is emitted with `{type, props}`.
+1. Text before the fence is emitted as `TEXT_MESSAGE_*` events.
+2. The JSON body is parsed. If valid, a `CUSTOM` event is
+   emitted with `name: "ui_component"` and
+   `value: { type, props }` (type is the fence name, props is
+   the parsed object).
 3. If the JSON is malformed, the content is **silently
    dropped** — no error event, no fallback text.
 4. If the fence is never closed (model stops mid-fence), the
-   partial content is flushed as plain `text` so the client
-   can render something.
+   partial content is flushed as plain text (via
+   `TEXT_MESSAGE_*`) so the client can render something.
 
 The fence parser also guards against streaming partial fence
 markers (e.g., a lone backtick at the end of a chunk) — these
@@ -86,8 +92,8 @@ that conversation and refreshes its TTL.
 
 The conversation history stores **clean text** — UI fences
 are stripped from the assistant's response before it is
-appended to history. The frontend receives structured
-`ui_component` events during streaming, but the history
+appended to history. The frontend receives `CUSTOM` events
+with `name: "ui_component"` during streaming, but the history
 retains only readable prose. This avoids re-parsing fences
 on subsequent turns and keeps the prompt token-efficient.
 
