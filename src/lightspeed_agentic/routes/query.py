@@ -184,9 +184,11 @@ def register_query_routes(
             max_turns,
             timeout,
         )
-        return RunResponse(success=result.success, summary=result.summary, **{
-            k: v for k, v in result.model_dump().items() if k not in ("success", "summary")
-        })
+        return RunResponse(
+            success=result.success,
+            summary=result.summary,
+            **{k: v for k, v in result.model_dump().items() if k not in ("success", "summary")},
+        )
 
     router.add_api_route("/run", run_endpoint, methods=["POST"], response_model=RunResponse)
 
@@ -199,7 +201,8 @@ def register_query_routes(
             _path: str = path,
         ) -> QueryResponse:
             logger.warning(
-                "Deprecated endpoint %s called — migrate to POST /run", _path,
+                "Deprecated endpoint %s called — migrate to POST /run",
+                _path,
             )
             return await _handle_query(
                 req,
@@ -212,6 +215,9 @@ def register_query_routes(
             )
 
         router.add_api_route(
-            path, legacy_endpoint, methods=["POST"],
-            response_model=QueryResponse, deprecated=True,
+            path,
+            legacy_endpoint,
+            methods=["POST"],
+            response_model=QueryResponse,
+            deprecated=True,
         )
