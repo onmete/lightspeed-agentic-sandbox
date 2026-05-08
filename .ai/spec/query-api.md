@@ -1,29 +1,19 @@
 # Query API
 
-Behavioral rules for the `/analyze`, `/execute`, and
-`/verify` endpoints.
+Behavioral rules for the `POST /run` endpoint.
 
-## One handler, three labels
+## Single endpoint
 
-All three endpoints run the same handler. The only
-differences are the phase label (used for logging and
-timeout selection) and the URL path. The operator controls
-what the agent does through the request body — system prompt,
-output schema, and context — not through endpoint choice.
+The operator controls what the agent does through the request
+body — system prompt, output schema, context, and timeout —
+not through endpoint choice.
 
-A future consolidation into a single endpoint with a phase
-field in the request body is anticipated.
+## Timeout
 
-## Timeout structure
-
-| Phase | Timeout source |
-|---|---|
-| analysis | analysis timeout (default 5 min) |
-| execution | execution timeout (default 10 min) |
-| verification | **analysis** timeout, not execution |
-
-Verification reuses the analysis timeout because it is a
-check, not a long-running action. This is intentional.
+The caller passes `timeout_ms` per request. If omitted, the
+server default applies (300s). This lets the operator set
+different timeouts for analysis vs execution vs verification
+without needing separate endpoints.
 
 ## Budget
 
@@ -66,13 +56,7 @@ This is a **prompt-level security boundary**: the agent is
 told not to deviate, but there is no server-side enforcement
 mechanism beyond the instruction itself.
 
-The approved option block includes the diagnosis, plan, risk
-assessment, and a specific action list. The closing line
-reinforces the constraint: perform nothing beyond what is
-listed.
-
 ## Streaming
 
 Query routes do not use streaming — the provider runs to
 completion and the handler waits for the final result event.
-Streaming is reserved for the chat endpoint.

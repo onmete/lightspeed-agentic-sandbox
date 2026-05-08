@@ -13,8 +13,7 @@ Before changing code, read the relevant spec in `.ai/spec/`:
 | Working on | Read |
 |---|---|
 | Provider adapters | [provider-contract.md](.ai/spec/provider-contract.md) |
-| Query routes (analyze/execute/verify) | [query-api.md](.ai/spec/query-api.md) |
-| Chat endpoint or SSE streaming | [chat-api.md](.ai/spec/chat-api.md) |
+| /run endpoint | [query-api.md](.ai/spec/query-api.md) |
 | Deployment, env vars, or defaults | [configuration.md](.ai/spec/configuration.md) |
 
 Specs capture invariants, design decisions, and known quirks that the code
@@ -51,8 +50,7 @@ src/lightspeed_agentic/
 │   └── deepagents.py     # deepagents/langgraph adapter
 └── routes/
     ├── __init__.py       # build_router(...)
-    ├── query.py          # /analyze, /execute, /verify
-    ├── chat.py           # /chat SSE endpoint
+    ├── query.py          # POST /run endpoint
     └── models.py         # Pydantic request/response models
 ```
 
@@ -74,11 +72,10 @@ helpers.
   package import path.
 - `types.py` event objects are frozen dataclasses. New event types should follow
   the same pattern and stay simple to serialize/log.
-- Route payloads use Pydantic models in `routes/models.py` and `routes/chat.py`.
+- Route payloads use Pydantic models in `routes/models.py`.
   Prefer extending those models over passing around untyped dicts.
-- Streaming paths are async all the way through: providers yield async event
-  streams, query handlers consume async iterators, and chat emits SSE via an
-  async generator.
+- Providers yield async event streams; the query handler consumes async
+  iterators and waits for the final result event.
 - Preserve the "thin adapter" shape when touching provider files: map SDK
   events into `ProviderEvent`, do not re-implement SDK behavior locally unless a
   testable workaround is required.

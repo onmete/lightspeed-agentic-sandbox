@@ -14,12 +14,12 @@ from typing import Any
 import pytest
 
 from .credentials import detect_all
-from .runner import AnalyzeResult
+from .runner import RunResult
 
-_STASH_KEY = pytest.StashKey[AnalyzeResult]()
+_STASH_KEY = pytest.StashKey[RunResult]()
 
 
-def store_eval_result(item: pytest.Item, result: AnalyzeResult) -> None:
+def store_eval_result(item: pytest.Item, result: RunResult) -> None:
     item.stash[_STASH_KEY] = result
 
 

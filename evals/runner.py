@@ -1,10 +1,9 @@
-"""Eval runner — POSTs to /v1/agent/run (or deprecated /v1/agent/analyze)."""
+"""Eval runner — POSTs to /v1/agent/run."""
 
 from __future__ import annotations
 
 import json
 import time
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,9 +19,6 @@ class RunResult:
     raw: dict[str, Any] = field(default_factory=dict)
     latency_seconds: float = 0.0
     error: str | None = None
-
-
-AnalyzeResult = RunResult
 
 
 async def run_query(
@@ -61,21 +57,10 @@ async def run_query(
     return result
 
 
-async def run_analyze(
-    server_url: str,
-    query: str,
-    system_prompt: str = "You are a helpful assistant.",
-    output_schema: dict | None = None,
-) -> RunResult:
-    """Deprecated — use run_query() instead."""
-    warnings.warn("run_analyze is deprecated, use run_query", DeprecationWarning, stacklevel=2)
-    return await run_query(server_url, query, system_prompt, output_schema)
-
-
 def assert_tool_token(
     eval_workspace: Path,
     token_file_name: str,
-    result: AnalyzeResult,
+    result: RunResult,
     provider_name: str,
     script_name: str,
 ) -> None:

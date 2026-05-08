@@ -3,13 +3,13 @@ metadata:
   version: "1.0"
 artifacts:
   # OpenShift CLI (oc + kubectl) — x86_64
-  - download_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz"
-    checksum: "sha256:da31d56b291c2aee47d0ba24cf17a43e0b50dec633234b09483236a79d64adf0"
+  - download_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-4.21/openshift-client-linux.tar.gz"
+    checksum: "sha256:966f7531d9189456173750b2cc32f8183c6aecf659e24c394f6eceaa1c89df03"
     filename: "openshift-client-linux-x86_64.tar.gz"
 
   # OpenShift CLI (oc + kubectl) — aarch64
-  - download_url: "https://mirror.openshift.com/pub/openshift-v4/aarch64/clients/ocp/stable/openshift-client-linux.tar.gz"
-    checksum: "sha256:f01344022628b3bab46141e3ed7130a405eb30575cb21bb921d92108988786d4"
+  - download_url: "https://mirror.openshift.com/pub/openshift-v4/aarch64/clients/ocp/stable-4.21/openshift-client-linux.tar.gz"
+    checksum: "sha256:6d34aa70e6f3416f4e0341f8ad6a285581e265b87234359f3ccca0afaf8c7f5f"
     filename: "openshift-client-linux-aarch64.tar.gz"
 
   # ripgrep 15.1.0 — x86_64 (musl static binary)
