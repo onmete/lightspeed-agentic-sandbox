@@ -1,17 +1,16 @@
 """FastAPI routers — mount into any FastAPI app.
 
-Maps to lightspeed-agent/src/agent.ts (query endpoints) and chat.ts (SSE chat).
-
-Usage in lightspeed-service:
+Usage:
     from lightspeed_agentic.routes import build_router
     app.include_router(build_router(provider), prefix="/v1/agent")
 """
 
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter
 
-from lightspeed_agentic.routes.chat import register_chat_routes
 from lightspeed_agentic.routes.query import register_query_routes
 from lightspeed_agentic.types import DEFAULT_MODEL, AgentProvider
 
@@ -22,32 +21,24 @@ def build_router(
     skills_dir: str = "/app/skills",
     model: str | None = None,
     max_turns: int = 200,
-    analysis_timeout_ms: int = 300_000,
-    execution_timeout_ms: int = 600_000,
-    chat_timeout_ms: int = 120_000,
-    chat_max_turns: int = 30,
-    chat_max_budget_usd: float = 1.0,
+    default_timeout_ms: int = 300_000,
 ) -> APIRouter:
-    router = APIRouter()
+    model_env_vars = {
+        "claude": "ANTHROPIC_MODEL",
+        "gemini": "GEMINI_MODEL",
+        "openai": "OPENAI_MODEL",
+        "deepagents": "DEEPAGENTS_MODEL",
+    }
+    env_var = model_env_vars.get(provider.name, "ANTHROPIC_MODEL")
+    resolved_model = model or os.environ.get(env_var, DEFAULT_MODEL)
 
+    router = APIRouter()
     register_query_routes(
         router,
         provider=provider,
         skills_dir=skills_dir,
-        model=model,
+        model=resolved_model,
         max_turns=max_turns,
-        analysis_timeout_ms=analysis_timeout_ms,
-        execution_timeout_ms=execution_timeout_ms,
+        default_timeout_ms=default_timeout_ms,
     )
-
-    register_chat_routes(
-        router,
-        provider=provider,
-        skills_dir=skills_dir,
-        model=model or DEFAULT_MODEL,
-        max_turns=chat_max_turns,
-        timeout_ms=chat_timeout_ms,
-        max_budget_usd=chat_max_budget_usd,
-    )
-
     return router

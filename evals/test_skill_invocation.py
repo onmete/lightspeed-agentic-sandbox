@@ -12,7 +12,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from .runner import AnalyzeResult, assert_tool_token
+from .runner import RunResult, assert_tool_token
 from .schemas import ANALYSIS_WITH_COMPONENTS_SCHEMA
 
 
@@ -21,7 +21,7 @@ from .schemas import ANALYSIS_WITH_COMPONENTS_SCHEMA
 async def test_find_token_skill(
     provider_name: str,
     eval_workspace: Path,
-    eval_runner: Callable[..., AnalyzeResult],
+    eval_runner: Callable[..., RunResult],
 ) -> None:
     """Provider discovers find-token skill, executes it, returns analysis with components."""
     result = await eval_runner(

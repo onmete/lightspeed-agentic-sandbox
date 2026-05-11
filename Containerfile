@@ -28,15 +28,19 @@ RUN unset PIP_INSTALL_OPTIONS PIP_TARGET PIP_HOME PIP_PREFIX 2>/dev/null; \
     pip3.12 install --no-cache-dir --target /app/site-packages \
         -r requirements.$(uname -m).txt
 
-# Install claude-code from prefetched npm packages.
-# Cachi2 sets npm registry to the prefetched local mirror via cachi2.env.
-# npm ci installs from lockfile using the prefetched cache, then we link
-# the CLI globally from node_modules (npm install -g would bypass cachi2).
+# Install claude-code CLI.
+# In hermetic builds (Konflux), cachi2 prefetches npm packages and sets the
+# registry via cachi2.env — use npm ci against the lockfile.
+# In non-hermetic builds (OpenShift BuildConfig), fall back to npm install -g.
 COPY package.json package-lock.json ./
 RUN dnf install -y --nodocs nodejs && dnf clean all
-RUN . /cachi2/cachi2.env 2>/dev/null || true && \
-    npm ci --ignore-scripts && \
-    ln -s /app/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude
+RUN if [ -f /cachi2/cachi2.env ]; then \
+        . /cachi2/cachi2.env && \
+        npm ci --ignore-scripts; \
+    else \
+        npm install -g @anthropic-ai/claude-code --ignore-scripts && \
+        cp -a /usr/local/lib/node_modules /app/node_modules; \
+    fi
 
 # ---------------------------------------------------------------------------
 # Runtime stage: minimal image with only what the agent needs
@@ -91,10 +95,16 @@ RUN ARCH=$(uname -m) && \
         chmod +x /usr/local/bin/dumb-init; \
     else \
         echo "WARN: generic deps dir not found, fetching from network (non-hermetic)" && \
-        curl -sL "https://mirror.openshift.com/pub/openshift-v4/${ARCH}/clients/ocp/stable/openshift-client-linux.tar.gz" | \
+        curl -sL "https://mirror.openshift.com/pub/openshift-v4/${ARCH}/clients/ocp/stable-4.21/openshift-client-linux.tar.gz" | \
             tar -xz -C /usr/local/bin oc kubectl && \
         chmod +x /usr/local/bin/oc /usr/local/bin/kubectl && \
-        dnf install -y --nodocs dumb-init && dnf clean all; \
+        RG_ARCH=$([ "$ARCH" = "aarch64" ] && echo "aarch64-unknown-linux-gnu" || echo "x86_64-unknown-linux-musl") && \
+        curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-${RG_ARCH}.tar.gz" | \
+            tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/rg' && \
+        chmod +x /usr/local/bin/rg && \
+        DUMB_ARCH=$([ "$ARCH" = "aarch64" ] && echo "aarch64" || echo "x86_64") && \
+        curl -sL "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_${DUMB_ARCH}" -o /usr/local/bin/dumb-init && \
+        chmod +x /usr/local/bin/dumb-init; \
     fi
 
 # Copy application source and metadata

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import shlex
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -79,6 +80,10 @@ class GeminiProvider(AgentProvider):
 
         async def _auto_confirm_run(*, args: Any, tool_context: Any) -> Any:
             tool_context.tool_confirmation = ToolConfirmation(confirmed=True)
+            # ExecuteBashTool uses subprocess_exec (no shell), so wrap through
+            # bash -c to support shell builtins, PATH lookups, and pipes.
+            if "command" in args:
+                args = {**args, "command": f"bash -c {shlex.quote(args['command'])}"}
             return await _orig_run(args=args, tool_context=tool_context)
 
         bash.run_async = _auto_confirm_run  # type: ignore[method-assign]

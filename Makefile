@@ -37,7 +37,7 @@ verify: ## Run non-mutating formatting, lint, and type checks
 	$(UV) run ruff check .
 	$(UV) run mypy src/lightspeed_agentic
 
-image: ## Build production container image
+image: ## Build container image for local development and evals
 	$(CONTAINER_RUNTIME) build -t $(IMAGE) .
 
 EVAL_ARGS ?=

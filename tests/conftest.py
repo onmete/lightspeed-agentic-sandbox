@@ -11,9 +11,6 @@ from lightspeed_agentic.types import (
     ProviderEvent,
     ProviderQueryOptions,
     ResultEvent,
-    TextDeltaEvent,
-    ToolCallEvent,
-    ToolResultEvent,
 )
 
 
@@ -39,29 +36,6 @@ class MockProvider(AgentProvider):
             yield event
 
 
-class StreamingMockProvider(AgentProvider):
-    """Provider that simulates a streaming response with tool calls."""
-
-    @property
-    def name(self) -> str:
-        return "streaming_mock"
-
-    async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
-        yield TextDeltaEvent(text="Hello ")
-        yield TextDeltaEvent(text="world")
-        yield ToolCallEvent(name="bash", input='{"command": "ls"}')
-        yield ToolResultEvent(output="file1.txt\nfile2.txt")
-        yield TextDeltaEvent(text="\nDone.")
-        yield ResultEvent(
-            text="Hello world\nDone.", cost_usd=0.05, input_tokens=200, output_tokens=100
-        )
-
-
 @pytest.fixture
 def mock_provider() -> MockProvider:
     return MockProvider()
-
-
-@pytest.fixture
-def streaming_provider() -> StreamingMockProvider:
-    return StreamingMockProvider()
