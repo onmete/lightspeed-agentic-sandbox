@@ -38,7 +38,7 @@ verify: ## Run non-mutating formatting, lint, and type checks
 	$(UV) run mypy src/lightspeed_agentic
 
 image: ## Build container image for local development and evals
-	$(CONTAINER_RUNTIME) build -f Containerfile.dev -t $(IMAGE) .
+	$(CONTAINER_RUNTIME) build -t $(IMAGE) .
 
 EVAL_ARGS ?=
 
