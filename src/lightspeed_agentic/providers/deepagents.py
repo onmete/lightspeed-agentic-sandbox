@@ -13,7 +13,6 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
-from lightspeed_agentic.tools import resolve_skills_dir
 from lightspeed_agentic.types import (
     TOOL_INPUT_MAX_CHARS,
     TOOL_OUTPUT_MAX_CHARS,
@@ -123,15 +122,13 @@ class DeepAgentsProvider(AgentProvider):
         from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
         backend = LocalShellBackend(root_dir=options.cwd, inherit_env=True)
-        skills_dir = resolve_skills_dir(options.cwd)
-
         model: Any = _resolve_model(options.model)
 
         agent_kwargs: dict[str, Any] = {
             "model": model,
             "system_prompt": options.system_prompt,
             "backend": backend,
-            "skills": [skills_dir],
+            "skills": [options.cwd],
         }
 
         if options.output_schema:

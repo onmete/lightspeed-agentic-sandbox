@@ -15,10 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-claude = ["claude-agent-sdk>=0.1.68"]
-gemini = ["google-adk>=1.31.1"]
-openai = ["openai-agents>=0.14.6"]
-deepagents = ["deepagents>=0.5.3", "langchain-google-vertexai>=3.2.2", "langchain-openai>=1.2.1", "langchain-google-genai>=4.2.2"]
+claude = ["claude-agent-sdk>=0.1.81"]
+gemini = ["google-adk>=1.33.0"]
+openai = ["openai-agents>=0.17.2"]
+deepagents = ["deepagents>=0.5.9", "langchain-google-vertexai>=3.2.3", "langchain-openai>=1.2.1", "langchain-google-genai>=4.2.2"]
 all = ["lightspeed-agentic[claude,gemini,openai,deepagents]"]
 dev = [
     "pytest>=9.0.3",
