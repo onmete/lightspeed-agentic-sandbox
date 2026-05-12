@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
 import shlex
 import time
@@ -90,11 +91,12 @@ class GeminiProvider(AgentProvider):
 
         # TODO: investigate more ADK built-in tools:
         # load_artifacts, load_memory, computer_use, file_search, mcp_servers
-        tools: list[Any] = [
-            bash,
-            google_search,
-            url_context,
-        ]
+        is_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").upper() == "TRUE"
+        tools: list[Any] = [bash]
+        # Vertex AI rejects mixing search tools (google_search, url_context)
+        # with non-search tools like bash in the same request.
+        if not is_vertex:
+            tools.extend([google_search, url_context])
 
         if options.cwd not in self._cached_skills:
             self._cached_skills[options.cwd] = _load_skills_toolset(options.cwd)
@@ -105,15 +107,17 @@ class GeminiProvider(AgentProvider):
         if not options.output_schema:
             tools.append(exit_loop)
 
+        tool_config_kwargs: dict[str, Any] = {}
+        if not is_vertex:
+            tool_config_kwargs["include_server_side_tool_invocations"] = True
+
         agent_kwargs: dict[str, Any] = {
             "name": "lightspeed",
             "model": options.model,
             "instruction": options.system_prompt,
             "tools": tools,
             "generate_content_config": types.GenerateContentConfig(
-                tool_config=types.ToolConfig(
-                    include_server_side_tool_invocations=True,
-                ),
+                tool_config=types.ToolConfig(**tool_config_kwargs),
             ),
         }
 
