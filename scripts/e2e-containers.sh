@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Run E2E BDD tests against one live sandbox container at a time.
+#
+# Usage (from lightspeed-agentic-sandbox/):
+#   bash scripts/e2e-containers.sh                  # all six providers (sequential)
+#   bash scripts/e2e-containers.sh openai          # one provider, default model from config.env
+#   bash scripts/e2e-containers.sh openai gpt-4.1-nano   # optional model override
+#
+# Exports SANDBOX_SERVICE_URL and E2E_PROVIDER for pytest. Missing credentials exit non-zero
+# before any container starts.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+cd "${ROOT}"
+
+# IMAGE / runtime must be non-empty OCI references. Whitespace-only or stray CR (e.g. from env)
+# makes podman fail with: Error: invalid reference format (exit 125).
+_e2e_trim() {
+    local s="${1:-}"
+    s="${s//$'\r'/}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s}"
+}
+
+RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman 2>/dev/null || command -v docker 2>/dev/null)}"
+RUNTIME="$(_e2e_trim "${RUNTIME}")"
+UV="${UV:-uv}"
+PORT="${E2E_PORT:-18080}"
+CONFIG_ENV="${ROOT}/tests/e2e/config.env"
+
+IMAGE="$(_e2e_trim "${IMAGE:-lightspeed-agentic-sandbox:latest}")"
+if [[ -z "${IMAGE}" || -z "${IMAGE// }" ]]; then
+    IMAGE="lightspeed-agentic-sandbox:latest"
+fi
+
+if [[ -z "${RUNTIME}" ]] || ! command -v "${RUNTIME}" >/dev/null 2>&1; then
+    echo "e2e: no container runtime (set CONTAINER_RUNTIME or install podman/docker)" >&2
+    exit 1
+fi
+
+if [ ! -f "${CONFIG_ENV}" ]; then
+    echo "e2e: missing ${CONFIG_ENV}" >&2
+    exit 1
+fi
+
+NAME=""
+
+cleanup() {
+    if [ -n "${NAME}" ]; then
+        "${RUNTIME}" logs "e2e-${NAME}" >"${ROOT}/.e2e-last-container.log" 2>&1 || true
+        "${RUNTIME}" stop "e2e-${NAME}" 2>/dev/null || true
+        "${RUNTIME}" rm -f "e2e-${NAME}" 2>/dev/null || true
+        NAME=""
+    fi
+    [ -n "${GCLOUD_TMP:-}" ] && rm -f "${GCLOUD_TMP}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+provider_to_image_provider() {
+    case "$1" in
+        deepagents-claude | deepagents-gemini | deepagents-openai) echo "deepagents" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+apply_model_override() {
+    local provider="$1"
+    local model="$2"
+    case "${provider}" in
+        claude) export ANTHROPIC_MODEL="${model}" ;;
+        gemini) export GEMINI_MODEL="${model}" ;;
+        openai) export OPENAI_MODEL="${model}" ;;
+        deepagents-claude) export DEEPAGENTS_MODEL="${model}" ;;
+        deepagents-gemini)
+            export DEEPAGENTS_GEMINI_MODEL="${model}"
+            export DEEPAGENTS_MODEL="${model}"
+            ;;
+        deepagents-openai)
+            export DEEPAGENTS_OPENAI_MODEL="${model}"
+            export DEEPAGENTS_MODEL="${model}"
+            ;;
+        *)
+            echo "e2e: unknown provider for model override: ${provider}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+model_env_var() {
+    local provider="$1"
+    case "${provider}" in
+        claude) printf '%s' "ANTHROPIC_MODEL=${ANTHROPIC_MODEL}" ;;
+        gemini) printf '%s' "GEMINI_MODEL=${GEMINI_MODEL}" ;;
+        openai) printf '%s' "OPENAI_MODEL=${OPENAI_MODEL}" ;;
+        deepagents-claude) printf '%s' "DEEPAGENTS_MODEL=${DEEPAGENTS_MODEL}" ;;
+        deepagents-gemini)
+            printf '%s' "DEEPAGENTS_MODEL=${DEEPAGENTS_GEMINI_MODEL:-${DEEPAGENTS_MODEL}}"
+            ;;
+        deepagents-openai)
+            printf '%s' "DEEPAGENTS_MODEL=${DEEPAGENTS_OPENAI_MODEL:-${DEEPAGENTS_MODEL}}"
+            ;;
+        *)
+            echo "e2e: unknown provider: ${provider}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+GCLOUD_ADC="${HOME}/.config/gcloud/application_default_credentials.json"
+GCLOUD_MOUNT=""
+GCLOUD_TMP=""
+if [ -f "${GCLOUD_ADC}" ]; then
+    # Copy to a world-readable temp file so the container user (UID 1001) can read it.
+    GCLOUD_TMP="$(mktemp /tmp/gcloud-adc-XXXXXX.json)"
+    cp "${GCLOUD_ADC}" "${GCLOUD_TMP}"
+    chmod 644 "${GCLOUD_TMP}"
+    GCLOUD_MOUNT="-v ${GCLOUD_TMP}:/tmp/gcloud-adc.json:ro,Z -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-adc.json"
+
+    # Auto-enable Vertex AI when ADC is present but no Gemini API key.
+    # google-genai / google-adk need GOOGLE_GENAI_USE_VERTEXAI + project to use ADC.
+    if [[ -z "${GOOGLE_API_KEY:-}" && -z "${GEMINI_API_KEY:-}" ]]; then
+        export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-TRUE}"
+        if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+            GOOGLE_CLOUD_PROJECT="${ANTHROPIC_VERTEX_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
+            export GOOGLE_CLOUD_PROJECT
+        fi
+        export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-${CLOUD_ML_REGION:-us-east5}}"
+    fi
+fi
+
+run_one() {
+    local provider="$1"
+    local model_override="${2:-}"
+    NAME="${provider}"
+    local agent_provider
+    agent_provider=$(provider_to_image_provider "${provider}")
+
+    # shellcheck disable=SC1090
+    set -a && source <(sed 's/\r$//' "${CONFIG_ENV}") && set +a
+    # config.env must never blank IMAGE; re-apply defaults after sourcing.
+    IMAGE="$(_e2e_trim "${IMAGE:-lightspeed-agentic-sandbox:latest}")"
+    if [[ -z "${IMAGE}" || -z "${IMAGE// }" ]]; then
+        IMAGE="lightspeed-agentic-sandbox:latest"
+    fi
+
+    if [ -n "${model_override}" ]; then
+        apply_model_override "${provider}" "${model_override}"
+    fi
+
+    "${UV}" run --extra e2e python tests/e2e/credentials.py check "${provider}"
+
+    echo "e2e: starting container for ${provider} (image provider=${agent_provider})..."
+    if [[ -z "${IMAGE// }" ]]; then
+        echo "e2e: IMAGE is empty after normalization; fix your environment or Makefile" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2086
+    "${RUNTIME}" run -d --rm \
+        --name "e2e-${provider}" \
+        -p "${PORT}:8080" \
+        -e PYTHONPATH="/app/src:/opt/app-root/lib64/python3.12/site-packages" \
+        ${GCLOUD_MOUNT} \
+        -e LIGHTSPEED_AGENT_PROVIDER="${agent_provider}" \
+        -e LIGHTSPEED_SKILLS_DIR="/app/skills" \
+        -e ANTHROPIC_API_KEY \
+        -e CLAUDE_CODE_USE_VERTEX \
+        -e ANTHROPIC_VERTEX_PROJECT_ID \
+        -e CLOUD_ML_REGION \
+        -e GOOGLE_API_KEY \
+        -e GEMINI_API_KEY \
+        -e GOOGLE_GENAI_USE_VERTEXAI \
+        -e GOOGLE_CLOUD_PROJECT \
+        -e GOOGLE_CLOUD_LOCATION \
+        -e OPENAI_API_KEY \
+        -e OPENAI_BASE_URL \
+        -e AWS_ACCESS_KEY_ID \
+        -e AWS_SECRET_ACCESS_KEY \
+        -e AWS_REGION \
+        -e "$(model_env_var "${provider}")" \
+        "${IMAGE}"
+
+    echo "e2e: waiting for /health on port ${PORT}..."
+    local attempt
+    for attempt in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            echo "e2e: ${provider} ready"
+            break
+        fi
+        if [ "${attempt}" -eq 60 ]; then
+            echo "e2e: timeout waiting for ${provider}" >&2
+            "${RUNTIME}" logs "e2e-${provider}" 2>&1 | tail -30 >&2 || true
+            exit 1
+        fi
+        sleep 1
+    done
+
+    export SANDBOX_SERVICE_URL="http://127.0.0.1:${PORT}"
+    export E2E_PROVIDER="${provider}"
+
+    echo "e2e: running pytest for ${provider}..."
+    # shellcheck disable=SC2086
+    "${UV}" run --extra e2e pytest -c tests/e2e/pytest.ini tests/e2e -v ${E2E_ARGS:-}
+}
+
+PROVIDERS=(claude gemini openai deepagents-claude deepagents-gemini deepagents-openai)
+
+if [ $# -eq 0 ]; then
+    for p in "${PROVIDERS[@]}"; do
+        NAME="${p}"
+        cleanup || true
+        NAME=""
+        run_one "${p}" ""
+        cleanup || true
+        NAME=""
+    done
+else
+    provider="$1"
+    shift || true
+    model="${1:-}"
+    if [ -n "${model}" ]; then
+        shift || true
+    fi
+    run_one "${provider}" "${model}"
+fi

@@ -3,7 +3,16 @@ UV := uv
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 IMAGE := lightspeed-agentic-sandbox:latest
 
-.PHONY: install install-all lock test lint format mypy verify eval eval-report image clean help \
+ifneq ($(filter e2e,$(MAKECMDGOALS)),)
+E2E_EXTRA_TARGETS := $(filter-out e2e,$(MAKECMDGOALS))
+ifneq ($(E2E_EXTRA_TARGETS),)
+.PHONY: $(E2E_EXTRA_TARGETS)
+$(E2E_EXTRA_TARGETS):
+	@:
+endif
+endif
+
+.PHONY: install install-all lock test lint format mypy verify eval eval-report e2e image clean help \
        requirements bump-deps rpm-lockfile
 
 help: ## Show this help
@@ -20,7 +29,7 @@ lock: ## Refresh uv.lock from pyproject.toml
 	$(UV) lock
 
 test: ## Run unit tests
-	$(UV) run pytest tests/ -v
+	$(UV) run pytest tests/ -v --ignore=tests/e2e
 
 lint: ## Run ruff linter
 	$(UV) run ruff check .
@@ -47,6 +56,9 @@ eval: image ## Run evals against live containers (use EVAL_ARGS to filter, e.g. 
 
 eval-report: image ## Run evals and generate JSON report
 	PYTEST="$(UV) run pytest" bash evals/run.sh --eval-report=evals/report.json $(EVAL_ARGS)
+
+e2e: image ## E2E BDD (make e2e | make e2e openai | make e2e openai gpt-4.1-mini). Optional: E2E_ARGS for pytest.
+	IMAGE="$(IMAGE)" E2E_ARGS="$(E2E_ARGS)" bash scripts/e2e-containers.sh $(filter-out e2e,$(MAKECMDGOALS))
 
 requirements: pyproject.toml ## Generate requirements.txt files for Konflux hermetic builds
 	$(UV) pip compile pyproject.toml --extra all --extra eval \
