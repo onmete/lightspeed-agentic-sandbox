@@ -30,7 +30,6 @@ else:
             pass
 
 
-from lightspeed_agentic.tools import resolve_skills_dir
 from lightspeed_agentic.types import (
     TOOL_INPUT_MAX_CHARS,
     TOOL_OUTPUT_MAX_CHARS,
@@ -120,13 +119,12 @@ class OpenAIProvider(AgentProvider):
             self._client = AsyncOpenAI(base_url=os.environ.get("OPENAI_BASE_URL"))
         model = OpenAIResponsesModel(model=options.model, openai_client=self._client)
 
-        skills_dir = resolve_skills_dir(options.cwd)
         capabilities = [
             Shell(),
             Filesystem(),
             Skills(
                 lazy_from=LocalDirLazySkillSource(
-                    source=LocalDir(src=Path(skills_dir)),
+                    source=LocalDir(src=Path(options.cwd)),
                 )
             ),
         ]

@@ -14,7 +14,6 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from lightspeed_agentic.tools import resolve_skills_dir
 from lightspeed_agentic.types import (
     TOOL_INPUT_MAX_CHARS,
     TOOL_OUTPUT_MAX_CHARS,
@@ -37,7 +36,7 @@ def _load_skills_toolset(skills_dir: str) -> Any:
         from google.adk.skills import list_skills_in_dir, load_skill_from_dir
         from google.adk.tools.skill_toolset import SkillToolset
 
-        target = pathlib.Path(resolve_skills_dir(skills_dir))
+        target = pathlib.Path(skills_dir)
         skill_entries = list_skills_in_dir(target)
         skills = [
             load_skill_from_dir(target / skill_id)

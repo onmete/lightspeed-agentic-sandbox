@@ -70,10 +70,10 @@ for i in "${!PROVIDERS[@]}"; do
     mkdir -p "$outdir"
     WORKDIRS+=("$workdir")
     OUTDIRS+=("$outdir")
-    cp -r "$(pwd)/evals/workspace/skills" "$workdir/skills"
     cp -r "$(pwd)/evals/workspace/tools" "$workdir/tools"
-    mkdir -p "$workdir/.claude"
-    cp -r "$(pwd)/evals/workspace/skills" "$workdir/.claude/skills"
+    for skill in "$(pwd)/evals/workspace/skills"/*/; do
+        [ -d "$skill" ] && cp -r "$skill" "$workdir/$(basename "$skill")"
+    done
     chmod -R 777 "$workdir" "$outdir"
 
     cid=$($RUNTIME run -d --rm \

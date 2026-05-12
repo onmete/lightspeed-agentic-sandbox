@@ -5,8 +5,11 @@ Maps to lightspeed-agent/src/providers/claude.ts.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from lightspeed_agentic.types import (
     TOOL_INPUT_MAX_CHARS,
@@ -23,11 +26,48 @@ from lightspeed_agentic.types import (
     stringify,
 )
 
+_skills_link_cache: dict[str, str] = {}
+
 
 class ClaudeProvider(AgentProvider):
     @property
     def name(self) -> str:
         return "claude"
+
+    @staticmethod
+    def _ensure_skills_link(cwd: str) -> str:
+        """Set up .claude/skills/ with symlinks to each skill dir in cwd.
+
+        Claude Code discovers skills from .claude/skills/ under its cwd.
+        Creates the structure in cwd if writable (evals), otherwise falls
+        back to /tmp (cluster with read-only volume mounts).
+        """
+        if cwd in _skills_link_cache:
+            return _skills_link_cache[cwd]
+
+        cwd_path = Path(cwd)
+        if (cwd_path / ".claude" / "skills").exists():
+            _skills_link_cache[cwd] = cwd
+            return cwd
+
+        fallback = Path(tempfile.gettempdir()) / "claude-workspace"
+        for base in [cwd_path, fallback]:
+            skills_dir = base / ".claude" / "skills"
+            try:
+                skills_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            for entry in cwd_path.iterdir():
+                if entry.name.startswith(".") or not entry.is_dir():
+                    continue
+                with contextlib.suppress(FileExistsError):
+                    (skills_dir / entry.name).symlink_to(entry)
+            result = str(base)
+            _skills_link_cache[cwd] = result
+            return result
+
+        _skills_link_cache[cwd] = cwd
+        return cwd
 
     async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
         from claude_agent_sdk import (
@@ -37,6 +77,8 @@ class ClaudeProvider(AgentProvider):
             StreamEvent,
             query,
         )
+
+        effective_cwd = self._ensure_skills_link(options.cwd)
 
         output_format: dict[str, object] | None = None
         if options.output_schema:
@@ -52,22 +94,49 @@ class ClaudeProvider(AgentProvider):
             system_prompt=options.system_prompt,
             allowed_tools=options.allowed_tools,
             permission_mode="bypassPermissions",
-            cwd=options.cwd,
+            cwd=effective_cwd,
             skills="all",
             include_partial_messages=True,
             output_format=output_format,
         )
 
+        _tool_name = ""
+        _tool_input_parts: list[str] = []
+        _tool_input_len = 0
+
         async for msg in query(prompt=options.prompt, options=sdk_options):
             if isinstance(msg, StreamEvent):
                 event = msg.event
-                if event.get("type") == "content_block_delta":
+                etype = event.get("type")
+                if etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        _tool_name = block.get("name", "")
+                        _tool_input_parts.clear()
+                        _tool_input_len = 0
+                elif etype == "content_block_delta":
                     delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta" and delta.get("text"):
+                    dtype = delta.get("type")
+                    if dtype == "text_delta" and delta.get("text"):
                         yield TextDeltaEvent(text=delta["text"])
-                    elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                    elif dtype == "thinking_delta" and delta.get("thinking"):
                         yield ThinkingDeltaEvent(thinking=delta["thinking"])
-                elif event.get("type") == "content_block_stop":
+                    elif (
+                        dtype == "input_json_delta"
+                        and delta.get("partial_json")
+                        and _tool_input_len < TOOL_INPUT_MAX_CHARS
+                    ):
+                        _tool_input_parts.append(delta["partial_json"])
+                        _tool_input_len += len(delta["partial_json"])
+                elif etype == "content_block_stop":
+                    if _tool_name:
+                        yield ToolCallEvent(
+                            name=_tool_name,
+                            input="".join(_tool_input_parts)[:TOOL_INPUT_MAX_CHARS],
+                        )
+                        _tool_name = ""
+                        _tool_input_parts.clear()
+                        _tool_input_len = 0
                     yield ContentBlockStopEvent()
                 continue
 
