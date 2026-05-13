@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -33,6 +34,15 @@ def provider_name() -> str:
     if not name:
         pytest.fail("E2E_PROVIDER is not set (e2e-containers.sh exports it)")
     return name
+
+
+@pytest.fixture
+def e2e_output_dir() -> Path | None:
+    """Host-side output directory where skill tools write token files."""
+    raw = os.environ.get("E2E_OUTPUT_DIR", "").strip()
+    if not raw:
+        return None
+    return Path(raw)
 
 
 @pytest.fixture

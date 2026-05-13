@@ -17,4 +17,4 @@ evals/report.json
 /.eval-workspaces/
 .ols/
 *.log
-.e2e-last-container.log
+.e2e/

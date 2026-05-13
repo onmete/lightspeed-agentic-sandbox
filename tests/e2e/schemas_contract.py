@@ -35,6 +35,17 @@ NESTED_OUTPUT_SCHEMA: dict[str, Any] = {
     "required": ["success", "summary", "items"],
 }
 
+ECHO_TOKEN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "success": {"type": "boolean"},
+        "summary": {"type": "string"},
+        "token": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["ok"]},
+    },
+    "required": ["success", "summary", "token", "status"],
+}
+
 # Strict schema used with a prompt that encourages invalid / non-JSON output.
 STRICT_CONFLICT_SCHEMA: dict[str, Any] = {
     "type": "object",
