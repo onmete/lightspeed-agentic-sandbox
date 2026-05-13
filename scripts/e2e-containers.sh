@@ -6,6 +6,12 @@
 #   bash scripts/e2e-containers.sh openai          # one provider, default model from config.env
 #   bash scripts/e2e-containers.sh openai gpt-4.1-nano   # optional model override
 #
+# OpenShift CI / no container runtime (host uvicorn):
+#   E2E_PROW_HOST=1 bash scripts/e2e-containers.sh openai
+#   bash scripts/e2e-containers.sh --prow-host openai
+# Optional: E2E_SKIP_INSTALL=1 if deps already installed; E2E_HOST_PORT=8080 (default);
+# ARTIFACT_DIR is used for E2E_OUTPUT_DIR when set (Prow).
+#
 # Exports SANDBOX_SERVICE_URL and E2E_PROVIDER for pytest. Missing credentials exit non-zero
 # before any container starts.
 
@@ -14,6 +20,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 cd "${ROOT}"
+
+E2E_PROW_HOST="${E2E_PROW_HOST:-0}"
+if [[ "${1:-}" == "--prow-host" ]]; then
+    E2E_PROW_HOST=1
+    shift
+fi
 
 # IMAGE / runtime must be non-empty OCI references. Whitespace-only or stray CR (e.g. from env)
 # makes podman fail with: Error: invalid reference format (exit 125).
@@ -36,19 +48,28 @@ if [[ -z "${IMAGE}" || -z "${IMAGE// }" ]]; then
     IMAGE="lightspeed-agentic-sandbox:latest"
 fi
 
-if [[ -z "${RUNTIME}" ]] || ! command -v "${RUNTIME}" >/dev/null 2>&1; then
-    echo "e2e: no container runtime (set CONTAINER_RUNTIME or install podman/docker)" >&2
-    exit 1
-fi
-
 if [ ! -f "${CONFIG_ENV}" ]; then
     echo "e2e: missing ${CONFIG_ENV}" >&2
     exit 1
 fi
 
+if [[ "${E2E_PROW_HOST}" != "1" ]]; then
+    if [[ -z "${RUNTIME}" ]] || ! command -v "${RUNTIME}" >/dev/null 2>&1; then
+        echo "e2e: no container runtime (set CONTAINER_RUNTIME or install podman/docker)" >&2
+        echo "e2e: or use E2E_PROW_HOST=1 / --prow-host for host uvicorn (e.g. OpenShift CI)" >&2
+        exit 1
+    fi
+fi
+
 NAME=""
+SERVER_PID=""
+E2E_SKILLS_WORKDIR=""
 
 cleanup() {
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill "${SERVER_PID}" 2>/dev/null || true
+        SERVER_PID=""
+    fi
     if [ -n "${NAME}" ]; then
         "${RUNTIME}" logs "e2e-${NAME}" >"${ROOT}/.e2e-last-container.log" 2>&1 || true
         "${RUNTIME}" stop "e2e-${NAME}" 2>/dev/null || true
@@ -56,6 +77,7 @@ cleanup() {
         NAME=""
     fi
     [ -n "${GCLOUD_TMP:-}" ] && rm -f "${GCLOUD_TMP}" 2>/dev/null || true
+    [ -n "${E2E_SKILLS_WORKDIR}" ] && rm -rf "${E2E_SKILLS_WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -109,6 +131,24 @@ model_env_var() {
     esac
 }
 
+# Align DEEPAGENTS_MODEL with docker -e behavior for default models from config.env.
+sync_deepagents_model_for_provider() {
+    local provider="$1"
+    case "${provider}" in
+        deepagents-gemini) export DEEPAGENTS_MODEL="${DEEPAGENTS_GEMINI_MODEL:-${DEEPAGENTS_MODEL}}" ;;
+        deepagents-openai) export DEEPAGENTS_MODEL="${DEEPAGENTS_OPENAI_MODEL:-${DEEPAGENTS_MODEL}}" ;;
+    esac
+}
+
+prepare_e2e_skills_workspace() {
+    local ws="${ROOT}/tests/e2e/workspace"
+    E2E_SKILLS_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/e2e-skills-XXXXXX")"
+    for _skill_dir in "${ws}/skills"/*/; do
+        [ -d "${_skill_dir}" ] && cp -a "${_skill_dir}" "${E2E_SKILLS_WORKDIR}/$(basename "${_skill_dir}")"
+    done
+    chmod -R a+rwX "${E2E_SKILLS_WORKDIR}"
+}
+
 GCLOUD_ADC="${HOME}/.config/gcloud/application_default_credentials.json"
 GCLOUD_MOUNT=""
 GCLOUD_TMP=""
@@ -131,6 +171,64 @@ if [ -f "${GCLOUD_ADC}" ]; then
     fi
 fi
 
+run_one_host() {
+    local provider="$1"
+    local model_override="${2:-}"
+    local agent_provider
+    local host_port="${E2E_HOST_PORT:-8080}"
+    local outdir="${ROOT}/.e2e-output-${provider}"
+
+    agent_provider=$(provider_to_image_provider "${provider}")
+
+    # shellcheck disable=SC1090
+    set -a && source <(sed 's/\r$//' "${CONFIG_ENV}") && set +a
+
+    if [ -n "${model_override}" ]; then
+        apply_model_override "${provider}" "${model_override}"
+    fi
+    sync_deepagents_model_for_provider "${provider}"
+
+    if [[ -z "${E2E_SKIP_INSTALL:-}" ]]; then
+        make install-all
+    fi
+
+    "${UV}" run --extra e2e python tests/e2e/credentials.py check "${provider}"
+
+    rm -rf "${outdir}" 2>/dev/null || true
+    mkdir -p "${outdir}"
+    chmod -R a+rwX "${outdir}"
+
+    prepare_e2e_skills_workspace
+    export LIGHTSPEED_AGENT_PROVIDER="${agent_provider}"
+    export LIGHTSPEED_SKILLS_DIR="${E2E_SKILLS_WORKDIR}"
+
+    echo "e2e: starting uvicorn (host) for ${provider} (image provider=${agent_provider}) on :${host_port}..."
+    "${UV}" run python -m uvicorn lightspeed_agentic.app:app --host 0.0.0.0 --port "${host_port}" &
+    SERVER_PID=$!
+
+    echo "e2e: waiting for /health on port ${host_port}..."
+    local attempt
+    for attempt in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:${host_port}/health" >/dev/null 2>&1; then
+            echo "e2e: ${provider} ready"
+            break
+        fi
+        if [ "${attempt}" -eq 60 ]; then
+            echo "e2e: timeout waiting for ${provider}" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+
+    export SANDBOX_SERVICE_URL="http://127.0.0.1:${host_port}"
+    export E2E_PROVIDER="${provider}"
+    export E2E_OUTPUT_DIR="${ARTIFACT_DIR:-$outdir}"
+
+    echo "e2e: running pytest for ${provider}..."
+    # shellcheck disable=SC2086
+    "${UV}" run --extra e2e pytest -c tests/e2e/pytest.ini tests/e2e -v ${E2E_ARGS:-}
+}
+
 run_one() {
     local provider="$1"
     local model_override="${2:-}"
@@ -149,6 +247,7 @@ run_one() {
     if [ -n "${model_override}" ]; then
         apply_model_override "${provider}" "${model_override}"
     fi
+    sync_deepagents_model_for_provider "${provider}"
 
     "${UV}" run --extra e2e python tests/e2e/credentials.py check "${provider}"
 
@@ -206,6 +305,21 @@ run_one() {
 }
 
 PROVIDERS=(claude gemini openai deepagents-claude deepagents-gemini deepagents-openai)
+
+if [[ "${E2E_PROW_HOST}" == "1" ]]; then
+    if [[ $# -lt 1 ]]; then
+        echo "e2e: --prow-host (or E2E_PROW_HOST=1) requires a provider: ${PROVIDERS[*]}" >&2
+        exit 1
+    fi
+    provider="$1"
+    shift || true
+    model="${1:-}"
+    if [ -n "${model}" ]; then
+        shift || true
+    fi
+    run_one_host "${provider}" "${model}"
+    exit 0
+fi
 
 if [ $# -eq 0 ]; then
     for p in "${PROVIDERS[@]}"; do
