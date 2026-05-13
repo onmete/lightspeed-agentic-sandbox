@@ -86,3 +86,19 @@ on SDK support and is not a provider-level requirement yet.
 - Retry or fallback logic — that belongs upstream.
 - Request validation — the route layer validates before
   calling the provider.
+
+## Verification
+
+BDD feature files that exercise this spec:
+
+| Feature file | Scenarios |
+|---|---|
+| `tests/e2e/features/structured_output.feature` | Run with flat schema and required fields; Run with nested schema; Adversarial schema does not return HTTP 500 |
+
+Coverage mapping:
+- **Structured output** (each provider uses its native mechanism) →
+  "Run with flat schema", "Run with nested schema"
+- **Graceful degradation on schema failure** →
+  "Adversarial schema does not return HTTP 500"
+- **Events** → not yet covered by E2E (unit-tested only)
+- **Cost reporting** → not yet covered

@@ -20,6 +20,17 @@ Specs capture invariants, design decisions, and known quirks that the code
 cannot express about itself. The code and this file cover the "how" — specs
 cover the "why" and the "must."
 
+### Component Specs
+
+Each spec has a Verification section linking to BDD feature files that exercise
+its rules. Use this table to navigate from component → spec → executable tests:
+
+| Spec | Description | Feature files |
+|---|---|---|
+| [query-api.md](.ai/spec/query-api.md) | `/run` endpoint: parsing, timeouts, context prefix, streaming | [structured_output.feature](tests/e2e/features/structured_output.feature) |
+| [provider-contract.md](.ai/spec/provider-contract.md) | Provider adapter rules: events, structured output, thin-adapter principle | [structured_output.feature](tests/e2e/features/structured_output.feature) |
+| [configuration.md](.ai/spec/configuration.md) | Provider selection, model resolution, skills directory, env vars | [structured_output.feature](tests/e2e/features/structured_output.feature) (implicit) |
+
 ## Quick Commands
 
 ```bash

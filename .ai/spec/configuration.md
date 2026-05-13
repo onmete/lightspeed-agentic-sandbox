@@ -91,3 +91,19 @@ Bash, Read, Glob, Grep, and Skill. This list is shared
 across all providers and both query and chat routes.
 Individual providers wire these into their SDK's native tool
 mechanism.
+
+## Verification
+
+BDD feature files that exercise this spec:
+
+| Feature file | Scenarios |
+|---|---|
+| `tests/e2e/features/structured_output.feature` | All scenarios (implicitly — each E2E run validates provider selection and model resolution via `config.env` defaults) |
+
+Coverage mapping:
+- **Provider selection** → validated by running each provider's
+  container with `LIGHTSPEED_AGENT_PROVIDER` set
+- **Model resolution** → cheap model defaults in `tests/e2e/config.env`
+  exercise the env-var resolution chain
+- **Skills directory resolution** → not yet covered by E2E
+- **Timeouts** → not yet covered by E2E (unit-tested only)
