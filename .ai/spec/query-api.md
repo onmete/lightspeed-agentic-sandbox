@@ -60,3 +60,18 @@ mechanism beyond the instruction itself.
 
 Query routes do not use streaming — the provider runs to
 completion and the handler waits for the final result event.
+
+## Verification
+
+BDD feature files that exercise this spec:
+
+| Feature file | Scenarios |
+|---|---|
+| `tests/e2e/features/structured_output.feature` | Run with flat schema and required fields; Run with nested schema; Run without output schema; Adversarial schema does not return HTTP 500 |
+
+Coverage mapping:
+- **Response parsing** (JSON path + plain-text path) →
+  "Run with flat schema", "Run with nested schema", "Run without output schema"
+- **Graceful degradation** (non-JSON treated as success) →
+  "Run without output schema", "Adversarial schema does not return HTTP 500"
+- **Timeout** → not yet covered by E2E (unit-tested only)
