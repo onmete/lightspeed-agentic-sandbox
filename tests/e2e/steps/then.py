@@ -16,6 +16,7 @@ def assert_status_200(bdd_context: dict[str, Any]) -> None:
     res: RunHttpResult = bdd_context["http_result"]
     assert res.error is None, f"transport error: {res.error}"
     assert res.status_code == 200, f"expected 200, got {res.status_code}: {res.raw_text[:500]}"
+    assert False, "DELIBERATE FAILURE: testing GitHub Actions failure propagation"
 
 
 @then("the response includes success summary and ticketId fields")
