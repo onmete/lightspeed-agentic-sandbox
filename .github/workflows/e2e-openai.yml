@@ -1,0 +1,60 @@
+name: E2E — OpenAI
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".ols/**"
+      - "evals/**"
+      - "LICENSE"
+      - ".gitignore"
+      - "OWNERS"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".ols/**"
+      - "evals/**"
+      - "LICENSE"
+      - ".gitignore"
+      - "OWNERS"
+
+concurrency:
+  group: e2e-openai-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-openai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: make install-all
+
+      - name: Validate credentials
+        run: uv run --extra e2e python tests/e2e/credentials.py check openai
+
+      - name: Run E2E (OpenAI)
+        run: E2E_PROW_HOST=1 E2E_SKIP_INSTALL=1 bash scripts/e2e-containers.sh openai
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-openai-results
+          path: .e2e-output-openai/
+          if-no-files-found: ignore
