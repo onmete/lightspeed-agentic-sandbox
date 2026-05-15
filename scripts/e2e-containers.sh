@@ -65,6 +65,16 @@ NAME=""
 SERVER_PID=""
 E2E_SKILLS_WORKDIR=""
 
+# Container-created files may be owned by mapped UIDs (rootless podman).
+# Try plain rm first, fall back to runtime unshare.
+_rm_container_owned() {
+    local target="$1"
+    [ -e "${target}" ] || return 0
+    rm -rf "${target}" 2>/dev/null \
+        || "${RUNTIME}" unshare rm -rf "${target}" 2>/dev/null \
+        || true
+}
+
 cleanup() {
     if [[ -n "${SERVER_PID:-}" ]]; then
         kill "${SERVER_PID}" 2>/dev/null || true
@@ -76,8 +86,8 @@ cleanup() {
         "${RUNTIME}" rm -f "e2e-${NAME}" 2>/dev/null || true
         NAME=""
     fi
+    _rm_container_owned "${ROOT}/.e2e"
     [ -n "${GCLOUD_TMP:-}" ] && rm -f "${GCLOUD_TMP}" 2>/dev/null || true
-    [ -n "${E2E_SKILLS_WORKDIR}" ] && rm -rf "${E2E_SKILLS_WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -142,7 +152,9 @@ sync_deepagents_model_for_provider() {
 
 prepare_e2e_skills_workspace() {
     local ws="${ROOT}/tests/e2e/workspace"
-    E2E_SKILLS_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/e2e-skills-XXXXXX")"
+    E2E_SKILLS_WORKDIR="${ROOT}/.e2e/skills"
+    _rm_container_owned "${E2E_SKILLS_WORKDIR}"
+    mkdir -p "${E2E_SKILLS_WORKDIR}"
     for _skill_dir in "${ws}/skills"/*/; do
         [ -d "${_skill_dir}" ] && cp -a "${_skill_dir}" "${E2E_SKILLS_WORKDIR}/$(basename "${_skill_dir}")"
     done
@@ -176,7 +188,7 @@ run_one_host() {
     local model_override="${2:-}"
     local agent_provider
     local host_port="${E2E_HOST_PORT:-8080}"
-    local outdir="${ROOT}/.e2e-output-${provider}"
+    local outdir="${ROOT}/.e2e/output-${provider}"
 
     agent_provider=$(provider_to_image_provider "${provider}")
 
@@ -251,6 +263,13 @@ run_one() {
 
     "${UV}" run --extra e2e python tests/e2e/credentials.py check "${provider}"
 
+    local outdir="${ROOT}/.e2e/output-${provider}"
+    rm -rf "${outdir}" 2>/dev/null || true
+    mkdir -p "${outdir}"
+    chmod -R a+rwX "${outdir}"
+
+    prepare_e2e_skills_workspace
+
     echo "e2e: starting container for ${provider} (image provider=${agent_provider})..."
     if [[ -z "${IMAGE// }" ]]; then
         echo "e2e: IMAGE is empty after normalization; fix your environment or Makefile" >&2
@@ -260,10 +279,13 @@ run_one() {
     "${RUNTIME}" run -d --rm \
         --name "e2e-${provider}" \
         -p "${PORT}:8080" \
+        -v "${E2E_SKILLS_WORKDIR}:/app/skills:Z" \
+        -v "${outdir}:/app/e2e-output:Z" \
         -e PYTHONPATH="/app/src:/opt/app-root/lib64/python3.12/site-packages" \
         ${GCLOUD_MOUNT} \
         -e LIGHTSPEED_AGENT_PROVIDER="${agent_provider}" \
         -e LIGHTSPEED_SKILLS_DIR="/app/skills" \
+        -e E2E_OUTPUT_DIR="/app/e2e-output" \
         -e ANTHROPIC_API_KEY \
         -e CLAUDE_CODE_USE_VERTEX \
         -e ANTHROPIC_VERTEX_PROJECT_ID \
@@ -298,6 +320,7 @@ run_one() {
 
     export SANDBOX_SERVICE_URL="http://127.0.0.1:${PORT}"
     export E2E_PROVIDER="${provider}"
+    export E2E_OUTPUT_DIR="${outdir}"
 
     echo "e2e: running pytest for ${provider}..."
     # shellcheck disable=SC2086

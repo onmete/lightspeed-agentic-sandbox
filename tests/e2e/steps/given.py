@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from pytest_bdd import given
 
 from schemas_contract import (
+    ECHO_TOKEN_SCHEMA,
     FLAT_OUTPUT_SCHEMA,
     NESTED_OUTPUT_SCHEMA,
     STRICT_CONFLICT_SCHEMA,
@@ -16,6 +18,30 @@ from schemas_contract import (
 @given("the sandbox service is running")
 def sandbox_running(server_url: str) -> None:
     assert server_url.startswith("http"), f"unexpected server URL: {server_url!r}"
+
+
+@given("the sandbox service is running with skills")
+def sandbox_running_with_skills(server_url: str, e2e_output_dir: Path | None) -> None:
+    assert server_url.startswith("http"), f"unexpected server URL: {server_url!r}"
+    assert e2e_output_dir is not None, (
+        "E2E_OUTPUT_DIR not set — skills not mounted (run via scripts/e2e-containers.sh)"
+    )
+
+
+@given("a simple non-skill query has been prepared")
+def prepare_simple_non_skill(bdd_context: dict[str, Any]) -> None:
+    bdd_context["query"] = "In one sentence, name any primary color."
+    bdd_context["output_schema"] = None
+
+
+@given("the echo-token skill query has been prepared")
+def prepare_echo_token(bdd_context: dict[str, Any]) -> None:
+    bdd_context["query"] = (
+        "Use the 'echo-token' skill to generate a verification token. "
+        "The skill instructions tell you to run: bash echo-token/tools/echo-token.sh "
+        "Return the token and status values from the script output."
+    )
+    bdd_context["output_schema"] = ECHO_TOKEN_SCHEMA
 
 
 @given("a flat output schema with required fields has been prepared")
