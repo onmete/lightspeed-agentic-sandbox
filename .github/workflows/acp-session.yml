@@ -70,7 +70,7 @@ jobs:
 
           testing = os.environ.get("ACP_REVIEW_TESTING", "true").lower() == "true"
 
-          # Avoid literal "<!--" in this YAML file — GitHub strips HTML comments from workflows.
+# GitHub strips HTML comment delimiters from workflow YAML; build them via hex escapes below.
           c_open = "\x3c!-- AC_REVIEW_CLOSURE"
           c_close = "--\x3e"
 
