@@ -1,0 +1,345 @@
+# Ambient Code Platform — PR review against linked Jira acceptance criteria.
+# Docs: https://ambient-code.github.io/platform/extensions/github-action/
+#
+# Runs on every new PR (opened). Requires Jira integration on the ACP project.
+#
+# Secrets: ACP_URL, ACP_TOKEN, ACP_PROJECT
+# Optional variable: ACP_NO_VERIFY_SSL=true
+
+name: ACP PR Review
+
+on:
+  pull_request:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+concurrency:
+  group: acp-pr-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Set to false when ready for full AC review + fail-on-miss behavior.
+      ACP_REVIEW_TESTING: "true"
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Load PR metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh pr view "${{ steps.pr.outputs.number }}" --json title,body,headRefName,baseRefName,url \
+            > "${RUNNER_TEMP}/pr.json"
+          echo "branch=$(jq -r '.headRefName' "${RUNNER_TEMP}/pr.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Build review prompt
+        id: prompt
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_BRANCH: ${{ steps.meta.outputs.branch }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          with open(os.environ["RUNNER_TEMP"] + "/pr.json") as f:
+              pr = json.load(f)
+
+          testing = os.environ.get("ACP_REVIEW_TESTING", "true").lower() == "true"
+
+          closure_spec = """
+## Required summary closure (machine-readable — do not skip)
+
+After your human-readable review, append **exactly** this HTML comment block as the last thing in your reply.
+Copy the format verbatim (raw HTML comment only — no markdown code fences around it).
+GitHub Actions parses it to pass/fail the check.
+
+Testing mode:
+<!-- AC_REVIEW_CLOSURE
+VERDICT=PASS
+JIRA_KEYS=OLS-1234
+SMOKE_TEST=OK
+SUMMARY=Jira and repository access verified.
+-->
+
+Full review mode:
+<!-- AC_REVIEW_CLOSURE
+VERDICT=FAIL
+JIRA_KEYS=OLS-1234,OCPSTRAT-99
+CRITERIA_TOTAL=5
+CRITERIA_MET=3
+CRITERIA_NOT_MET=2
+CRITERIA_UNCLEAR=0
+SUMMARY=Two acceptance criteria lack tests and error handling.
+-->
+
+Rules:
+- `VERDICT` must be one of: `PASS`, `FAIL`, `WARN`
+- `PASS` — all criteria met (full mode) or smoke test OK (testing mode)
+- `FAIL` — any criterion **Not met** or merge-blocking gap
+- `WARN` — no Jira key, Jira/AC unavailable, or review inconclusive
+- `JIRA_KEYS` — comma-separated keys, or `NONE`
+- Count fields must be non-negative integers; in testing mode you may set criteria counts to `0`
+- `SUMMARY` — one line, no newlines inside the value
+"""
+
+          testing_block = """## Testing mode (current)
+Smoke test only:
+1. Extract Jira keys from the PR title and description (e.g. OLS-1234, OCPSTRAT-1234).
+2. Fetch each issue and its acceptance criteria via the Jira integration.
+3. Confirm you can read the repository at the PR head branch.
+4. Do **not** judge criteria met/not met yet.
+
+Write a short human summary, then the closure block with `SMOKE_TEST=OK` or `SMOKE_TEST=FAILED`.
+"""
+
+          full_review_block = """## Full review mode
+1. Extract Jira keys from the PR title and description.
+2. Fetch each issue and acceptance criteria (or AC / Definition of Done).
+3. Review the full PR diff against the base branch.
+4. For each criterion: **Met** / **Not met** / **Unclear** with evidence.
+5. Human summary for the PR comment, then the closure block with accurate counts.
+
+Do not push commits.
+"""
+
+          mode = testing_block if testing else full_review_block
+
+          prompt = f"""# ACP PR review — Jira acceptance criteria
+
+Repository: {os.environ["REPOSITORY"]}
+Pull request: #{os.environ["PR_NUMBER"]}
+URL: {pr["url"]}
+Base: {pr["baseRefName"]} ← Head: {os.environ["HEAD_BRANCH"]}
+
+Title: {pr["title"]}
+
+Description:
+{pr.get("body") or "(none)"}
+
+{mode}
+{closure_spec}
+
+Format the human-readable portion as GitHub markdown. The closure block must be last.
+"""
+
+          print("text<<EOF")
+          print(prompt.rstrip())
+          print("EOF")
+          PY
+
+      - name: Run ACP PR review session
+        id: session
+        uses: ambient-code/ambient-action@v0.0.5
+        with:
+          api-url: ${{ secrets.ACP_URL }}
+          api-token: ${{ secrets.ACP_TOKEN }}
+          project: ${{ secrets.ACP_PROJECT }}
+          display-name: pr-review-${{ github.repository }}-${{ steps.pr.outputs.number }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          repos: |
+            [
+              {
+                "url": "https://github.com/${{ github.repository }}.git",
+                "branch": "${{ steps.meta.outputs.branch }}",
+                "autoPush": false
+              }
+            ]
+          labels: |
+            {
+              "github.repository": "${{ github.repository }}",
+              "github.pr": "${{ steps.pr.outputs.number }}",
+              "task": "pr-review-jira"
+            }
+          wait: "true"
+          poll-interval: 15
+          poll-timeout: 90
+          stop-on-run-finished: true
+          no-verify-ssl: ${{ vars.ACP_NO_VERIFY_SSL == 'true' && 'true' || 'false' }}
+
+      - name: Parse review closure
+        id: closure
+        env:
+          SESSION_RESULT: ${{ steps.session.outputs.session-result }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SESSION_RESULT" > "${RUNNER_TEMP}/session-result.txt"
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          import sys
+
+          path = os.environ["RUNNER_TEMP"] + "/session-result.txt"
+          text = open(path, encoding="utf-8").read()
+
+          match = re.search(
+              r"<!--\s*AC_REVIEW_CLOSURE\s*(.*?)\s*-->",
+              text,
+              re.DOTALL | re.IGNORECASE,
+          )
+          public_path = os.environ["RUNNER_TEMP"] + "/review-public.md"
+
+          if not match:
+              print("found=false")
+              with open(public_path, "w", encoding="utf-8") as f:
+                  f.write(text.strip())
+              sys.exit(0)
+
+          fields: dict[str, str] = {}
+          for line in match.group(1).strip().splitlines():
+              line = line.strip()
+              if not line or "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              fields[key.strip().upper()] = value.strip()
+
+          def out(name: str, value: str) -> None:
+              print(f"{name}={value}")
+
+          out("found", "true")
+          out("verdict", fields.get("VERDICT", ""))
+          out("jira_keys", fields.get("JIRA_KEYS", ""))
+          out("summary", fields.get("SUMMARY", ""))
+          out("smoke_test", fields.get("SMOKE_TEST", ""))
+          out("criteria_total", fields.get("CRITERIA_TOTAL", ""))
+          out("criteria_met", fields.get("CRITERIA_MET", ""))
+          out("criteria_not_met", fields.get("CRITERIA_NOT_MET", ""))
+          out("criteria_unclear", fields.get("CRITERIA_UNCLEAR", ""))
+
+          # Strip closure from PR comment body (HTML comment is hidden on GitHub)
+          public = re.sub(
+              r"<!--\s*AC_REVIEW_CLOSURE\s*.*?\s*-->",
+              "",
+              text,
+              count=1,
+              flags=re.DOTALL | re.IGNORECASE,
+          ).strip()
+          with open(public_path, "w", encoding="utf-8") as f:
+              f.write(public)
+          PY
+
+      - name: Post review on PR
+        if: steps.session.outputs.session-url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SESSION_URL: ${{ steps.session.outputs.session-url }}
+          SESSION_PHASE: ${{ steps.session.outputs.session-phase }}
+        run: |
+          set -euo pipefail
+          BODY_FILE="${RUNNER_TEMP}/review-public.md"
+          if [ ! -f "$BODY_FILE" ]; then
+            printf '%s' "${{ steps.session.outputs.session-result }}" > "$BODY_FILE"
+          fi
+          {
+            echo "## Ambient PR review (Jira AC)"
+            echo ""
+            echo "**Session:** [${SESSION_PHASE}](${SESSION_URL})"
+            if [ "${{ steps.closure.outputs.found }}" = "true" ]; then
+              echo ""
+              echo "**Verdict:** \`${{ steps.closure.outputs.verdict }}\` — ${{ steps.closure.outputs.summary }}"
+            fi
+            echo ""
+            cat "$BODY_FILE"
+          } > "${RUNNER_TEMP}/review-comment.md"
+          gh pr comment "${{ steps.pr.outputs.number }}" --body-file "${RUNNER_TEMP}/review-comment.md"
+
+      - name: Fail job if acceptance criteria not met
+        env:
+          SESSION_PHASE: ${{ steps.session.outputs.session-phase }}
+          ACP_FAIL_ON_AC_MISS: ${{ vars.ACP_FAIL_ON_AC_MISS != 'false' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          case "$SESSION_PHASE" in
+            Completed|Running) ;;
+            *)
+              fail "ACP session ended with phase: ${SESSION_PHASE:-unknown}"
+              ;;
+          esac
+
+          if [ "$ACP_FAIL_ON_AC_MISS" != "true" ]; then
+            echo "ACP_FAIL_ON_AC_MISS is false — skipping closure gate."
+            exit 0
+          fi
+
+          if [ "${{ steps.closure.outputs.found }}" != "true" ]; then
+            fail "Missing <!-- AC_REVIEW_CLOSURE ... --> block. See prompt for required format."
+          fi
+
+          VERDICT="${{ steps.closure.outputs.verdict }}"
+          case "$VERDICT" in
+            PASS|FAIL|WARN) ;;
+            *)
+              fail "Invalid or missing VERDICT in closure (got: '${VERDICT:-empty}'). Expected PASS, FAIL, or WARN."
+              ;;
+          esac
+
+          if [ "$ACP_REVIEW_TESTING" = "true" ]; then
+            SMOKE="${{ steps.closure.outputs.smoke_test }}"
+            if [ -n "$SMOKE" ] && [ "$SMOKE" != "OK" ] && [ "$VERDICT" = "PASS" ]; then
+              fail "Closure inconsistent: VERDICT=PASS but SMOKE_TEST=${SMOKE}"
+            fi
+          else
+            NOT_MET="${{ steps.closure.outputs.criteria_not_met }}"
+            if [ -n "$NOT_MET" ] && [ "$NOT_MET" -gt 0 ] 2>/dev/null && [ "$VERDICT" = "PASS" ]; then
+              fail "Closure inconsistent: VERDICT=PASS but CRITERIA_NOT_MET=${NOT_MET}"
+            fi
+            if [ "$VERDICT" = "PASS" ]; then
+              MET="${{ steps.closure.outputs.criteria_met }}"
+              TOTAL="${{ steps.closure.outputs.criteria_total }}"
+              if [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null && [ -n "$MET" ] && [ "$MET" != "$TOTAL" ]; then
+                fail "Closure inconsistent: CRITERIA_MET (${MET}) != CRITERIA_TOTAL (${TOTAL}) with VERDICT=PASS"
+              fi
+            fi
+          fi
+
+          echo "Closure verdict: $VERDICT"
+          echo "Summary: ${{ steps.closure.outputs.summary }}"
+          case "$VERDICT" in
+            PASS) ;;
+            WARN) fail "Review inconclusive (${VERDICT}): ${{ steps.closure.outputs.summary }}" ;;
+            FAIL) fail "Acceptance criteria not met (${VERDICT}): ${{ steps.closure.outputs.summary }}" ;;
+          esac
+
+      - name: Summary
+        run: |
+          {
+            echo "### ACP PR review (Jira AC)"
+            echo "- **PR:** #${{ steps.pr.outputs.number }}"
+            echo "- **Branch:** ${{ steps.meta.outputs.branch }}"
+            echo "- **Session:** ${{ steps.session.outputs.session-url }}"
+            echo "- **Phase:** ${{ steps.session.outputs.session-phase }}"
+            if [ "${{ steps.closure.outputs.found }}" = "true" ]; then
+              echo "- **Verdict:** ${{ steps.closure.outputs.verdict }}"
+              echo "- **Jira:** ${{ steps.closure.outputs.jira_keys }}"
+              echo "- **Summary:** ${{ steps.closure.outputs.summary }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
