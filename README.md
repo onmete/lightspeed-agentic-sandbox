@@ -10,7 +10,7 @@ Local development uses `uv`. Run `make install` for dev dependencies,
 
 ## Bumping Dependencies
 
-The container image is built hermetially in Konflux. After changing
+The container image is built hermetically in Konflux. After changing
 dependencies in `pyproject.toml`, regenerate the lockfiles:
 
 ```bash
