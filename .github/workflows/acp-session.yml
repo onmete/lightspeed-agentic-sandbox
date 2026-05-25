@@ -147,6 +147,25 @@ jobs:
           stop-on-run-finished: true
           no-verify-ssl: ${{ vars.ACP_NO_VERIFY_SSL == 'true' && 'true' || 'false' }}
 
+      - name: Debug action outputs
+        if: always()
+        run: |
+          echo "=== Action outputs ==="
+          echo "session-name: ${{ steps.session.outputs.session-name }}"
+          echo "session-phase: ${{ steps.session.outputs.session-phase }}"
+          echo "session-url: ${{ steps.session.outputs.session-url }}"
+          echo "session-result length: $(printf '%s' '${{ steps.session.outputs.session-result }}' | wc -c)"
+          echo "=== Output file ==="
+          cat "${RUNNER_TEMP}/ambient-session-output.json" 2>/dev/null | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          for k, v in d.items():
+              if isinstance(v, str) and len(v) > 200:
+                  print(f'{k}: ({len(v)} chars) {v[:200]}...')
+              else:
+                  print(f'{k}: {v}')
+          " || echo "(no output file)"
+
       - name: Fetch session result from ACP API
         id: fetch
         if: steps.session.outputs.session-name != ''
