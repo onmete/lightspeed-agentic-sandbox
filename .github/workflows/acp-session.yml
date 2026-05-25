@@ -4,10 +4,14 @@
 # Runs on every new PR (opened). Requires Jira integration on the ACP project.
 #
 # Secrets (fork Settings → Actions):
-#   ACP_URL     — Backend API base URL, MUST include /api (see verify step)
-#   ACP_TOKEN   — Bot bearer token (project access key)
-#   ACP_PROJECT — Workspace/project slug (same as in ACP UI URL)
-# Optional variable: ACP_NO_VERIFY_SSL=true
+#   ACP_URL     — Backend-route API URL (NOT the browser UI host). Example for vteam-uat:
+#                 https://backend-route-ambient-code.apps.rosa.vteam-uat.0ksl.p3.openshiftapps.com/api
+#                 UI host (ambient-code.apps.*) sits behind OAuth and strips Bearer tokens → 401.
+#   ACP_TOKEN   — Project access key (Bearer), from ACP project keys
+#   ACP_PROJECT — Workspace slug (e.g. ols-agents)  [can also be a variable]
+# Variables (fork Settings → Actions → Variables):
+#   ACP_PROJECT        — Alternative to secret; visible in logs for debugging
+#   ACP_NO_VERIFY_SSL  — Set to "true" for self-signed certs
 
 name: ACP PR Review
 
@@ -72,10 +76,10 @@ jobs:
         env:
           ACP_URL: ${{ secrets.ACP_URL }}
           ACP_TOKEN: ${{ secrets.ACP_TOKEN }}
-          ACP_PROJECT: ${{ secrets.ACP_PROJECT }}
+          ACP_PROJECT: ${{ vars.ACP_PROJECT || secrets.ACP_PROJECT }}
         run: |
           set -euo pipefail
-          CURL=(curl -sS -o /dev/null -w "%{http_code}")
+          CURL=(curl -sS -o "${RUNNER_TEMP}/acp-probe-body.txt" -w "%{http_code}")
           if [ "${{ vars.ACP_NO_VERIFY_SSL }}" = "true" ]; then
             CURL+=(--insecure)
           fi
@@ -86,6 +90,10 @@ jobs:
           }
 
           base="${ACP_URL%/}"
+          if echo "${base}" | grep -qE '://ambient-code\.apps\.' && ! echo "${base}" | grep -q 'backend-route'; then
+            echo "::warning::ACP_URL looks like the UI host (ambient-code.apps.*). Use the backend-route host (backend-route-ambient-code.apps.*) so Bearer tokens reach the API."
+          fi
+
           code="$(probe "${base}")"
           if [ "${code}" = "404" ] && [ "${base}" != */api ]; then
             base="${base}/api"
@@ -93,7 +101,15 @@ jobs:
           fi
 
           case "${code}" in
-            200|401|403|405) ;;
+            200|403|405) ;;
+            401)
+              if grep -q 'User token required' "${RUNNER_TEMP}/acp-probe-body.txt" 2>/dev/null; then
+                echo "::error::ACP API returned 401 User token required — ACP_URL is likely the UI route (OAuth proxy strips Bearer). Use backend-route URL, e.g. https://backend-route-ambient-code.apps.<cluster>/api"
+              else
+                echo "::error::ACP API returned 401 — check ACP_TOKEN (project access key) and ACP_URL (backend-route /api, not UI host)."
+              fi
+              exit 1
+              ;;
             404)
               echo "::error::ACP API 404 at ${base}/projects/${ACP_PROJECT}/agentic-sessions — use API base URL ending in /api (not the web UI) and verify ACP_PROJECT slug."
               exit 1
@@ -106,6 +122,7 @@ jobs:
 
           echo "api_url=${base}" >> "$GITHUB_OUTPUT"
           echo "Using ACP API base: ${base}"
+          echo "ACP project: ${ACP_PROJECT}"
 
       - name: Run ACP PR review session
         id: session
@@ -113,7 +130,7 @@ jobs:
         with:
           api-url: ${{ steps.acp.outputs.api_url }}
           api-token: ${{ secrets.ACP_TOKEN }}
-          project: ${{ secrets.ACP_PROJECT }}
+          project: ${{ vars.ACP_PROJECT || secrets.ACP_PROJECT }}
           display-name: pr-review-${{ github.repository }}-${{ steps.pr.outputs.number }}
           prompt: ${{ steps.prompt.outputs.text }}
           repos: |
@@ -124,12 +141,6 @@ jobs:
                 "autoPush": false
               }
             ]
-          labels: |
-            {
-              "github.repository": "${{ github.repository }}",
-              "github.pr": "${{ steps.pr.outputs.number }}",
-              "task": "pr-review-jira"
-            }
           wait: "true"
           poll-interval: 15
           poll-timeout: 90
@@ -186,7 +197,7 @@ jobs:
           }
 
           case "$SESSION_PHASE" in
-            Completed|Running) ;;
+            Completed|Running|Stopped) ;;
             *)
               fail "ACP session ended with phase: ${SESSION_PHASE:-unknown}"
               ;;
