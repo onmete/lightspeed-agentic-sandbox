@@ -3,7 +3,10 @@
 #
 # Runs on every new PR (opened). Requires Jira integration on the ACP project.
 #
-# Secrets: ACP_URL, ACP_TOKEN, ACP_PROJECT
+# Secrets (fork Settings → Actions):
+#   ACP_URL     — Backend API base URL, MUST include /api (see verify step)
+#   ACP_TOKEN   — Bot bearer token (project access key)
+#   ACP_PROJECT — Workspace/project slug (same as in ACP UI URL)
 # Optional variable: ACP_NO_VERIFY_SSL=true
 
 name: ACP PR Review
@@ -157,11 +160,51 @@ jobs:
           print("EOF")
           PY
 
+      - name: Verify ACP API URL and project
+        id: acp
+        env:
+          ACP_URL: ${{ secrets.ACP_URL }}
+          ACP_TOKEN: ${{ secrets.ACP_TOKEN }}
+          ACP_PROJECT: ${{ secrets.ACP_PROJECT }}
+        run: |
+          set -euo pipefail
+          CURL=(curl -sS -o /dev/null -w "%{http_code}")
+          if [ "${{ vars.ACP_NO_VERIFY_SSL }}" = "true" ]; then
+            CURL+=(--insecure)
+          fi
+
+          probe() {
+            "${CURL[@]}" -H "Authorization: Bearer ${ACP_TOKEN}" \
+              "$1/projects/${ACP_PROJECT}/agentic-sessions"
+          }
+
+          base="${ACP_URL%/}"
+          code="$(probe "${base}")"
+          if [ "${code}" = "404" ] && [ "${base}" != */api ]; then
+            base="${base}/api"
+            code="$(probe "${base}")"
+          fi
+
+          case "${code}" in
+            200|401|403|405) ;;
+            404)
+              echo "::error::ACP API 404 at ${base}/projects/${ACP_PROJECT}/agentic-sessions — use API base URL ending in /api (not the web UI) and verify ACP_PROJECT slug."
+              exit 1
+              ;;
+            *)
+              echo "::error::ACP API probe failed (HTTP ${code}). Check ACP_URL, ACP_TOKEN, and network access from GitHub Actions."
+              exit 1
+              ;;
+          esac
+
+          echo "api_url=${base}" >> "$GITHUB_OUTPUT"
+          echo "Using ACP API base: ${base}"
+
       - name: Run ACP PR review session
         id: session
         uses: ambient-code/ambient-action@v0.0.5
         with:
-          api-url: ${{ secrets.ACP_URL }}
+          api-url: ${{ steps.acp.outputs.api_url }}
           api-token: ${{ secrets.ACP_TOKEN }}
           project: ${{ secrets.ACP_PROJECT }}
           display-name: pr-review-${{ github.repository }}-${{ steps.pr.outputs.number }}
