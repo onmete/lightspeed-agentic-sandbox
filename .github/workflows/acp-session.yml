@@ -10,7 +10,7 @@ name: ACP PR Review
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -70,7 +70,11 @@ jobs:
 
           testing = os.environ.get("ACP_REVIEW_TESTING", "true").lower() == "true"
 
-          closure_spec = """
+          # Avoid literal "<!--" in this YAML file — GitHub strips HTML comments from workflows.
+          c_open = "\x3c!-- AC_REVIEW_CLOSURE"
+          c_close = "--\x3e"
+
+          closure_spec = f"""
 ## Required summary closure (machine-readable — do not skip)
 
 After your human-readable review, append **exactly** this HTML comment block as the last thing in your reply.
@@ -78,15 +82,15 @@ Copy the format verbatim (raw HTML comment only — no markdown code fences arou
 GitHub Actions parses it to pass/fail the check.
 
 Testing mode:
-<!-- AC_REVIEW_CLOSURE
+{c_open}
 VERDICT=PASS
 JIRA_KEYS=OLS-1234
 SMOKE_TEST=OK
 SUMMARY=Jira and repository access verified.
--->
+{c_close}
 
 Full review mode:
-<!-- AC_REVIEW_CLOSURE
+{c_open}
 VERDICT=FAIL
 JIRA_KEYS=OLS-1234,OCPSTRAT-99
 CRITERIA_TOTAL=5
@@ -94,7 +98,7 @@ CRITERIA_MET=3
 CRITERIA_NOT_MET=2
 CRITERIA_UNCLEAR=0
 SUMMARY=Two acceptance criteria lack tests and error handling.
--->
+{c_close}
 
 Rules:
 - `VERDICT` must be one of: `PASS`, `FAIL`, `WARN`
@@ -195,11 +199,11 @@ Format the human-readable portion as GitHub markdown. The closure block must be 
           path = os.environ["RUNNER_TEMP"] + "/session-result.txt"
           text = open(path, encoding="utf-8").read()
 
-          match = re.search(
-              r"<!--\s*AC_REVIEW_CLOSURE\s*(.*?)\s*-->",
-              text,
+          closure_re = re.compile(
+              "\x3c!--\\s*AC_REVIEW_CLOSURE\\s*(.*?)\\s*--\x3e",
               re.DOTALL | re.IGNORECASE,
           )
+          match = closure_re.search(text)
           public_path = os.environ["RUNNER_TEMP"] + "/review-public.md"
 
           if not match:
@@ -230,13 +234,7 @@ Format the human-readable portion as GitHub markdown. The closure block must be 
           out("criteria_unclear", fields.get("CRITERIA_UNCLEAR", ""))
 
           # Strip closure from PR comment body (HTML comment is hidden on GitHub)
-          public = re.sub(
-              r"<!--\s*AC_REVIEW_CLOSURE\s*.*?\s*-->",
-              "",
-              text,
-              count=1,
-              flags=re.DOTALL | re.IGNORECASE,
-          ).strip()
+          public = closure_re.sub("", text, count=1).strip()
           with open(public_path, "w", encoding="utf-8") as f:
               f.write(public)
           PY
@@ -291,7 +289,7 @@ Format the human-readable portion as GitHub markdown. The closure block must be 
           fi
 
           if [ "${{ steps.closure.outputs.found }}" != "true" ]; then
-            fail "Missing <!-- AC_REVIEW_CLOSURE ... --> block. See prompt for required format."
+            fail "Missing AC_REVIEW_CLOSURE block in agent output. See prompt for required format."
           fi
 
           VERDICT="${{ steps.closure.outputs.verdict }}"
