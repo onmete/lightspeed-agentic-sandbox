@@ -147,10 +147,45 @@ jobs:
           stop-on-run-finished: true
           no-verify-ssl: ${{ vars.ACP_NO_VERIFY_SSL == 'true' && 'true' || 'false' }}
 
+      - name: Fetch session result from ACP API
+        id: fetch
+        if: steps.session.outputs.session-name != ''
+        env:
+          ACP_URL: ${{ steps.acp.outputs.api_url }}
+          ACP_TOKEN: ${{ secrets.ACP_TOKEN }}
+          ACP_PROJECT: ${{ vars.ACP_PROJECT || secrets.ACP_PROJECT }}
+          SESSION_NAME: ${{ steps.session.outputs.session-name }}
+        run: |
+          set -euo pipefail
+          CURL_OPTS=(-sS)
+          if [ "${{ vars.ACP_NO_VERIFY_SSL }}" = "true" ]; then
+            CURL_OPTS+=(--insecure)
+          fi
+          curl "${CURL_OPTS[@]}" \
+            -H "Authorization: Bearer ${ACP_TOKEN}" \
+            "${ACP_URL}/projects/${ACP_PROJECT}/agentic-sessions/${SESSION_NAME}" \
+            -o "${RUNNER_TEMP}/session-detail.json"
+          python3 -c "
+          import json, os
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'session-detail.json')) as f:
+              data = json.load(f)
+          result = data.get('status', {}).get('result', '') or ''
+          runs = data.get('status', {}).get('runs', [])
+          if not result and runs:
+              last = runs[-1]
+              result = last.get('result', '') or last.get('output', '') or ''
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('text<<GHEOF\n')
+              out.write(result)
+              out.write('\nGHEOF\n')
+          print(f'Result length: {len(result)} chars')
+          print(result[:500] if result else '(empty)')
+          "
+
       - name: Parse review closure
         id: closure
         env:
-          SESSION_RESULT: ${{ steps.session.outputs.session-result }}
+          SESSION_RESULT: ${{ steps.fetch.outputs.text || steps.session.outputs.session-result }}
         run: |
           set -euo pipefail
           printf '%s' "$SESSION_RESULT" > "${RUNNER_TEMP}/session-result.txt"
