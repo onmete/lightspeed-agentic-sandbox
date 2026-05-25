@@ -144,7 +144,6 @@ jobs:
           wait: "true"
           poll-interval: 15
           poll-timeout: 90
-          stop-on-run-finished: true
           no-verify-ssl: ${{ vars.ACP_NO_VERIFY_SSL == 'true' && 'true' || 'false' }}
 
       - name: Parse review closure
