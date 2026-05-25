@@ -42,7 +42,11 @@ Cross-references: how options are consumed in code → `how/provider-architectur
 
 18. **Non-hermetic fallback.** When prefetch directories are absent, the container build recipe may fetch selected binaries from external URLs for developer builds.
 
-19. **System packages — minimum expectations.** Runtime image includes Bash, Git, OpenShift CLI (`oc`), Kubernetes CLI (`kubectl`), ripgrep, Node.js (Claude Code CLI), and supporting OS utilities for debugging and archives per the container recipe.
+19. **Readiness probe cache.** `LIGHTSPEED_READINESS_CACHE_TTL_SECONDS` sets in-process TTL for `GET /readiness` results (default 30). Use `0` to disable caching.
+
+20. **MCP server list for readiness.** `LIGHTSPEED_MCP_SERVERS` is an optional comma-separated list of MCP HTTP(S) base URLs probed by `GET /readiness` when set.
+
+21. **System packages — minimum expectations.** Runtime image includes Bash, Git, OpenShift CLI (`oc`), Kubernetes CLI (`kubectl`), ripgrep, Node.js (Claude Code CLI), and supporting OS utilities for debugging and archives per the container recipe.
 
 ## Configuration Surface
 
@@ -58,6 +62,8 @@ Cross-references: how options are consumed in code → `how/provider-architectur
 | `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION` | Vertex project/region for Claude via Vertex. |
 | `CLAUDE_CODE_USE_VERTEX` | Enables Vertex-hosted Claude when set to sentinel value `1`. |
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint override. |
+| `LIGHTSPEED_READINESS_CACHE_TTL_SECONDS` | TTL for cached `/readiness` responses (seconds; `0` disables). |
+| `LIGHTSPEED_MCP_SERVERS` | Optional comma-separated MCP URLs for readiness reachability checks. |
 | `build_router(..., skills_dir=..., model=..., max_turns=..., default_timeout_ms=...)` | Library-level defaults when embedding the router. |
 
 ## Constraints
@@ -68,5 +74,7 @@ Cross-references: how options are consumed in code → `how/provider-architectur
 ## Planned Changes
 
 - TLS termination, mTLS, and network policies for operator-to-sandbox traffic. [PLANNED: OLS-3038–OLS-3043]
-- Readiness and startup probes distinct from simple liveness. [PLANNED: OLS-3058–OLS-3060]
+- `GET /readiness` with subsystem checks (OLS-3060). Further probe refinements from OLS-3058 may follow.
 - Konflux pipeline and lockfile policy updates as Red Hat platform requirements evolve. [PLANNED: OLS-2894]
+
+
