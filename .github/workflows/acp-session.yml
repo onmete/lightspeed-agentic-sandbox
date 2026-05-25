@@ -218,6 +218,9 @@ jobs:
           SESSION_PHASE: ${{ steps.session.outputs.session-phase }}
         run: |
           set -euo pipefail
+          # Convert backend-route API URL to browser UI URL
+          UI_URL="${SESSION_URL/backend-route-/}"
+          UI_URL="${UI_URL/\/api\//\/}"
           BODY_FILE="${RUNNER_TEMP}/review-public.md"
           if [ ! -f "$BODY_FILE" ]; then
             printf '%s' "${{ steps.session.outputs.session-result }}" > "$BODY_FILE"
@@ -225,7 +228,7 @@ jobs:
           {
             echo "## Ambient PR review (Jira AC)"
             echo ""
-            echo "**Session:** [${SESSION_PHASE}](${SESSION_URL})"
+            echo "**Session:** [${SESSION_PHASE}](${UI_URL})"
             if [ "${{ steps.closure.outputs.found }}" = "true" ]; then
               echo ""
               echo "**Verdict:** \`${{ steps.closure.outputs.verdict }}\` — ${{ steps.closure.outputs.summary }}"
@@ -302,12 +305,16 @@ jobs:
           esac
 
       - name: Summary
+        env:
+          SESSION_URL: ${{ steps.session.outputs.session-url }}
         run: |
+          UI_URL="${SESSION_URL/backend-route-/}"
+          UI_URL="${UI_URL/\/api\//\/}"
           {
             echo "### ACP PR review (Jira AC)"
             echo "- **PR:** #${{ steps.pr.outputs.number }}"
             echo "- **Branch:** ${{ steps.meta.outputs.branch }}"
-            echo "- **Session:** ${{ steps.session.outputs.session-url }}"
+            echo "- **Session:** ${UI_URL}"
             echo "- **Phase:** ${{ steps.session.outputs.session-phase }}"
             if [ "${{ steps.closure.outputs.found }}" = "true" ]; then
               echo "- **Verdict:** ${{ steps.closure.outputs.verdict }}"
