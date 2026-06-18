@@ -18,6 +18,8 @@ from lightspeed_agentic.routes import build_router, resolve_startup_model
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Entry point for container and prow-host e2e runs (uvicorn loads this module).
+
 app = FastAPI(title="lightspeed-agentic-sandbox")
 
 sdk = resolve_sdk()
