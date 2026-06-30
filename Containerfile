@@ -30,13 +30,13 @@ RUN unset PIP_INSTALL_OPTIONS PIP_TARGET PIP_HOME PIP_PREFIX 2>/dev/null; \
 
 # Install claude-code CLI.
 # In hermetic builds (Konflux), cachi2 prefetches npm packages and sets the
-# registry via cachi2.env — use npm ci against the lockfile.
+# registry via cachi2.env — use npm ci --offline against the lockfile.
 # In non-hermetic builds (OpenShift BuildConfig), fall back to npm install -g.
 COPY package.json package-lock.json ./
 RUN dnf install -y --nodocs nodejs && dnf clean all
 RUN if [ -f /cachi2/cachi2.env ]; then \
         . /cachi2/cachi2.env && \
-        npm ci --ignore-scripts; \
+        npm ci --offline --ignore-scripts; \
     else \
         npm install -g @anthropic-ai/claude-code --ignore-scripts && \
         cp -a /usr/local/lib/node_modules /app/node_modules; \
