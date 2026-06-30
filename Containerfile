@@ -29,14 +29,26 @@ RUN unset PIP_INSTALL_OPTIONS PIP_TARGET PIP_HOME PIP_PREFIX 2>/dev/null; \
         -r requirements.$(uname -m).txt
 
 # Install claude-code CLI.
-# In hermetic builds (Konflux), cachi2 prefetches npm packages and sets the
-# registry via cachi2.env — use npm ci --offline against the lockfile.
-# In non-hermetic builds (OpenShift BuildConfig), fall back to npm install -g.
+# In hermetic builds (Konflux), Hermeto prefetches npm tarballs under
+# /cachi2/output/deps/npm. Extract them directly — npm ci still reaches the
+# registry when lockfile injection does not apply inside multi-stage COPYs.
+# In non-hermetic builds (OpenShift CI), fall back to npm install -g.
 COPY package.json package-lock.json ./
 RUN dnf install -y --nodocs nodejs && dnf clean all
 RUN if [ -f /cachi2/cachi2.env ]; then \
-        . /cachi2/cachi2.env && \
-        npm ci --offline --ignore-scripts; \
+        VERSION=$(node -p "require('./package-lock.json').packages['node_modules/@anthropic-ai/claude-code'].version"); \
+        case "$(uname -m)" in \
+            x86_64) PLATFORM=linux-x64 ;; \
+            aarch64) PLATFORM=linux-arm64 ;; \
+            *) echo "unsupported arch: $(uname -m)"; exit 1 ;; \
+        esac; \
+        DEPS=/cachi2/output/deps/npm; \
+        MAIN_TGZ=$(find "$DEPS" -name "*claude-code-${VERSION}.tgz" ! -name "*-${PLATFORM}*" ! -name "*darwin*" ! -name "*win32*" | head -1); \
+        PLATFORM_TGZ=$(find "$DEPS" -name "*claude-code-${PLATFORM}-${VERSION}.tgz" | head -1); \
+        test -n "$MAIN_TGZ" && test -n "$PLATFORM_TGZ"; \
+        mkdir -p "node_modules/@anthropic-ai/claude-code" "node_modules/@anthropic-ai/claude-code-${PLATFORM}"; \
+        tar -xzf "$MAIN_TGZ" -C "node_modules/@anthropic-ai/claude-code" --strip-components=1; \
+        tar -xzf "$PLATFORM_TGZ" -C "node_modules/@anthropic-ai/claude-code-${PLATFORM}" --strip-components=1; \
     else \
         npm install -g @anthropic-ai/claude-code --ignore-scripts && \
         cp -a /usr/local/lib/node_modules /app/node_modules; \
