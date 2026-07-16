@@ -8,6 +8,7 @@
 #
 # Hermetic build: all dependencies are prefetched by Konflux/Hermeto.
 # Network access is disabled during build.
+# CI smoke: comment-only change to exercise the full pipeline.
 
 # ---------------------------------------------------------------------------
 # Builder stage: install Python deps from prefetched requirements
