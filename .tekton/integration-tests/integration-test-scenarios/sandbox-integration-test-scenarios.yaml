@@ -2,23 +2,24 @@
 # Apply to crt-nshift-lightspeed-tenant. Each scenario triggers the shared
 # sandbox-integration-test-pipeline with provider-specific credentials.
 #
-# These replace the Prow e2e-deepagents, e2e-gemini, and e2e-openai presubmit jobs.
+# Naming: {model-or-vendor}-{transport?}-{runtime}
+# These replace the Prow e2e-* presubmit jobs.
 ---
 apiVersion: appstudio.redhat.com/v1beta2
 kind: IntegrationTestScenario
 metadata:
-  name: sandbox-integration-deepagents
+  name: sandbox-integration-anthropic-vertex-deepagents
   namespace: crt-nshift-lightspeed-tenant
   labels:
     test.appstudio.openshift.io/optional: "true"
 spec:
   application: ols
   contexts:
-    - description: Sandbox integration test — DeepAgents (Vertex)
+    - description: Sandbox integration test — Anthropic via Vertex + DeepAgents
       name: component_lightspeed-agentic-sandbox
   params:
     - name: provider
-      value: deepagents
+      value: anthropic-vertex-deepagents
     - name: credential-secret
       value: vertex-apitoken
   resolverRef:
@@ -35,18 +36,18 @@ spec:
 apiVersion: appstudio.redhat.com/v1beta2
 kind: IntegrationTestScenario
 metadata:
-  name: sandbox-integration-gemini
+  name: sandbox-integration-gemini-vertex-adk
   namespace: crt-nshift-lightspeed-tenant
   labels:
     test.appstudio.openshift.io/optional: "true"
 spec:
   application: ols
   contexts:
-    - description: Sandbox integration test — Gemini (Vertex)
+    - description: Sandbox integration test — Gemini via Vertex + ADK
       name: component_lightspeed-agentic-sandbox
   params:
     - name: provider
-      value: gemini
+      value: gemini-vertex-adk
     - name: credential-secret
       value: vertex-apitoken
   resolverRef:
@@ -63,18 +64,18 @@ spec:
 apiVersion: appstudio.redhat.com/v1beta2
 kind: IntegrationTestScenario
 metadata:
-  name: sandbox-integration-openai
+  name: sandbox-integration-openai-agents
   namespace: crt-nshift-lightspeed-tenant
   labels:
     test.appstudio.openshift.io/optional: "true"
 spec:
   application: ols
   contexts:
-    - description: Sandbox integration test — OpenAI
+    - description: Sandbox integration test — OpenAI Agents SDK
       name: component_lightspeed-agentic-sandbox
   params:
     - name: provider
-      value: openai
+      value: openai-agents
     - name: credential-secret
       value: openai
   resolverRef:

@@ -3,12 +3,13 @@
 #
 # Usage (from lightspeed-agentic-sandbox/):
 #   bash scripts/e2e-containers.sh                  # all three providers (sequential)
-#   bash scripts/e2e-containers.sh openai          # one provider, default model from config.env
-#   bash scripts/e2e-containers.sh openai gpt-4.1-nano   # optional model override
+#   bash scripts/e2e-containers.sh openai-agents   # one provider, default model from config.env
+#   bash scripts/e2e-containers.sh openai-agents gpt-4.1-nano   # optional model override
 #
 # OpenShift CI / no container runtime (host uvicorn):
-#   E2E_PROW_HOST=1 bash scripts/e2e-containers.sh openai
-#   bash scripts/e2e-containers.sh --prow-host openai
+#   E2E_PROW_HOST=1 bash scripts/e2e-containers.sh openai-agents
+#   bash scripts/e2e-containers.sh --prow-host openai-agents
+# Legacy aliases: claude|deepagents, gemini, openai
 # Optional: E2E_SKIP_INSTALL=1 if deps already installed; E2E_HOST_PORT=8080 (default);
 # Skill token output uses a host tmpdir (E2E_OUTPUT_DIR); removed after pytest.
 # When ARTIFACT_DIR is set (Prow), outputs are copied there before cleanup;
@@ -122,22 +123,36 @@ _verify_image_app_source() {
     fi
 }
 
+# Canonical E2E matrix ids: {model-or-vendor}-{transport?}-{runtime}
+normalize_e2e_provider() {
+    case "$1" in
+        claude|deepagents) echo "anthropic-vertex-deepagents" ;;
+        gemini) echo "gemini-vertex-adk" ;;
+        openai) echo "openai-agents" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 provider_to_image_provider() {
     case "$1" in
-        deepagents)
+        anthropic-vertex-deepagents)
             if [ -n "${GCLOUD_MOUNT}" ]; then echo "vertex"; else echo "anthropic"; fi
             ;;
-        gemini) echo "vertex" ;;
-        *) echo "$1" ;;
+        gemini-vertex-adk) echo "vertex" ;;
+        openai-agents) echo "openai" ;;
+        *)
+            echo "e2e: unknown provider: $1" >&2
+            exit 1
+            ;;
     esac
 }
 
 provider_to_model_provider() {
     case "$1" in
-        deepagents)
+        anthropic-vertex-deepagents)
             if [ -n "${GCLOUD_MOUNT}" ]; then echo "anthropic"; else echo ""; fi
             ;;
-        gemini) echo "google" ;;
+        gemini-vertex-adk) echo "google" ;;
         *) echo "" ;;
     esac
 }
@@ -146,9 +161,9 @@ apply_model_override() {
     local provider="$1"
     local model="$2"
     case "${provider}" in
-        deepagents) export ANTHROPIC_MODEL="${model}" ;;
-        gemini) export GEMINI_MODEL="${model}" ;;
-        openai) export OPENAI_MODEL="${model}" ;;
+        anthropic-vertex-deepagents) export ANTHROPIC_MODEL="${model}" ;;
+        gemini-vertex-adk) export GEMINI_MODEL="${model}" ;;
+        openai-agents) export OPENAI_MODEL="${model}" ;;
         *)
             echo "e2e: unknown provider for model override: ${provider}" >&2
             exit 1
@@ -249,9 +264,9 @@ trap cleanup EXIT
 model_env_var() {
     local provider="$1"
     case "${provider}" in
-        deepagents) printf '%s' "LIGHTSPEED_MODEL=${ANTHROPIC_MODEL:-}" ;;
-        gemini) printf '%s' "LIGHTSPEED_MODEL=${GEMINI_MODEL:-}" ;;
-        openai) printf '%s' "LIGHTSPEED_MODEL=${OPENAI_MODEL:-}" ;;
+        anthropic-vertex-deepagents) printf '%s' "LIGHTSPEED_MODEL=${ANTHROPIC_MODEL:-}" ;;
+        gemini-vertex-adk) printf '%s' "LIGHTSPEED_MODEL=${GEMINI_MODEL:-}" ;;
+        openai-agents) printf '%s' "LIGHTSPEED_MODEL=${OPENAI_MODEL:-}" ;;
         *)
             echo "e2e: unknown provider: ${provider}" >&2
             exit 1
@@ -264,15 +279,15 @@ sync_provider_model() {
     local provider="$1"
     unset LIGHTSPEED_MODEL
     case "${provider}" in
-        deepagents)
+        anthropic-vertex-deepagents)
             export LIGHTSPEED_MODEL="${ANTHROPIC_MODEL:-}"
             export ANTHROPIC_MODEL="${LIGHTSPEED_MODEL}"
             ;;
-        gemini)
+        gemini-vertex-adk)
             export LIGHTSPEED_MODEL="${GEMINI_MODEL:-}"
             export GEMINI_MODEL="${LIGHTSPEED_MODEL}"
             ;;
-        openai)
+        openai-agents)
             export LIGHTSPEED_MODEL="${OPENAI_MODEL:-}"
             export OPENAI_MODEL="${LIGHTSPEED_MODEL}"
             ;;
@@ -286,9 +301,9 @@ sync_provider_model() {
 provider_sdk_model_env() {
     local provider="$1"
     case "${provider}" in
-        deepagents) printf '%s' "ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}" ;;
-        gemini) printf '%s' "GEMINI_MODEL=${GEMINI_MODEL:-}" ;;
-        openai) printf '%s' "OPENAI_MODEL=${OPENAI_MODEL:-}" ;;
+        anthropic-vertex-deepagents) printf '%s' "ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}" ;;
+        gemini-vertex-adk) printf '%s' "GEMINI_MODEL=${GEMINI_MODEL:-}" ;;
+        openai-agents) printf '%s' "OPENAI_MODEL=${OPENAI_MODEL:-}" ;;
         *)
             echo "e2e: unknown provider: ${provider}" >&2
             exit 1
@@ -580,14 +595,14 @@ run_one() {
     return "${pytest_exit}"
 }
 
-PROVIDERS=(deepagents gemini openai)
+PROVIDERS=(anthropic-vertex-deepagents gemini-vertex-adk openai-agents)
 
 if [[ "${E2E_PROW_HOST}" == "1" ]]; then
     if [[ $# -lt 1 ]]; then
         echo "e2e: --prow-host (or E2E_PROW_HOST=1) requires a provider: ${PROVIDERS[*]}" >&2
         exit 1
     fi
-    provider="$1"
+    provider="$(normalize_e2e_provider "$1")"
     shift || true
     model="${1:-}"
     if [ -n "${model}" ]; then
@@ -607,7 +622,7 @@ if [ $# -eq 0 ]; then
         NAME=""
     done
 else
-    provider="$1"
+    provider="$(normalize_e2e_provider "$1")"
     shift || true
     model="${1:-}"
     if [ -n "${model}" ]; then

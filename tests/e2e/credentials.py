@@ -4,6 +4,9 @@ Resolution order per provider mirrors the deploy scripts in
 lightspeed-operator/hack/ — env vars first, CLI tools as fallback.
 
 Unlike evals credential checks, missing credentials raise instead of soft-skipping.
+
+E2E matrix ids use {model-or-vendor}-{transport?}-{runtime}. Legacy short names
+(claude, deepagents, gemini, openai) are accepted as aliases.
 """
 
 from __future__ import annotations
@@ -11,6 +14,22 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass, field
+
+# Canonical E2E matrix ids (not AgentProvider.name / CR LIGHTSPEED_PROVIDER).
+PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS = "anthropic-vertex-deepagents"
+PROVIDER_GEMINI_VERTEX_ADK = "gemini-vertex-adk"
+PROVIDER_OPENAI_AGENTS = "openai-agents"
+
+_ALIASES: dict[str, str] = {
+    "claude": PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS,
+    "deepagents": PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS,
+    "gemini": PROVIDER_GEMINI_VERTEX_ADK,
+    "openai": PROVIDER_OPENAI_AGENTS,
+}
+
+
+def canonical_provider(provider: str) -> str:
+    return _ALIASES.get(provider, provider)
 
 
 @dataclass(frozen=True)
@@ -35,10 +54,11 @@ def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[bool, str]:
         return False, ""
 
 
-def _check_deepagents() -> ProviderCredentialStatus:
+def _check_anthropic_vertex_deepagents() -> ProviderCredentialStatus:
+    name = PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS
     if os.environ.get("ANTHROPIC_API_KEY"):
         return ProviderCredentialStatus(
-            "deepagents",
+            name,
             True,
             "env",
             "ANTHROPIC_API_KEY set",
@@ -48,7 +68,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
         gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
         if gac and os.path.isfile(gac):
             return ProviderCredentialStatus(
-                "deepagents",
+                name,
                 True,
                 "env",
                 "Vertex AI credentials file",
@@ -56,13 +76,13 @@ def _check_deepagents() -> ProviderCredentialStatus:
         ok, _ = _run_quiet(["gcloud", "auth", "application-default", "print-access-token"])
         if ok:
             return ProviderCredentialStatus(
-                "deepagents",
+                name,
                 True,
                 "gcloud",
                 "gcloud application-default credentials",
             )
         return ProviderCredentialStatus(
-            "deepagents",
+            name,
             False,
             "none",
             "CLAUDE_CODE_USE_VERTEX=1 but no credentials file or gcloud ADC",
@@ -71,7 +91,7 @@ def _check_deepagents() -> ProviderCredentialStatus:
     if os.environ.get("CLAUDE_CODE_USE_BEDROCK") == "1":
         if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
             return ProviderCredentialStatus(
-                "deepagents",
+                name,
                 True,
                 "env",
                 "AWS Bedrock credentials via env vars",
@@ -79,20 +99,20 @@ def _check_deepagents() -> ProviderCredentialStatus:
         ok, _ = _run_quiet(["aws", "configure", "get", "aws_access_key_id"])
         if ok:
             return ProviderCredentialStatus(
-                "deepagents",
+                name,
                 True,
                 "aws_cli",
                 "AWS credentials via aws configure",
             )
         return ProviderCredentialStatus(
-            "deepagents",
+            name,
             False,
             "none",
             "CLAUDE_CODE_USE_BEDROCK=1 but no AWS credentials found",
         )
 
     return ProviderCredentialStatus(
-        "deepagents",
+        name,
         False,
         "none",
         "ANTHROPIC_API_KEY not set (or set CLAUDE_CODE_USE_VERTEX=1 / CLAUDE_CODE_USE_BEDROCK=1)",
@@ -115,10 +135,11 @@ def _vertex_env_vars() -> dict[str, str]:
     return env
 
 
-def _check_gemini() -> ProviderCredentialStatus:
+def _check_gemini_vertex_adk() -> ProviderCredentialStatus:
+    name = PROVIDER_GEMINI_VERTEX_ADK
     if os.environ.get("GOOGLE_API_KEY"):
         return ProviderCredentialStatus(
-            "gemini",
+            name,
             True,
             "env",
             "GOOGLE_API_KEY set",
@@ -128,7 +149,7 @@ def _check_gemini() -> ProviderCredentialStatus:
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         return ProviderCredentialStatus(
-            "gemini",
+            name,
             True,
             "env",
             "GEMINI_API_KEY set",
@@ -139,7 +160,7 @@ def _check_gemini() -> ProviderCredentialStatus:
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     if gac and os.path.isfile(gac):
         return ProviderCredentialStatus(
-            "gemini",
+            name,
             True,
             "env",
             "GOOGLE_APPLICATION_CREDENTIALS file (Vertex AI)",
@@ -149,7 +170,7 @@ def _check_gemini() -> ProviderCredentialStatus:
     ok, _ = _run_quiet(["gcloud", "auth", "application-default", "print-access-token"])
     if ok:
         return ProviderCredentialStatus(
-            "gemini",
+            name,
             True,
             "gcloud",
             "gcloud ADC (Vertex AI)",
@@ -157,7 +178,7 @@ def _check_gemini() -> ProviderCredentialStatus:
         )
 
     return ProviderCredentialStatus(
-        "gemini",
+        name,
         False,
         "none",
         "No Gemini credentials: set GOOGLE_API_KEY, GEMINI_API_KEY, "
@@ -165,10 +186,11 @@ def _check_gemini() -> ProviderCredentialStatus:
     )
 
 
-def _check_openai() -> ProviderCredentialStatus:
+def _check_openai_agents() -> ProviderCredentialStatus:
+    name = PROVIDER_OPENAI_AGENTS
     if os.environ.get("OPENAI_API_KEY"):
         return ProviderCredentialStatus(
-            "openai",
+            name,
             True,
             "env",
             "OPENAI_API_KEY set",
@@ -176,14 +198,14 @@ def _check_openai() -> ProviderCredentialStatus:
 
     if os.environ.get("OPENAI_BASE_URL"):
         return ProviderCredentialStatus(
-            "openai",
+            name,
             True,
             "env",
             "OPENAI_BASE_URL set (custom endpoint, no key required)",
         )
 
     return ProviderCredentialStatus(
-        "openai",
+        name,
         False,
         "none",
         "OPENAI_API_KEY not set (or set OPENAI_BASE_URL for keyless endpoints)",
@@ -191,16 +213,17 @@ def _check_openai() -> ProviderCredentialStatus:
 
 
 _CHECKERS = {
-    "deepagents": _check_deepagents,
-    "gemini": _check_gemini,
-    "openai": _check_openai,
+    PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS: _check_anthropic_vertex_deepagents,
+    PROVIDER_GEMINI_VERTEX_ADK: _check_gemini_vertex_adk,
+    PROVIDER_OPENAI_AGENTS: _check_openai_agents,
 }
 
 PROVIDER_NAMES = list(_CHECKERS.keys())
 
 
 def detect_credentials(provider: str) -> ProviderCredentialStatus:
-    checker = _CHECKERS.get(provider)
+    canonical = canonical_provider(provider)
+    checker = _CHECKERS.get(canonical)
     if checker is None:
         return ProviderCredentialStatus(provider, False, "none", f"Unknown provider: {provider}")
     return checker()

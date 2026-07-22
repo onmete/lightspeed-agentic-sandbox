@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from credentials import canonical_provider
 from tests.e2e.runner import RunHttpResult, run_query
 from steps.given import *  # noqa: F403 — step fixtures must be in conftest namespace
 from steps.when import *  # noqa: F403
@@ -33,7 +34,7 @@ def provider_name() -> str:
     name = os.environ.get("E2E_PROVIDER", "").strip()
     if not name:
         pytest.fail("E2E_PROVIDER is not set (e2e-containers.sh exports it)")
-    return name
+    return canonical_provider(name)
 
 
 @pytest.fixture

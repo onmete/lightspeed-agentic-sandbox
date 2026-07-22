@@ -7,6 +7,11 @@
 # Usage:
 #   bash .tekton/integration-tests/scripts/run-sandbox-integration-tests.sh <provider>
 #
+# Provider ids (canonical):
+#   anthropic-vertex-deepagents | gemini-vertex-adk | openai-agents
+# Legacy aliases accepted until Konflux IntegrationTestScenario CRs are updated:
+#   claude | deepagents | gemini | openai
+#
 # Expects:
 #   - Provider credentials mounted at /var/run/credentials/token
 #   - ARTIFACT_DIR set (for junit XML output)
@@ -15,13 +20,14 @@
 set -euo pipefail
 trap 'echo "error: $0 line $LINENO: command \"$BASH_COMMAND\" exited with status $?" >&2' ERR
 
-PROVIDER="${1:?Usage: $0 <provider> (deepagents|gemini|openai)}"
+PROVIDER="${1:?Usage: $0 <provider> (anthropic-vertex-deepagents|gemini-vertex-adk|openai-agents)}"
 CRED_PATH="/var/run/credentials/token"
 
-# Accept "claude" as a legacy alias until Konflux IntegrationTestScenario CRs are updated.
-if [[ "${PROVIDER}" == "claude" ]]; then
-    PROVIDER="deepagents"
-fi
+case "${PROVIDER}" in
+  claude|deepagents) PROVIDER="anthropic-vertex-deepagents" ;;
+  gemini) PROVIDER="gemini-vertex-adk" ;;
+  openai) PROVIDER="openai-agents" ;;
+esac
 
 if [ ! -f "${CRED_PATH}" ]; then
     echo "error: credential file not found at ${CRED_PATH}" >&2
@@ -30,7 +36,7 @@ fi
 
 # --- Set up provider credentials ---
 case "${PROVIDER}" in
-  deepagents)
+  anthropic-vertex-deepagents)
     mkdir -p "${HOME}/.config/gcloud"
     cp "${CRED_PATH}" "${HOME}/.config/gcloud/application_default_credentials.json"
     export GOOGLE_APPLICATION_CREDENTIALS="${CRED_PATH}"
@@ -38,14 +44,14 @@ case "${PROVIDER}" in
     ANTHROPIC_VERTEX_PROJECT_ID=$(python3 -c "import json; print(json.load(open('${CRED_PATH}'))['project_id'])")
     export ANTHROPIC_VERTEX_PROJECT_ID
     ;;
-  gemini)
+  gemini-vertex-adk)
     mkdir -p "${HOME}/.config/gcloud"
     cp "${CRED_PATH}" "${HOME}/.config/gcloud/application_default_credentials.json"
     export GOOGLE_APPLICATION_CREDENTIALS="${CRED_PATH}"
     GOOGLE_CLOUD_PROJECT=$(python3 -c "import json; print(json.load(open('${CRED_PATH}'))['project_id'])")
     export GOOGLE_CLOUD_PROJECT
     ;;
-  openai)
+  openai-agents)
     OPENAI_API_KEY=$(cat "${CRED_PATH}")
     export OPENAI_API_KEY
     ;;

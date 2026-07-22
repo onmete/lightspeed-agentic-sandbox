@@ -49,7 +49,7 @@ def post_echo_token_query(bdd_context: dict[str, Any], run_runner: Any, provider
     if "system_prompt" in bdd_context:
         kwargs["system_prompt"] = bdd_context["system_prompt"]
     # OpenAI omits output_schema so shell tools run first; DeepAgents/Gemini keep it when provided.
-    output_schema = None if provider_name == "openai" else bdd_context.get("output_schema")
+    output_schema = None if provider_name == "openai-agents" else bdd_context.get("output_schema")
     res: RunHttpResult = run_runner(query, output_schema=output_schema, **kwargs)
     bdd_context["http_result"] = res
     bdd_context["response_body"] = res.body

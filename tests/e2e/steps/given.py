@@ -59,7 +59,7 @@ def prepare_timeout_query(bdd_context: dict[str, Any], provider_name: str) -> No
     """
     import pytest
 
-    broken_timeout_providers = {"openai", "gemini"}
+    broken_timeout_providers = {"openai-agents", "gemini-vertex-adk"}
     if provider_name in broken_timeout_providers:
         pytest.skip(
             f"{provider_name} SDK does not propagate asyncio cancellation — "

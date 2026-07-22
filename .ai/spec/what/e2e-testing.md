@@ -84,8 +84,9 @@ scripts/e2e-containers.sh   # start sandbox, export env, run pytest
 **Container (default)** — requires podman or docker:
 
 ```bash
-make e2e openai
-# or: bash scripts/e2e-containers.sh openai [model-override]
+make e2e openai-agents
+# or: bash scripts/e2e-containers.sh openai-agents [model-override]
+# matrix ids: anthropic-vertex-deepagents | gemini-vertex-adk | openai-agents
 ```
 
 Builds or uses `IMAGE`, mounts skills workspace and tmp output dir, runs one
@@ -94,8 +95,8 @@ provider per process, exports `SANDBOX_SERVICE_URL` and `E2E_PROVIDER` for pytes
 **Prow host** — no container runtime; uvicorn on the host (OpenShift CI):
 
 ```bash
-E2E_SKIP_INSTALL=1 bash scripts/e2e-containers.sh --prow-host openai
-# optional model: ... --prow-host openai gpt-5-mini
+E2E_SKIP_INSTALL=1 bash scripts/e2e-containers.sh --prow-host openai-agents
+# optional model: ... --prow-host openai-agents gpt-5-mini
 ```
 
 Uses `tests/e2e/config.env` models in a clean env (avoids host shell pollution
@@ -142,6 +143,6 @@ Unit tests: [test_routes.py](../../../tests/test_routes.py),
 ```bash
 make install-all          # providers + e2e extras (first time)
 make test                 # unit only; no credentials
-make e2e openai           # live BDD, container mode
-E2E_SKIP_INSTALL=1 E2E_ARGS="-v" bash scripts/e2e-containers.sh --prow-host openai
+make e2e openai-agents    # live BDD, container mode
+E2E_SKIP_INSTALL=1 E2E_ARGS="-v" bash scripts/e2e-containers.sh --prow-host openai-agents
 ```
