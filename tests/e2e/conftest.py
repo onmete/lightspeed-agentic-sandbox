@@ -1,4 +1,7 @@
-"""E2E fixtures — single provider per process (no parametrization)."""
+"""E2E fixtures — single provider per process (no parametrization).
+
+Konflux ITS smoke: touch tests/ so Pac builds and new sandbox-integration-* scenarios run.
+"""
 
 from __future__ import annotations
 
