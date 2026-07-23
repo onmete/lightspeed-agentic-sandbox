@@ -7,10 +7,8 @@
 # Usage:
 #   bash .tekton/integration-tests/scripts/run-sandbox-integration-tests.sh <provider>
 #
-# Provider ids (canonical):
+# Provider ids:
 #   anthropic-vertex-deepagents | gemini-vertex-adk | openai-agents
-# Legacy aliases accepted until Konflux IntegrationTestScenario CRs are updated:
-#   claude | deepagents | gemini | openai
 #
 # Expects:
 #   - Provider credentials mounted at /var/run/credentials/token
@@ -22,12 +20,6 @@ trap 'echo "error: $0 line $LINENO: command \"$BASH_COMMAND\" exited with status
 
 PROVIDER="${1:?Usage: $0 <provider> (anthropic-vertex-deepagents|gemini-vertex-adk|openai-agents)}"
 CRED_PATH="/var/run/credentials/token"
-
-case "${PROVIDER}" in
-  claude|deepagents) PROVIDER="anthropic-vertex-deepagents" ;;
-  gemini) PROVIDER="gemini-vertex-adk" ;;
-  openai) PROVIDER="openai-agents" ;;
-esac
 
 if [ ! -f "${CRED_PATH}" ]; then
     echo "error: credential file not found at ${CRED_PATH}" >&2

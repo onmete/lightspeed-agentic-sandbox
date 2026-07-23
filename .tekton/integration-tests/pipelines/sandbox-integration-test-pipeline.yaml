@@ -19,9 +19,7 @@ spec:
       default: '{"components": [{"name":"lightspeed-agentic-sandbox", "containerImage": "quay.io/example/repo:latest"}]}'
       type: string
     - name: provider
-      description: >-
-        E2E matrix id (anthropic-vertex-deepagents, gemini-vertex-adk, openai-agents).
-        Legacy aliases: claude, deepagents, gemini, openai.
+      description: 'E2E matrix id (anthropic-vertex-deepagents, gemini-vertex-adk, openai-agents).'
       type: string
     - name: credential-secret
       description: 'Name of the Konflux workspace secret containing provider credentials.'

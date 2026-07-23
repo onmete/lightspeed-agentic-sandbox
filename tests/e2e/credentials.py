@@ -5,8 +5,8 @@ lightspeed-operator/hack/ — env vars first, CLI tools as fallback.
 
 Unlike evals credential checks, missing credentials raise instead of soft-skipping.
 
-E2E matrix ids use {model-or-vendor}-{transport?}-{runtime}. Legacy short names
-(claude, deepagents, gemini, openai) are accepted as aliases.
+E2E matrix ids use {model-or-vendor}-{transport?}-{runtime} (not AgentProvider.name /
+CR LIGHTSPEED_PROVIDER).
 """
 
 from __future__ import annotations
@@ -15,21 +15,9 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 
-# Canonical E2E matrix ids (not AgentProvider.name / CR LIGHTSPEED_PROVIDER).
 PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS = "anthropic-vertex-deepagents"
 PROVIDER_GEMINI_VERTEX_ADK = "gemini-vertex-adk"
 PROVIDER_OPENAI_AGENTS = "openai-agents"
-
-_ALIASES: dict[str, str] = {
-    "claude": PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS,
-    "deepagents": PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS,
-    "gemini": PROVIDER_GEMINI_VERTEX_ADK,
-    "openai": PROVIDER_OPENAI_AGENTS,
-}
-
-
-def canonical_provider(provider: str) -> str:
-    return _ALIASES.get(provider, provider)
 
 
 @dataclass(frozen=True)
@@ -222,8 +210,7 @@ PROVIDER_NAMES = list(_CHECKERS.keys())
 
 
 def detect_credentials(provider: str) -> ProviderCredentialStatus:
-    canonical = canonical_provider(provider)
-    checker = _CHECKERS.get(canonical)
+    checker = _CHECKERS.get(provider)
     if checker is None:
         return ProviderCredentialStatus(provider, False, "none", f"Unknown provider: {provider}")
     return checker()

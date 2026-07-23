@@ -9,7 +9,6 @@
 # OpenShift CI / no container runtime (host uvicorn):
 #   E2E_PROW_HOST=1 bash scripts/e2e-containers.sh openai-agents
 #   bash scripts/e2e-containers.sh --prow-host openai-agents
-# Legacy aliases: claude|deepagents, gemini, openai
 # Optional: E2E_SKIP_INSTALL=1 if deps already installed; E2E_HOST_PORT=8080 (default);
 # Skill token output uses a host tmpdir (E2E_OUTPUT_DIR); removed after pytest.
 # When ARTIFACT_DIR is set (Prow), outputs are copied there before cleanup;
@@ -121,16 +120,6 @@ _verify_image_app_source() {
         echo "e2e:   ${RUNTIME} build --no-cache -t ${image} -f Containerfile ." >&2
         exit 1
     fi
-}
-
-# Canonical E2E matrix ids: {model-or-vendor}-{transport?}-{runtime}
-normalize_e2e_provider() {
-    case "$1" in
-        claude|deepagents) echo "anthropic-vertex-deepagents" ;;
-        gemini) echo "gemini-vertex-adk" ;;
-        openai) echo "openai-agents" ;;
-        *) echo "$1" ;;
-    esac
 }
 
 provider_to_image_provider() {
@@ -602,7 +591,7 @@ if [[ "${E2E_PROW_HOST}" == "1" ]]; then
         echo "e2e: --prow-host (or E2E_PROW_HOST=1) requires a provider: ${PROVIDERS[*]}" >&2
         exit 1
     fi
-    provider="$(normalize_e2e_provider "$1")"
+    provider="$1"
     shift || true
     model="${1:-}"
     if [ -n "${model}" ]; then
@@ -622,7 +611,7 @@ if [ $# -eq 0 ]; then
         NAME=""
     done
 else
-    provider="$(normalize_e2e_provider "$1")"
+    provider="$1"
     shift || true
     model="${1:-}"
     if [ -n "${model}" ]; then
