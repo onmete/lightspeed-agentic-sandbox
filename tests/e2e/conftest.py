@@ -1,4 +1,7 @@
-"""E2E fixtures — single provider per process (no parametrization)."""
+"""E2E fixtures — single provider per process (no parametrization).
+
+Konflux ITS smoke: touch watched paths so Pac builds new sandbox-integration-* scenarios.
+"""
 
 from __future__ import annotations
 
