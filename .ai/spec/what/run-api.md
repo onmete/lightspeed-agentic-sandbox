@@ -109,7 +109,7 @@ B1. **No HTTP server.** The sandbox MUST NOT start a FastAPI/HTTP server. There 
 
 B2. **Input files.** The operator mounts a ConfigMap at `/input/` (read-only) with keys:
 - `/input/query` — step input text (same content as the former `RunRequest.query`; after OLS-3491 this MUST NOT embed role/system instructions)
-- `/input/system-prompt` — [PLANNED: OLS-3491] step system instructions (same content as former `RunRequest.systemPrompt`). When absent or empty, the sandbox uses the fixed default persona (same as HTTP rule 5).
+- `/input/system-prompt` — [PLANNED: OLS-3491] optional step system instructions (same content as former `RunRequest.systemPrompt`). When absent or empty, the sandbox uses the fixed default persona (same as HTTP rule 5). **Absence of this file is valid input and MUST NOT be treated as a sandbox input-read failure** (contrast rule B6, which applies to required inputs that cannot be read).
 - `/input/output-schema` — JSON schema for structured output (same as former `RunRequest.outputSchema`)
 - `/input/context` — JSON object with `targetNamespaces`, `previousAttempts`, `approvedOption`, `executionResult` (same structure as former `RunRequest.context`)
 - `/input/result-template` — pre-filled Result CR JSON with `apiVersion`, `kind`, `metadata` (name, namespace, labels, ownerReferences), and `spec` (agenticRunName, retryIndex). The sandbox fills in `status` only.
