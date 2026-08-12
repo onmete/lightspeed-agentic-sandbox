@@ -8,15 +8,15 @@ Cross-references: provider behavior and events → `provider-contract.md`. Env d
 
 ## Behavioral Rules
 
-1. **Operator integration boundary.** The Kubernetes operator (workflow engine) invokes the sandbox over HTTP using `POST /v1/agent/run` with a JSON body matching `RunRequest`. The sandbox returns `RunResponse` JSON. The operator carries step semantics primarily via `query` (template-rendered prompt), `outputSchema`, and `context`. The operator sends `systemPrompt` as empty; the sandbox applies a default persona when `systemPrompt` is empty or omitted (see rule 5). The sandbox does not interpret workflow phase names.
+1. **Operator integration boundary.** The Kubernetes operator (workflow engine) invokes the sandbox over HTTP using `POST /v1/agent/run` with a JSON body matching `RunRequest`. The sandbox returns `RunResponse` JSON. The operator carries step **input** via `query`, structured-output hints via `outputSchema`, and runtime envelope via `context`. [PLANNED: OLS-3491] Step **system instructions** are carried via `systemPrompt` (non-empty after operator materialization). Until OLS-3491, the operator may still send `systemPrompt` as empty and embed role text in `query`; the sandbox applies a default persona when `systemPrompt` is empty or omitted (see rule 5). The sandbox does not interpret workflow phase names.
 
 2. **Route mounting.** Agent routes are mounted under the path prefix `/v1/agent` on the FastAPI application. Probe routes (`/health`, `/ready`) are **not** under that prefix.
 
 3. **Canonical run endpoint.** `POST /v1/agent/run` accepts `RunRequest` and returns `RunResponse`.
 
-4. **RunRequest — `query` (required).** User task text. When `context` is present, the handler prepends a formatted context block to this text before sending the combined string to the provider (see rules 12–16).
+4. **RunRequest — `query` (required).** Step input / user task text (not system role instructions after OLS-3491). When `context` is present, the handler prepends a formatted context block to this text before sending the combined string to the provider (see rules 12–16).
 
-5. **RunRequest — `systemPrompt`.** Optional. When omitted or null, the handler substitutes a fixed default assistant persona string.
+5. **RunRequest — `systemPrompt`.** Optional. When omitted, null, or empty, the handler substitutes a fixed default assistant persona string. [PLANNED: OLS-3491] When the operator sends non-empty `systemPrompt`, the handler MUST use it as-is (full replacement of the default persona). The sandbox MUST NOT append the default persona to a non-empty caller `systemPrompt`.
 
 6. **RunRequest — `outputSchema`.** Optional JSON-object schema. When present, forwarded to the provider as structured-output hints (see `provider-contract.md`). The HTTP response still follows `RunResponse` shaping rules (rules 18–22).
 
@@ -107,13 +107,14 @@ Replaces the HTTP API (rules 1–24) with a batch execution model. The sandbox r
 
 B1. **No HTTP server.** The sandbox MUST NOT start a FastAPI/HTTP server. There are no routes, no probes (`/health`, `/ready`), no inbound connections. The process reads files, runs the agent, writes results, and exits.
 
-B2. **Input files.** The operator mounts a ConfigMap at `/input/` (read-only) with four keys:
-- `/input/query` — rendered prompt text (same content as the former `RunRequest.query`)
+B2. **Input files.** The operator mounts a ConfigMap at `/input/` (read-only) with keys:
+- `/input/query` — step input text (same content as the former `RunRequest.query`; after OLS-3491 this MUST NOT embed role/system instructions)
+- `/input/system-prompt` — [PLANNED: OLS-3491] step system instructions (same content as former `RunRequest.systemPrompt`). When absent or empty, the sandbox uses the fixed default persona (same as HTTP rule 5).
 - `/input/output-schema` — JSON schema for structured output (same as former `RunRequest.outputSchema`)
 - `/input/context` — JSON object with `targetNamespaces`, `previousAttempts`, `approvedOption`, `executionResult` (same structure as former `RunRequest.context`)
 - `/input/result-template` — pre-filled Result CR JSON with `apiVersion`, `kind`, `metadata` (name, namespace, labels, ownerReferences), and `spec` (agenticRunName, retryIndex). The sandbox fills in `status` only.
 
-B3. **Agent execution.** The sandbox reads the input files, initializes the LLM provider (same provider adapters as today — unchanged), and runs the agent with the query, output schema, and context. Tool execution (kubectl, oc) is unchanged. Skills and MCP servers are configured via environment variables and volume mounts (unchanged).
+B3. **Agent execution.** The sandbox reads the input files, initializes the LLM provider (same provider adapters as today — unchanged), and runs the agent with the system prompt, query, output schema, and context. Tool execution (kubectl, oc) is unchanged. Skills and MCP servers are configured via environment variables and volume mounts (unchanged).
 
 B4. **Output — success path.** On successful agent completion, the sandbox MUST: (a) merge the agent's structured JSON output into the Result CR's `status` fields (options, diagnosis, actionRequired, actionsTaken, checks, summary — varies by step type), (b) set `status.conditions` to include `Started=True` and `Completed=True`, (c) run `oc create -f <result.json>` to create the CR (metadata + spec from template), (d) run `oc patch <resultCR> --type=merge --subresource=status -p '<status-json>'` to set the status, (e) exit 0.
 
