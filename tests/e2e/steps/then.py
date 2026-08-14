@@ -40,6 +40,38 @@ def assert_gen_ai_histograms(bdd_context: dict[str, Any]) -> None:
         assert name in raw, f"metric {name!r} not found in /metrics output"
 
 
+def _histogram_count(raw: str, metric: str) -> float:
+    """Sum the ``<metric>_count`` samples across all label sets in Prometheus text."""
+    total = 0.0
+    prefix = f"{metric}_count"
+    for line in raw.splitlines():
+        if line.startswith("#") or not line.startswith(prefix):
+            continue
+        # Format: gen_ai_..._count{labels} <value>   (or without the {labels} block)
+        char_after = line[len(prefix) : len(prefix) + 1]
+        if char_after not in ("{", " "):
+            continue
+        total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+@then("the gen_ai token and duration metrics have recorded samples")
+def assert_gen_ai_metrics_recorded(bdd_context: dict[str, Any]) -> None:
+    """Assert the histograms actually observed data, not just that they are registered.
+
+    Only ``token_usage`` and ``operation_duration`` are recorded by the run
+    endpoint; ``execute_tool_duration`` is registered but never observed, so it is
+    intentionally excluded here.
+    """
+    raw = bdd_context["http_result"].raw_text
+    for metric in (
+        "gen_ai_client_token_usage",
+        "gen_ai_client_operation_duration_seconds",
+    ):
+        count = _histogram_count(raw, metric)
+        assert count > 0, f"metric {metric!r} has no recorded samples (count={count})"
+
+
 @then("the response includes success summary and ticketId fields")
 def assert_flat_fields(bdd_context: dict[str, Any]) -> None:
     """Assert structured output includes success, summary, and ticketId."""
@@ -85,6 +117,29 @@ def assert_success_false(bdd_context: dict[str, Any]) -> None:
     """Assert RunResponse ``success`` is false."""
     body = bdd_context["response_body"]
     assert body.get("success") is False, body
+
+
+@then("the response summary indicates a timeout")
+def assert_summary_indicates_timeout(bdd_context: dict[str, Any]) -> None:
+    """Assert the failure was a timeout, not any other error.
+
+    The endpoint returns ``success=false`` for timeouts, generic errors, and
+    empty responses alike; this distinguishes the timeout path via its summary
+    (``Agent timed out after {N}ms``).
+    """
+    body = bdd_context["response_body"]
+    summary = body.get("summary", "").lower()
+    assert "timed out" in summary or "timeout" in summary, (
+        f"summary does not indicate a timeout: {body!r}"
+    )
+
+
+@then("the response summary contains the reasoning answer")
+def assert_summary_contains_reasoning_answer(bdd_context: dict[str, Any]) -> None:
+    """Assert the model produced the correct answer to 17 * 23 (391)."""
+    body = bdd_context["response_body"]
+    summary = body.get("summary", "")
+    assert "391" in summary, f"summary missing correct answer 391: {body!r}"
 
 
 @then("the response namespaces field matches the prepared context")
@@ -175,7 +230,22 @@ def assert_200_envelope(bdd_context: dict[str, Any]) -> None:
 # --- MCP assertions ---
 
 _KNOWN_MOCK_MCP_TOOLS = ("echo", "list_namespaces")
-_KNOWN_MOCK_NAMESPACES = ("default", "kube-system", "openshift-lightspeed", "openshift-monitoring")
+# Unguessable marker returned only by the mock's list_namespaces tool — proves the
+# agent actually invoked the tool. Keep in sync with mock_mcp_server.MOCK_NAMESPACES.
+_MOCK_SENTINEL_NAMESPACE = "e2e-sentinel-ns-7f3a9"
+# Words that indicate the model reported a real tool failure rather than parroting.
+_TOOL_FAILURE_MARKERS = (
+    "nonexistent_tool_xyz_999",
+    "not exist",
+    "does not exist",
+    "doesn't exist",
+    "not found",
+    "unknown tool",
+    "no such tool",
+    "unavailable",
+    "fail",
+    "error",
+)
 
 
 @then("the response summary mentions a known mock MCP tool")
@@ -188,11 +258,26 @@ def assert_summary_mentions_mock_tool(bdd_context: dict[str, Any]) -> None:
     )
 
 
-@then("the response summary contains known namespace output")
+@then("the response summary contains the sentinel namespace from the tool")
 def assert_summary_contains_namespace_output(bdd_context: dict[str, Any]) -> None:
-    """Assert the summary references at least one namespace from the mock MCP."""
+    """Assert the summary contains the unguessable sentinel namespace.
+
+    A model cannot fabricate the sentinel, so its presence proves the agent
+    actually invoked the mock MCP ``list_namespaces`` tool and used its output.
+    """
     body = bdd_context["response_body"]
     summary = body.get("summary", "").lower()
-    assert any(ns in summary for ns in _KNOWN_MOCK_NAMESPACES), (
-        f"summary does not mention any known namespace {_KNOWN_MOCK_NAMESPACES}: {summary!r}"
+    assert _MOCK_SENTINEL_NAMESPACE in summary, (
+        f"summary does not contain sentinel namespace {_MOCK_SENTINEL_NAMESPACE!r} "
+        f"(tool was likely not invoked): {summary!r}"
+    )
+
+
+@then("the response summary indicates a tool failure")
+def assert_summary_indicates_tool_failure(bdd_context: dict[str, Any]) -> None:
+    """Assert the summary reports a genuine failure for the nonexistent tool."""
+    body = bdd_context["response_body"]
+    summary = body.get("summary", "").lower()
+    assert any(marker in summary for marker in _TOOL_FAILURE_MARKERS), (
+        f"summary does not indicate a tool failure {_TOOL_FAILURE_MARKERS}: {summary!r}"
     )

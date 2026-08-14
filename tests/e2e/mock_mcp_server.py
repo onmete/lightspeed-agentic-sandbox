@@ -25,7 +25,16 @@ from starlette.routing import Route
 
 logger = logging.getLogger("mock_mcp_server")
 
-MOCK_NAMESPACES = ["default", "kube-system", "openshift-lightspeed", "openshift-monitoring"]
+# "e2e-sentinel-ns-7f3a9" is an unguessable marker: it can only appear in a run
+# summary if the agent actually invoked list_namespaces (a model cannot hallucinate
+# it the way it can guess "default"/"kube-system"). Keep in sync with steps/then.py.
+MOCK_NAMESPACES = [
+    "default",
+    "kube-system",
+    "openshift-lightspeed",
+    "openshift-monitoring",
+    "e2e-sentinel-ns-7f3a9",
+]
 
 mcp_server = Server("mock-ocp-mcp")
 

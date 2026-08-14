@@ -24,6 +24,7 @@ Feature: Sandbox E2E contract
     When I POST run with timeout_ms 1
     Then the HTTP response status code is 200
     And success is false
+    And the response summary indicates a timeout
 
   Scenario: Target namespaces from context reach the model
     Given the sandbox service is running
@@ -41,11 +42,16 @@ Feature: Sandbox E2E contract
     And success is true
     And the response first failure reason matches the prepared context
 
-  Scenario: Metrics endpoint exposes gen_ai histograms
-    Given the sandbox service is running
+  Scenario: Metrics endpoint records gen_ai histogram samples after a run
+    Given provider credentials are configured
+    And the sandbox service is running
+    And a flat output schema with required fields has been prepared
+    When I POST run with the prepared schema and query
+    Then the HTTP response status code is 200
     When I GET /metrics
     Then the HTTP response status code is 200
     And the response body contains gen_ai histogram metrics
+    And the gen_ai token and duration metrics have recorded samples
 
   Scenario: Approved option from context reaches the model
     Given the sandbox service is running

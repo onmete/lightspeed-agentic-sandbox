@@ -11,6 +11,7 @@ Feature: Reasoning configuration via LIGHTSPEED_REASONING_CONFIG
     Then the HTTP response status code is 200
     And success is true
     And the response has a non-empty summary
+    And the response summary contains the reasoning answer
 
   Scenario: Reasoning does not break structured output
     Given the sandbox service is running with reasoning configured

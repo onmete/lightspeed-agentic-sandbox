@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -76,13 +77,14 @@ def prepare_timeout_query(bdd_context: dict[str, Any], provider_name: str) -> No
     )
 
 
-_CONTEXT_TARGET_NAMESPACES = ["default", "kube-system"]
-
-
 @given("a context with target namespaces and an echo output schema have been prepared")
 def prepare_context_namespaces_echo(bdd_context: dict[str, Any]) -> None:
-    bdd_context["context"] = {"targetNamespaces": _CONTEXT_TARGET_NAMESPACES}
-    bdd_context["expected_namespaces"] = ", ".join(_CONTEXT_TARGET_NAMESPACES)
+    # Unguessable per-run values: the echo can only match if context was truly
+    # injected — real namespaces like "default"/"kube-system" a model could guess.
+    nonce = secrets.token_hex(3)
+    target_namespaces = [f"ns-{nonce}-alpha", f"ns-{nonce}-bravo"]
+    bdd_context["context"] = {"targetNamespaces": target_namespaces}
+    bdd_context["expected_namespaces"] = ", ".join(target_namespaces)
     bdd_context["output_schema"] = CONTEXT_NAMESPACES_ECHO_SCHEMA
     bdd_context["query"] = (
         "The user message contains a [context] block with Target namespaces. "
@@ -93,16 +95,19 @@ def prepare_context_namespaces_echo(bdd_context: dict[str, Any]) -> None:
     )
 
 
-_CONTEXT_PREVIOUS_ATTEMPTS = [
-    {"attempt": 1, "failureReason": "timeout"},
-    {"attempt": 2},
-]
-
-
 @given("a context with previous attempts and an echo output schema have been prepared")
 def prepare_context_previous_attempts_echo(bdd_context: dict[str, Any]) -> None:
-    bdd_context["context"] = {"previousAttempts": _CONTEXT_PREVIOUS_ATTEMPTS}
-    bdd_context["expected_first_failure_reason"] = "timeout"
+    # Unguessable per-run failure reason: a generic value like "timeout" a model
+    # could produce without any injected context.
+    nonce = secrets.token_hex(3)
+    first_failure_reason = f"probe-fault-{nonce}"
+    bdd_context["context"] = {
+        "previousAttempts": [
+            {"attempt": 1, "failureReason": first_failure_reason},
+            {"attempt": 2},
+        ]
+    }
+    bdd_context["expected_first_failure_reason"] = first_failure_reason
     bdd_context["output_schema"] = CONTEXT_PREVIOUS_ATTEMPTS_ECHO_SCHEMA
     bdd_context["query"] = (
         "The user message contains a [context] block with a Previous attempts section. "
@@ -247,7 +252,6 @@ def prepare_mcp_tool_listing(bdd_context: dict[str, Any]) -> None:
     bdd_context["query"] = (
         "You have access to an MCP server called 'mock-ocp-mcp'. "
         "List the tools available ONLY from that MCP server (not your built-in tools). "
-        "The MCP server provides tools like 'echo' and 'list_namespaces'. "
         "Return a single JSON object only (no markdown). "
         "Fields: success=true, summary=<comma-separated names of tools from the "
         "mock-ocp-mcp MCP server>."
@@ -268,8 +272,9 @@ def prepare_mcp_tool_invocation(bdd_context: dict[str, Any]) -> None:
 def prepare_mcp_nonexistent_tool(bdd_context: dict[str, Any]) -> None:
     bdd_context["output_schema"] = MCP_TOOL_OUTPUT_SCHEMA
     bdd_context["query"] = (
-        "Call a tool named 'nonexistent_tool_xyz_999' from the MCP server. "
-        "If the tool does not exist or the call fails, report the failure. "
-        "Return a single JSON object only (no markdown). "
-        "Fields: success=false, summary=<what went wrong>."
+        "Actually attempt to call a tool named 'nonexistent_tool_xyz_999' from the MCP "
+        "server named 'mock-ocp-mcp'. Do not assume the outcome — make the call. "
+        "Return a single JSON object only (no markdown). Report the real outcome: "
+        "set success to true only if the tool call actually succeeded, false otherwise, "
+        "and put a short description of what happened (including the tool name) in summary."
     )

@@ -23,10 +23,11 @@ Feature: MCP server connectivity
     When I POST run with the prepared schema and query
     Then the HTTP response status code is 200
     And success is true
-    And the response summary contains known namespace output
+    And the response summary contains the sentinel namespace from the tool
 
   Scenario: Agent handles unknown MCP tool gracefully
     Given an MCP query targeting a nonexistent tool has been prepared
     When I POST run with the prepared schema and query
     Then the HTTP response status code is 200
     And success is false
+    And the response summary indicates a tool failure
