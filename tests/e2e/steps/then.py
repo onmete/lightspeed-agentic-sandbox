@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +140,7 @@ def assert_summary_contains_reasoning_answer(bdd_context: dict[str, Any]) -> Non
     """Assert the model produced the correct answer to 17 * 23 (391)."""
     body = bdd_context["response_body"]
     summary = body.get("summary", "")
-    assert "391" in summary, f"summary missing correct answer 391: {body!r}"
+    assert re.search(r"\b391\b", summary), f"summary missing correct answer 391: {body!r}"
 
 
 @then("the response namespaces field matches the prepared context")
@@ -233,18 +234,19 @@ _KNOWN_MOCK_MCP_TOOLS = ("echo", "list_namespaces")
 # Unguessable marker returned only by the mock's list_namespaces tool — proves the
 # agent actually invoked the tool. Keep in sync with mock_mcp_server.MOCK_NAMESPACES.
 _MOCK_SENTINEL_NAMESPACE = "e2e-sentinel-ns-7f3a9"
-# Words that indicate the model reported a real tool failure rather than parroting.
-_TOOL_FAILURE_MARKERS = (
-    "nonexistent_tool_xyz_999",
+# Unknown-tool diagnostics that only appear if the agent actually got a
+# tool-not-found error. Deliberately excludes generic markers (fail/error/
+# unavailable) and the tool name itself, so an unrelated failure (e.g. an MCP
+# connection error) cannot satisfy the assertion.
+_NONEXISTENT_TOOL_NAME = "nonexistent_tool_xyz_999"
+_UNKNOWN_TOOL_MARKERS = (
     "not exist",
     "does not exist",
     "doesn't exist",
     "not found",
     "unknown tool",
     "no such tool",
-    "unavailable",
-    "fail",
-    "error",
+    "no tool named",
 )
 
 
@@ -275,9 +277,16 @@ def assert_summary_contains_namespace_output(bdd_context: dict[str, Any]) -> Non
 
 @then("the response summary indicates a tool failure")
 def assert_summary_indicates_tool_failure(bdd_context: dict[str, Any]) -> None:
-    """Assert the summary reports a genuine failure for the nonexistent tool."""
+    """Assert the summary reports the requested tool as unknown/not found.
+
+    Requires both the requested tool name and an unknown-tool diagnostic so a
+    generic failure (e.g. an MCP connection error) cannot satisfy it.
+    """
     body = bdd_context["response_body"]
     summary = body.get("summary", "").lower()
-    assert any(marker in summary for marker in _TOOL_FAILURE_MARKERS), (
-        f"summary does not indicate a tool failure {_TOOL_FAILURE_MARKERS}: {summary!r}"
+    assert _NONEXISTENT_TOOL_NAME in summary, (
+        f"summary does not reference the requested tool {_NONEXISTENT_TOOL_NAME!r}: {summary!r}"
+    )
+    assert any(marker in summary for marker in _UNKNOWN_TOOL_MARKERS), (
+        f"summary does not indicate an unknown tool {_UNKNOWN_TOOL_MARKERS}: {summary!r}"
     )
