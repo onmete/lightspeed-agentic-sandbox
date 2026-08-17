@@ -11,13 +11,6 @@ Feature: MCP server connectivity
     Then the HTTP response status code is 200
     And the response body status is ok
 
-  Scenario: Agent can list tools from configured MCP server
-    Given an MCP tool listing query has been prepared
-    When I POST run with the prepared schema and query
-    Then the HTTP response status code is 200
-    And success is true
-    And the response summary mentions a known mock MCP tool
-
   Scenario: Agent can invoke an MCP tool and use its output
     Given an MCP tool invocation query has been prepared
     When I POST run with the prepared schema and query

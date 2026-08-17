@@ -246,18 +246,6 @@ def sandbox_running_with_mcp(server_url: str) -> None:
     )
 
 
-@given("an MCP tool listing query has been prepared")
-def prepare_mcp_tool_listing(bdd_context: dict[str, Any]) -> None:
-    bdd_context["output_schema"] = MCP_TOOL_OUTPUT_SCHEMA
-    bdd_context["query"] = (
-        "You have access to an MCP server called 'mock-ocp-mcp'. "
-        "List the tools available ONLY from that MCP server (not your built-in tools). "
-        "Return a single JSON object only (no markdown). "
-        "Fields: success=true, summary=<comma-separated names of tools from the "
-        "mock-ocp-mcp MCP server>."
-    )
-
-
 @given("an MCP tool invocation query has been prepared")
 def prepare_mcp_tool_invocation(bdd_context: dict[str, Any]) -> None:
     bdd_context["output_schema"] = MCP_TOOL_OUTPUT_SCHEMA

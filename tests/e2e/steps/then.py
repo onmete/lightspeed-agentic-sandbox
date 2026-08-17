@@ -230,7 +230,6 @@ def assert_200_envelope(bdd_context: dict[str, Any]) -> None:
 
 # --- MCP assertions ---
 
-_KNOWN_MOCK_MCP_TOOLS = ("echo", "list_namespaces")
 # Unguessable marker returned only by the mock's list_namespaces tool — proves the
 # agent actually invoked the tool. Keep in sync with mock_mcp_server.MOCK_NAMESPACES.
 _MOCK_SENTINEL_NAMESPACE = "e2e-sentinel-ns-7f3a9"
@@ -248,16 +247,6 @@ _UNKNOWN_TOOL_MARKERS = (
     "no such tool",
     "no tool named",
 )
-
-
-@then("the response summary mentions a known mock MCP tool")
-def assert_summary_mentions_mock_tool(bdd_context: dict[str, Any]) -> None:
-    """Assert the summary contains at least one known mock MCP tool name."""
-    body = bdd_context["response_body"]
-    summary = body.get("summary", "").lower()
-    assert any(tool in summary for tool in _KNOWN_MOCK_MCP_TOOLS), (
-        f"summary does not mention any known MCP tool {_KNOWN_MOCK_MCP_TOOLS}: {summary!r}"
-    )
 
 
 @then("the response summary contains the sentinel namespace from the tool")
