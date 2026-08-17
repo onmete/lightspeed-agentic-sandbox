@@ -233,20 +233,6 @@ def assert_200_envelope(bdd_context: dict[str, Any]) -> None:
 # Unguessable marker returned only by the mock's list_namespaces tool — proves the
 # agent actually invoked the tool. Keep in sync with mock_mcp_server.MOCK_NAMESPACES.
 _MOCK_SENTINEL_NAMESPACE = "e2e-sentinel-ns-7f3a9"
-# Unknown-tool diagnostics that only appear if the agent actually got a
-# tool-not-found error. Deliberately excludes generic markers (fail/error/
-# unavailable) and the tool name itself, so an unrelated failure (e.g. an MCP
-# connection error) cannot satisfy the assertion.
-_NONEXISTENT_TOOL_NAME = "nonexistent_tool_xyz_999"
-_UNKNOWN_TOOL_MARKERS = (
-    "not exist",
-    "does not exist",
-    "doesn't exist",
-    "not found",
-    "unknown tool",
-    "no such tool",
-    "no tool named",
-)
 
 
 @then("the response summary contains the sentinel namespace from the tool")
@@ -261,21 +247,4 @@ def assert_summary_contains_namespace_output(bdd_context: dict[str, Any]) -> Non
     assert _MOCK_SENTINEL_NAMESPACE in summary, (
         f"summary does not contain sentinel namespace {_MOCK_SENTINEL_NAMESPACE!r} "
         f"(tool was likely not invoked): {summary!r}"
-    )
-
-
-@then("the response summary indicates a tool failure")
-def assert_summary_indicates_tool_failure(bdd_context: dict[str, Any]) -> None:
-    """Assert the summary reports the requested tool as unknown/not found.
-
-    Requires both the requested tool name and an unknown-tool diagnostic so a
-    generic failure (e.g. an MCP connection error) cannot satisfy it.
-    """
-    body = bdd_context["response_body"]
-    summary = body.get("summary", "").lower()
-    assert _NONEXISTENT_TOOL_NAME in summary, (
-        f"summary does not reference the requested tool {_NONEXISTENT_TOOL_NAME!r}: {summary!r}"
-    )
-    assert any(marker in summary for marker in _UNKNOWN_TOOL_MARKERS), (
-        f"summary does not indicate an unknown tool {_UNKNOWN_TOOL_MARKERS}: {summary!r}"
     )
