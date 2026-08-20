@@ -15,6 +15,16 @@ class TestDerivePhase:
         conditions = [{"type": "Escalated", "status": "True"}]
         assert derive_phase(conditions) == "Escalated"
 
+    def test_escalating(self) -> None:
+        # Verification failed and escalation is in flight: the operator sets
+        # Verified=False plus Escalated=Unknown. Escalated takes priority over
+        # Verified, so this derives Escalating (non-terminal), not Failed.
+        conditions = [
+            {"type": "Verified", "status": "False"},
+            {"type": "Escalated", "status": "Unknown"},
+        ]
+        assert derive_phase(conditions) == "Escalating"
+
     def test_verified_true(self) -> None:
         conditions = [
             {"type": "Analyzed", "status": "True"},
@@ -86,3 +96,7 @@ class TestConstants:
 
     def test_terminal_phases(self) -> None:
         assert frozenset({"Completed", "Failed", "Denied", "Escalated"}) == TERMINAL_PHASES
+
+    def test_escalating_is_not_terminal(self) -> None:
+        # Escalation in progress must not stop phase polling early.
+        assert "Escalating" not in TERMINAL_PHASES

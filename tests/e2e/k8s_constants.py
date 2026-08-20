@@ -15,8 +15,15 @@ def derive_phase(conditions: list[dict[str, str]]) -> str:
     """
     cond_map: dict[str, dict[str, str]] = {c["type"]: c for c in conditions}
 
-    if "Escalated" in cond_map and cond_map["Escalated"]["status"] == "True":
-        return "Escalated"
+    if "Escalated" in cond_map:
+        status = cond_map["Escalated"]["status"]
+        if status == "True":
+            return "Escalated"
+        # Unknown = escalation in progress after a verification failure
+        # (matches Go DerivePhase); non-terminal, so polling must keep going.
+        if status == "Unknown":
+            return "Escalating"
+        return "Failed"
 
     if "Verified" in cond_map:
         status = cond_map["Verified"]["status"]
