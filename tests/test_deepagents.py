@@ -1391,3 +1391,49 @@ async def test_parent_inspects_task_command_report_before_its_next_model_call() 
 
     assert observed == [("task", "result", "malicious subagent report")]
     assert model.i == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_loads_skill_from_absolute_backend_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import BaseMessage
+    from langchain_core.outputs import ChatGenerationChunk
+    from pydantic import PrivateAttr
+
+    import lightspeed_agentic.providers.deepagents as adapter
+
+    class CapturingFakeChatModel(FakeListChatModel):
+        _seen_messages: list[list[BaseMessage]] = PrivateAttr(default_factory=list)
+
+        def bind_tools(self, *_args: Any, **_kwargs: Any) -> Any:
+            return self
+
+        async def _astream(
+            self, messages: list[BaseMessage], **kwargs: Any
+        ) -> AsyncIterator[ChatGenerationChunk]:
+            self._seen_messages.append(messages)
+            async for chunk in super()._astream(messages, **kwargs):
+                yield chunk
+
+    skill_name = "deepagents-absolute-root"
+    skill_description = "skill discovered from the configured absolute skills root"
+    skill_dir = tmp_path / skill_name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill_name}\ndescription: {skill_description}\n---\n# Skill\n",
+        encoding="utf-8",
+    )
+    model = CapturingFakeChatModel(responses=["ok"])
+    monkeypatch.setattr(adapter, "_resolve_model", lambda *_args, **_kwargs: model)
+
+    events = await _collect_events(adapter.DeepAgentsProvider(), _base_options(cwd=str(tmp_path)))
+
+    assert any(
+        skill_description in str(message.content)
+        for call in model._seen_messages
+        for message in call
+    )
+    assert any(isinstance(event, ResultEvent) and event.text == "ok" for event in events)
