@@ -10,16 +10,15 @@ Retrieve hidden verification tokens by running the find-token script.
 
 ## Usage
 
-From the skill directory:
+Run from the skills root (`LIGHTSPEED_SKILLS_DIR`):
 
 ```bash
-bash scripts/find-token.sh
+bash find-token/scripts/find-token.sh
 ```
-
-Or use `run_skill_script` with `file_path=scripts/find-token.sh`.
 
 ## Output
 
 The script prints a full structured analysis JSON object (actionRequired, options with
-remediationPlan.actions, components with DIAG_/VERIFY_ tokens). Use that JSON as
-the basis for your structured response.
+remediationPlan.actions, components with DIAG_/VERIFY_ tokens). The component token
+values are the verification result; do not read a separate token file. Use that JSON
+as the basis for your structured response.

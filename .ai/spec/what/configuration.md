@@ -28,13 +28,13 @@ Cross-references: how options are consumed in code → `how/provider-architectur
 
     | Env var | Required | Description |
     | --- | --- | --- |
-    | `LIGHTSPEED_AUDIT_ENABLED` | No | When `"true"`, structured audit event logging is enabled. Default: disabled. |
-    | `LIGHTSPEED_CAPTURE_CONTENT` | No | When `"true"`, `gen_ai.completion` and `gen_ai.reasoning_content` are recorded on `gen_ai.choice` span events. When unset, defaults to the same value as `LIGHTSPEED_AUDIT_ENABLED` (content on when audit is on). Set `"false"` to opt out. The operator does not set this env today. [DEFERRED] Separate CRD field for user-controllable opt-in/out planned per parent spec. |
-    | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Shared OTLP collector endpoint for span **and** log export. When absent, OTLP export is off (stdout audit JSON still applies when audit is enabled). |
+    | `LIGHTSPEED_AUDIT_ENABLED` | No | `"true"` enables stdout OTLP-JSON compliance span export and, with an OTLP endpoint, derived templog copies of completed sandbox GenAI operation spans. Default: disabled; OTLP trace export with an endpoint remains independent. |
+    | `LIGHTSPEED_CAPTURE_CONTENT` | No | Compliance copies only: unset defaults to `LIGHTSPEED_AUDIT_ENABLED`, explicit `"true"`/`"false"` overrides. `"false"` removes standard message, system-instruction, tool-definition, and tool-call argument/result content attributes from stdout and templog projections, not from recording source spans or their OTLP trace export. The operator does not set this env today. [DEFERRED] Separate CRD field for user-controllable opt-in/out planned per parent spec. |
+    | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Shared OTLP collector endpoint for unmodified traces and developer/derived audit logs. Without it OTLP export is off (stdout audit JSON still applies when audit is enabled). |
     | `OTEL_EXPORTER_OTLP_PROTOCOL` | No | `grpc` (default) or `http/protobuf`. |
-    | `LIGHTSPEED_AGENTICRUN_UID` | No | AgenticRun `metadata.uid` for this sandbox pod. Stamped on bridged OTLP log **record** attributes. Required by collector templog INSERT. Set by operator with the OTEL endpoint. |
-    | `LIGHTSPEED_AGENTICRUN_STEP` | No | AgenticRun step/phase for this pod (`analysis`, `execution`, …). Mapped to `agenticrun.phase` on bridged OTLP log records. Set by operator with the OTEL endpoint. |
-    | `TRACEPARENT` | No | W3C trace context from the operator phase span. When set, links sandbox inference spans as children of the operator trace. When absent, sandbox generates a new trace ID. |
+    | `LIGHTSPEED_AGENTICRUN_UID` | No | AgenticRun `metadata.uid` for this sandbox pod; when supplied, becomes `agenticrun.uid` on sandbox agent/model/tool spans and bridged OTLP log records. Required by collector candidate eligibility and templog INSERT. Set by operator with the OTEL endpoint. |
+    | `LIGHTSPEED_AGENTICRUN_STEP` | No | AgenticRun step/phase for this pod (`analysis`, `execution`, …); when supplied, becomes `agenticrun.phase` on sandbox agent/model/tool spans and bridged OTLP log records. Set by operator with the OTEL endpoint. |
+    | `TRACEPARENT` | No | W3C context from the operator phase span. Valid context parents the sandbox `invoke_agent` span, whose model/tool spans are sibling children; absent or invalid context creates a new trace. |
     | `LIGHTSPEED_MCP_SERVERS` | No | JSON array of MCP server configs. See rule 20a. When absent, no MCP servers are configured. |
     | `LIGHTSPEED_TLS_PROFILE` | No | Optional resolved OpenShift TLS profile type from the operator handoff. Runtime defaults apply when unset. |
     | `LIGHTSPEED_TLS_MIN_VERSION` | No | Optional resolved minimum TLS version from the operator handoff. Runtime defaults apply when unset. |
@@ -200,11 +200,11 @@ OPENAI_API_KEY: <token-or-placeholder>
 | `/var/run/secrets/llm-credentials/{aws_access_key_id,aws_secret_access_key,role_arn}` | Bedrock IAM files; `role_arn` (optional) selects STS assume-role, refreshed by botocore (rule 9b). Mounted by operator. |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Internal: Vertex mode for Gemini adapter. Set by configuration mapping. |
 | `OPENAI_BASE_URL` | Internal: OpenAI-compatible endpoint. Set by configuration mapping. |
-| `LIGHTSPEED_AUDIT_ENABLED` | Audit event logging toggle. Set by operator from `AgenticOLSConfig`. |
-| `LIGHTSPEED_CAPTURE_CONTENT` | Content capture for `gen_ai.completion`/`gen_ai.reasoning_content` on choice events. When unset, defaults to audit enabled; `"false"` opts out. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Shared OTLP endpoint for span and log export. Set by operator from `AgenticOLSConfig`. |
-| `LIGHTSPEED_AGENTICRUN_UID` | AgenticRun UID on bridged OTLP log record attrs (templog). Set by operator with OTEL endpoint. |
-| `LIGHTSPEED_AGENTICRUN_STEP` | AgenticRun step → `agenticrun.phase` on bridged OTLP log records. Set by operator with OTEL endpoint. |
+| `LIGHTSPEED_AUDIT_ENABLED` | Compliance stdout and endpoint-backed derived templog toggle. Set by operator from `AgenticOLSConfig`; product trace export with an endpoint remains independent. |
+| `LIGHTSPEED_CAPTURE_CONTENT` | Compliance stdout/templog content attribute policy, not source-span capture. When unset defaults to audit enabled; explicit `"true"`/`"false"` overrides. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Shared endpoint for source trace and log export. Set by operator from `AgenticOLSConfig`. |
+| `LIGHTSPEED_AGENTICRUN_UID` | AgenticRun UID on sandbox agent/model/tool spans and bridged OTLP log records, when supplied. Set by operator with OTEL endpoint. |
+| `LIGHTSPEED_AGENTICRUN_STEP` | AgenticRun step → `agenticrun.phase` on sandbox spans and bridged OTLP log records, when supplied. Set by operator with OTEL endpoint. |
 | `LIGHTSPEED_MCP_SERVERS` | JSON array of MCP server configs with URLs, timeouts, and header sources. Set by operator from `ToolsSpec.mcpServers` and auto-injected defaults. |
 | `LIGHTSPEED_TLS_PROFILE` | Resolved OpenShift TLS profile type from the operator handoff. |
 | `LIGHTSPEED_TLS_MIN_VERSION` | Resolved minimum TLS version from the operator handoff. |

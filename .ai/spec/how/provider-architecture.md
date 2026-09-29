@@ -8,7 +8,7 @@ Package tree: `AGENTS.md`. Behavioral rules: `what/run-api.md`, `what/provider-c
 1. Startup: `batch.main()` reads `/input/`, then calls `resolve_sdk()`, `parse_reasoning_config()`, and `parse_mcp_servers()` (fail-fast on bad env), `run_readiness_checks()`, `init_tracer()` when `otel_runtime_enabled()`, and `create_provider()`. [PLANNED: OLS-3743] Startup also requires and validates `LIGHTSPEED_AGENT_TIMEOUT_SECONDS` and `LIGHTSPEED_AGENT_MAX_TURNS` before provider invocation.
 2. `run_agent_query()` applies context prefix, passes pre-parsed `mcp_servers` and operator-resolved maximum turns into `ProviderQueryOptions`, and calls `provider.query(...)`. [PLANNED: OLS-3743] The outer agent invocation is bounded by the operator-resolved timeout; timeout returns a structured classification used by Result status assembly.
 2a. [PLANNED: OLS-3928] The DeepAgents adapter installs result-inspection middleware around model-visible tool results and errors. The middleware uses the resolved DeepAgents model for isolated classifier calls.
-3. Handler async-iterates events; `EventLogger` and `AuditLogger` side effects; metrics histograms updated; stops at first `result` event.
+3. `run_agent_query()` starts the `invoke_agent lightspeed` span and passes `GenAIRecorder` via `ProviderQueryOptions.telemetry`; adapters record actual model and tool spans as sibling children, while the handler consumes normalized events for `EventLogger` and the final `result`; metrics histograms are updated.
 4. `publish_agent_result()` builds status from agent output, creates Result CR via Kubernetes API (`create_namespaced_custom_object`), replaces status (`replace_namespaced_custom_object_status`).
 5. `shutdown_tracer()`; exit 0 on sandbox success (including agent failure), non-zero on infrastructure failure with termination log.
 
@@ -41,7 +41,7 @@ configuration rather than independent CA arguments.
 - **google-adk / google.genai:** `Agent`, `Runner`, `ExecuteBashTool`, `SkillToolset`. MCP via `McpToolset` + `StreamableHTTPConnectionParams`.
 - **openai-agents (+ openai):** `SandboxAgent`, `Runner`, `UnixLocalSandboxClient`. MCP via `MCPServerStreamableHttp`. Client selection by provider (`what/provider-contract.md` rule 29): native OpenAI → `AsyncOpenAI` + `OpenAIResponsesModel`; Azure → the SDK's built-in `AsyncAzureOpenAI` + `OpenAIChatCompletionsModel`.
 - **azure.identity (Azure Entra ID):** `ClientSecretCredential` + `get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")` supplies the `azure_ad_token_provider` passed to `AsyncAzureOpenAI`; the library owns token caching/refresh (`what/provider-contract.md` rule 38). Imported inside the adapter method (optional-extra convention). **New dependency** [OLS-3050]: `azure-identity` (pulls `azure-core`) is added to the `openai` optional extra — `AsyncAzureOpenAI` and its `azure_ad_token_provider` param ship in `openai` (via `openai-agents`), but the credential classes do not. Adding it requires regenerating the Konflux hashed requirements/lockfiles.
-- **OpenTelemetry:** `tracing.py` TracerProvider; `audit.py` GenAI spans/events; `metrics.py` in-process Prometheus histograms (no `/metrics` route).
+- **OpenTelemetry:** `tracing.py` TracerProvider, traceparent parsing, and compliance projections; `audit.py` `GenAIRecorder` for model/tool spans; `genai_messages.py` for standard ordered messages; `metrics.py` in-process Prometheus histograms (no `/metrics` route).
 
 ## Implementation Notes
 

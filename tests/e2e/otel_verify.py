@@ -45,24 +45,45 @@ def fetch_otel_collector_logs(
     return "\n".join(chunks)
 
 
+def _record_blocks(logs: str, marker: str) -> list[str]:
+    """Split debug-exporter output into individual span or log-record blocks."""
+    records: list[str] = []
+    current: list[str] | None = None
+    for line in logs.splitlines():
+        if line.lstrip().startswith(marker):
+            if current is not None:
+                records.append("\n".join(current))
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        records.append("\n".join(current))
+    return records
+
+
 def logs_contain_traces_for_run(logs: str, run_uid: str) -> bool:
-    """True when debug exporter output includes spans correlated to ``run_uid``."""
-    if run_uid not in logs:
-        return False
-    trace_markers = ("ResourceSpans", "Span #", "Trace ID")
-    return any(marker in logs for marker in trace_markers)
+    """True when one span contains both this run ID and a GenAI operation."""
+    return any(
+        f"agenticrun.uid: Str({run_uid})" in record
+        and any(
+            f"gen_ai.operation.name: Str({operation})" in record
+            for operation in ("invoke_agent", "chat", "execute_tool")
+        )
+        for record in _record_blocks(logs, "Span #")
+    )
 
 
 def logs_contain_audit_logs_for_run(logs: str, run_uid: str, *, phase: str) -> bool:
-    """True when debug exporter output includes bridged audit log records for the run."""
-    if run_uid not in logs:
-        return False
-    if phase not in logs:
-        return False
-    audit_markers = ("LogRecord", "LogsExporter", "gen_ai.choice")
-    if not any(marker in logs for marker in audit_markers):
-        return False
-    return "agenticrun" in logs
+    """True when one log record contains this run, phase, and operation event."""
+    return any(
+        f"agenticrun.uid: Str({run_uid})" in record
+        and f"agenticrun.phase: Str({phase})" in record
+        and any(
+            f"event: Str({operation})" in record
+            for operation in ("invoke_agent", "chat", "execute_tool")
+        )
+        for record in _record_blocks(logs, "LogRecord #")
+    )
 
 
 def wait_for_otel_traces(

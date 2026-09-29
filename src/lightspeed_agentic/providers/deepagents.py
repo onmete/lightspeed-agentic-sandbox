@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import uuid
+from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator
 from typing import Any, Literal, cast
+from uuid import UUID
 
 from lightspeed_agentic.skills import has_skills
 from lightspeed_agentic.types import (
@@ -36,6 +38,7 @@ from lightspeed_agentic.types import (
 # not skip work on the hot path once a run is underway.
 
 logger = logging.getLogger(__name__)
+
 
 _JSON_SCHEMA_TYPE_MAP: dict[str, type[Any]] = {
     "string": str,
@@ -198,11 +201,497 @@ def _resolve_field_type(schema: dict[str, Any], name: str) -> Any:
     return _JSON_SCHEMA_TYPE_MAP.get(json_type, str)
 
 
-def _usage_from_message(msg: Any) -> tuple[int, int]:
-    usage = getattr(msg, "usage_metadata", None)
-    if not usage:
-        return 0, 0
-    return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+def _model_usage(msg: Any) -> dict[str, int]:
+    usage = getattr(msg, "usage_metadata", None) or {}
+    details = usage.get("output_token_details") or {}
+    result: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens"):
+        value = usage.get(key)
+        if type(value) is int:
+            result[key] = value
+    reasoning = details.get("reasoning")
+    if type(reasoning) is int:
+        result["reasoning_tokens"] = reasoning
+    return result
+
+
+def _response_model(msg: Any) -> str | None:
+    metadata = getattr(msg, "response_metadata", None) or {}
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get("model_name") or metadata.get("model")
+
+
+def _message_parts(message: Any, ids: Any = None, *, output: bool = False) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    content = getattr(message, "content", "")
+    blocks = getattr(message, "content_blocks", None)
+    if blocks:
+        for block in blocks:
+            kind = block.get("type") if isinstance(block, dict) else getattr(block, "type", "")
+            get = (
+                block.get
+                if isinstance(block, dict)
+                else lambda key, default=None, _block=block: getattr(_block, key, default)
+            )
+            if kind == "non_standard":
+                wrapped = get("value", {})
+                if not isinstance(wrapped, dict):
+                    continue
+                get = wrapped.get
+                kind = get("type", "")
+            if kind in ("reasoning", "thinking"):
+                reasoning = get("reasoning", get("thinking", ""))
+                if isinstance(reasoning, str) and reasoning:
+                    parts.append({"type": "reasoning", "content": reasoning})
+            elif kind == "text":
+                parts.append({"type": "text", "content": get("text", "")})
+            elif kind in ("tool_call", "tool_use"):
+                parts.append(
+                    {
+                        "type": "tool_call",
+                        "id": get("id"),
+                        "name": get("name", ""),
+                        "arguments": get("args", get("input", {})),
+                    }
+                )
+    elif content:
+        if isinstance(content, str):
+            parts.append({"type": "text", "content": content})
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    parts.append({"type": "text", "content": block})
+                elif isinstance(block, dict):
+                    if block.get("type") in ("thinking", "reasoning"):
+                        reasoning = block.get("thinking", block.get("reasoning", ""))
+                        if isinstance(reasoning, str) and reasoning:
+                            parts.append({"type": "reasoning", "content": reasoning})
+                    elif block.get("type") == "text":
+                        parts.append({"type": "text", "content": block.get("text", "")})
+    tool_calls = getattr(message, "tool_calls", None) or []
+    if tool_calls:
+
+        def call_key(name: str, arguments: Any) -> tuple[str, str]:
+            return (
+                name,
+                json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str),
+            )
+
+        call_indexes_by_key: dict[tuple[str, str], list[int]] = defaultdict(list)
+        explicit_call_indexes: dict[str, deque[int]] = defaultdict(deque)
+        for index, call in enumerate(tool_calls):
+            key = call_key(call.get("name", ""), call.get("args", {}))
+            call_indexes_by_key[key].append(index)
+            if call_id := call.get("id"):
+                explicit_call_indexes[call_id].append(index)
+
+        matched_call_positions: dict[int, int] = {}
+        unmatched_block_positions: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for position, part in enumerate(parts):
+            if part["type"] != "tool_call":
+                continue
+            key = call_key(part["name"], part["arguments"])
+            indexes = explicit_call_indexes[part["id"]] if part.get("id") else None
+            if indexes:
+                index = indexes.popleft()
+                matched_call_positions[index] = position
+                call = tool_calls[index]
+                parts[position]["id"] = call.get("id")
+                parts[position]["name"] = call.get("name", "")
+                parts[position]["arguments"] = call.get("args", {})
+            else:
+                unmatched_block_positions[key].append(position)
+
+        duplicate_block_positions: set[int] = set()
+        for key, positions in unmatched_block_positions.items():
+            call_indexes = call_indexes_by_key.get(key)
+            if not call_indexes:
+                continue
+            unmatched_calls = [
+                index for index in call_indexes if index not in matched_call_positions
+            ]
+            paired_count = 0
+            if unmatched_calls and (
+                len(unmatched_calls) == 1 or len(positions) >= len(unmatched_calls)
+            ):
+                paired_count = min(len(positions), len(unmatched_calls))
+                for position, index in zip(
+                    positions[:paired_count], unmatched_calls[:paired_count], strict=True
+                ):
+                    matched_call_positions[index] = position
+                    call = tool_calls[index]
+                    parts[position]["id"] = call.get("id")
+                    parts[position]["name"] = call.get("name", "")
+                    parts[position]["arguments"] = call.get("args", {})
+            duplicate_block_positions.update(positions[paired_count:])
+
+        following_positions: dict[int, int | None] = {}
+        following_position = None
+        for index in range(len(tool_calls) - 1, -1, -1):
+            following_positions[index] = following_position
+            if index in matched_call_positions:
+                following_position = matched_call_positions[index]
+
+        insert_before: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        insert_after: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        trailing_calls: list[dict[str, Any]] = []
+        previous_position = None
+        for index, call in enumerate(tool_calls):
+            if index in matched_call_positions:
+                previous_position = matched_call_positions[index]
+                continue
+            name, arguments = call.get("name", ""), call.get("args", {})
+            part = {
+                "type": "tool_call",
+                "id": call.get("id"),
+                "name": name,
+                "arguments": arguments,
+            }
+            next_position = following_positions[index]
+            if next_position is not None:
+                insert_before[next_position].append(part)
+            elif previous_position is not None:
+                insert_after[previous_position].append(part)
+            else:
+                trailing_calls.append(part)
+
+        if insert_before or insert_after or trailing_calls or duplicate_block_positions:
+            merged_parts: list[dict[str, Any]] = []
+            for position, part in enumerate(parts):
+                merged_parts.extend(insert_before.get(position, ()))
+                if position not in duplicate_block_positions:
+                    merged_parts.append(part)
+                merged_parts.extend(insert_after.get(position, ()))
+            merged_parts.extend(trailing_calls)
+            parts = merged_parts
+    for part in parts:
+        if part["type"] == "tool_call" and not part["id"]:
+            part["id"] = (
+                (
+                    ids.output_id(part["name"], part["arguments"])
+                    if output
+                    else ids.input_id(part["name"], part["arguments"])
+                )
+                if ids
+                else ""
+            )
+    if getattr(message, "type", "") == "tool":
+        call_id = getattr(message, "tool_call_id", "") or (ids.result_id(message) if ids else "")
+        return [{"type": "tool_call_response", "id": call_id, "response": content}]
+    return parts
+
+
+def _genai_tool_definitions(tools: Any) -> list[dict[str, Any]] | None:
+    """Normalize LangChain tool definitions to the GenAI semantic-convention shape."""
+    if not isinstance(tools, list):
+        return None
+    definitions = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        definition = function if isinstance(function, dict) else tool
+        tool_type = tool.get("type") or "function"
+        name = definition.get("name")
+        if not isinstance(tool_type, str) or not isinstance(name, str):
+            continue
+        normalized: dict[str, Any] = {"type": tool_type, "name": name}
+        description = definition.get("description")
+        if isinstance(description, str):
+            normalized["description"] = description
+        parameters = definition.get("parameters")
+        if parameters is None:
+            parameters = definition.get("input_schema")
+        if isinstance(parameters, dict):
+            normalized["parameters"] = parameters
+        definitions.append(normalized)
+    return definitions or None
+
+
+def _telemetry_handler(observer: Any, requested_model: str) -> Any:
+    """LangChain callback boundaries see the final post-middleware model request."""
+    from langchain_core.callbacks import AsyncCallbackHandler
+    from langchain_core.messages import BaseMessage
+
+    class Handler(AsyncCallbackHandler):
+        def __init__(self) -> None:
+            self.models: dict[Any, list[tuple[object, str]]] = {}
+            self.tools: dict[Any, tuple[object, str]] = {}
+            self.pending_tool_results: dict[str, tuple[object, Any]] = {}
+            self.model_input_tool_results: dict[str, Any] = {}
+            self.proposed_ids: dict[tuple[str, str], deque[str]] = defaultdict(deque)
+            self.pending_ids: dict[tuple[str, str], deque[str]] = defaultdict(deque)
+            self.preassigned_ids: dict[tuple[str, str], deque[str]] = defaultdict(deque)
+            self.history_ids: dict[tuple[str, str], list[str]] = defaultdict(list)
+            self.completed_ids: dict[str, list[str]] = defaultdict(list)
+            self.input_call_positions: Counter[tuple[str, str]] = Counter()
+            self.input_call_totals: Counter[tuple[str, str]] = Counter()
+            self.input_history_count: dict[tuple[str, str], int] = {}
+            self.input_result_positions: Counter[str] = Counter()
+            self.input_result_totals: Counter[str] = Counter()
+            self.stream_result_positions: Counter[str] = Counter()
+            self.usage_seen = False
+            self.model_completed = False
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.reasoning_tokens = 0
+            self.response_model = ""
+
+        def key(self, name: str, arguments: Any) -> tuple[str, str]:
+            return name, json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+
+        def call_id(self, name: str, arguments: Any) -> str:
+            key = self.key(name, arguments)
+            if self.preassigned_ids[key]:
+                return self.preassigned_ids[key].popleft()
+            call_id = uuid.uuid4().hex
+            self.proposed_ids[key].append(call_id)
+            return call_id
+
+        def output_id(self, name: str, arguments: Any) -> str:
+            key = self.key(name, arguments)
+            call_id = (
+                self.proposed_ids[key].popleft() if self.proposed_ids[key] else uuid.uuid4().hex
+            )
+            self.pending_ids[key].append(call_id)
+            self.history_ids[key].append(call_id)
+            return call_id
+
+        def bind_output_id(self, name: str, arguments: Any) -> str:
+            key = self.key(name, arguments)
+            has_stream_id = bool(self.proposed_ids[key])
+            call_id = self.output_id(name, arguments)
+            if not has_stream_id:
+                self.preassigned_ids[key].append(call_id)
+            return call_id
+
+        def input_id(self, name: str, arguments: Any) -> str:
+            key = self.key(name, arguments)
+            index = self.input_call_positions[key]
+            self.input_call_positions[key] += 1
+            previous = min(self.input_call_totals[key], self.input_history_count.get(key, 0))
+            if index < previous:
+                return self.history_ids[key][-previous + index]
+            call_id = uuid.uuid4().hex
+            self.history_ids[key].append(call_id)
+            return call_id
+
+        def begin_input_batch(self, batch: list[Any]) -> None:
+            self.preassigned_ids.clear()
+            self.input_call_positions.clear()
+            self.input_result_positions.clear()
+            self.input_call_totals = Counter(
+                self.key(call.get("name", ""), call.get("args", {}))
+                for msg in batch
+                for call in getattr(msg, "tool_calls", None) or []
+                if not call.get("id")
+            )
+            self.input_history_count = {
+                key: len(self.history_ids[key]) for key in self.input_call_totals
+            }
+            self.input_result_totals = Counter(
+                str(msg.content)
+                for msg in batch
+                if msg.type == "tool" and not getattr(msg, "tool_call_id", None)
+            )
+
+        def result_id(self, message: Any, *, stream: bool = False) -> str:
+            content = str(getattr(message, "content", ""))
+            positions = self.stream_result_positions if stream else self.input_result_positions
+            index = positions[content]
+            positions[content] += 1
+            count = (
+                len(self.completed_ids[content]) if stream else self.input_result_totals[content]
+            )
+            offset = count - index
+            return (
+                self.completed_ids[content][-offset]
+                if 0 < offset <= len(self.completed_ids[content])
+                else ""
+            )
+
+        def model_tool_result(self, call_id: str) -> tuple[bool, Any]:
+            if call_id not in self.model_input_tool_results:
+                return False, None
+            return True, self.model_input_tool_results[call_id]
+
+        def fail_pending_tool_results(self, error: BaseException) -> None:
+            pending = self.pending_tool_results
+            self.pending_tool_results = {}
+            for handle, _result in pending.values():
+                observer.end_tool(handle, None, error)
+
+        async def on_chat_model_start(
+            self,
+            serialized: dict[str, Any],  # noqa: ARG002
+            messages: list[list[BaseMessage]],
+            *,
+            run_id: UUID,
+            parent_run_id: UUID | None = None,  # noqa: ARG002
+            tags: list[str] | None = None,  # noqa: ARG002
+            metadata: dict[str, Any] | None = None,  # noqa: ARG002
+            **kwargs: Any,
+        ) -> None:
+            params = kwargs.get("invocation_params") or {}
+            model = params.get("model") or params.get("model_name") or requested_model
+            tool_definitions = _genai_tool_definitions(params.get("tools"))
+            self.model_input_tool_results.clear()
+            started = []
+            for batch in messages:
+                self.begin_input_batch(batch)
+                system = [
+                    part
+                    for msg in batch
+                    if getattr(msg, "type", "") == "system"
+                    for part in _message_parts(msg, self)
+                ]
+                inputs = []
+                for msg in batch:
+                    if msg.type == "system":
+                        continue
+                    parts = _message_parts(msg, self)
+                    if msg.type == "tool":
+                        response = next(
+                            (part for part in parts if part.get("type") == "tool_call_response"),
+                            None,
+                        )
+                        call_id = response.get("id") if response else None
+                        if isinstance(call_id, str) and call_id:
+                            self.model_input_tool_results[call_id] = msg.content
+                            pending_result = self.pending_tool_results.pop(call_id, None)
+                            if pending_result is not None:
+                                observer.end_tool(pending_result[0], pending_result[1], None)
+                    inputs.append(
+                        {
+                            "role": "assistant"
+                            if msg.type == "ai"
+                            else "tool"
+                            if msg.type == "tool"
+                            else "user",
+                            "parts": parts,
+                        }
+                    )
+                started.append(
+                    (
+                        observer.start_model(
+                            inputs,
+                            system or None,
+                            model,
+                            tool_definitions=tool_definitions,
+                        ),
+                        model,
+                    )
+                )
+            self.models[run_id] = started
+
+        async def on_llm_end(self, response: Any, *, run_id: Any, **_kwargs: Any) -> None:
+            started = self.models.pop(run_id, [])
+            llm_output = getattr(response, "llm_output", None) or {}
+            for index, (handle, _request_model) in enumerate(started):
+                choices = response.generations[index] if index < len(response.generations) else []
+                outputs = []
+                usage: dict[str, int] = {}
+                response_model = None
+                for choice in choices:
+                    msg = getattr(choice, "message", None)
+                    if msg is None:
+                        continue
+                    for call in getattr(msg, "tool_calls", None) or []:
+                        if not call.get("id"):
+                            call["id"] = self.bind_output_id(
+                                call.get("name", ""), call.get("args", {})
+                            )
+                    metadata = getattr(msg, "response_metadata", None) or {}
+                    outputs.append(
+                        {
+                            "role": "assistant",
+                            "parts": _message_parts(msg, self, output=True),
+                            "finish_reason": (
+                                (getattr(choice, "generation_info", None) or {}).get(
+                                    "finish_reason"
+                                )
+                                or metadata.get("finish_reason")
+                                or metadata.get("stop_reason")
+                                or "unknown"
+                            ),
+                        }
+                    )
+                    response_model = _response_model(msg) or response_model
+                    for key, value in _model_usage(msg).items():
+                        usage[key] = usage.get(key, 0) + value
+                if len(started) == 1:
+                    if not usage:
+                        token_usage = llm_output.get("token_usage") or {}
+                        for key, alternate in (
+                            ("input_tokens", "prompt_tokens"),
+                            ("output_tokens", "completion_tokens"),
+                        ):
+                            token_value = token_usage.get(key, token_usage.get(alternate))
+                            if type(token_value) is int:
+                                usage[key] = token_value
+                        details = token_usage.get("output_token_details") or {}
+                        reasoning = details.get("reasoning")
+                        if type(reasoning) is int:
+                            usage["reasoning_tokens"] = reasoning
+                    response_model = (
+                        response_model or llm_output.get("model_name") or llm_output.get("model")
+                    )
+                self.usage_seen = self.usage_seen or bool(usage)
+                self.model_completed = True
+                for key, value in usage.items():
+                    setattr(self, key, getattr(self, key) + value)
+                if isinstance(response_model, str) and response_model:
+                    self.response_model = response_model
+                observer.end_model(
+                    handle, outputs if outputs else None, response_model, usage, None
+                )
+
+        async def on_llm_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+            for handle, _model in self.models.pop(run_id, []):
+                observer.end_model(handle, None, None, {}, error)
+
+        async def on_tool_start(
+            self,
+            serialized: dict[str, Any],
+            input_str: str,
+            *,
+            run_id: Any,
+            inputs: dict[str, Any] | None = None,
+            tool_call_id: str | None = None,
+            **_kwargs: Any,
+        ) -> None:
+            name = serialized.get("name", "")
+            arguments = inputs if inputs is not None else input_str
+            key = self.key(name, arguments)
+            pending = self.pending_ids[key]
+            if tool_call_id:
+                if tool_call_id in pending:
+                    pending.remove(tool_call_id)
+                call_id = tool_call_id
+            else:
+                call_id = pending.popleft() if pending else uuid.uuid4().hex
+            self.tools[run_id] = observer.start_tool(name, call_id, arguments), call_id
+
+        async def on_tool_end(self, output: Any, *, run_id: Any, **_kwargs: Any) -> None:
+            entry = self.tools.pop(run_id, None)
+            if entry is None:
+                return
+            handle, call_id = entry
+            content = getattr(output, "content", output)
+            if not getattr(output, "tool_call_id", None):
+                self.completed_ids[str(content)].append(call_id)
+            if getattr(output, "status", "success") == "error":
+                observer.end_tool(handle, None, RuntimeError(str(content)))
+            else:
+                self.pending_tool_results[call_id] = (handle, content)
+
+        async def on_tool_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+            entry = self.tools.pop(run_id, None)
+            if entry is not None:
+                observer.end_tool(entry[0], None, error)
+
+    return Handler()
 
 
 def _structured_output_method() -> str:
@@ -218,7 +707,8 @@ async def _shape_structured_output(
     system_prompt: str,
     prompt: str,
     agent_text: str,
-) -> tuple[Any, int, int]:
+    telemetry: Any = None,
+) -> tuple[Any, int, int, int, str]:
     """Shape pass: tool-free structured binding on a model without thinking."""
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -239,49 +729,72 @@ async def _shape_structured_output(
         ),
     ]
     try:
-        result = await structured.ainvoke(shape_messages)
+        config = {"callbacks": [_telemetry_handler(telemetry, model)]} if telemetry else None
+        result = (
+            await structured.ainvoke(shape_messages, config=config)
+            if config
+            else await structured.ainvoke(shape_messages)
+        )
     finally:
         await _close_model_clients(format_model)
     if isinstance(result, dict) and "parsed" in result:
         parsed = result["parsed"]
-        in_tok, out_tok = _usage_from_message(result.get("raw"))
-        return parsed, in_tok, out_tok
-    return result, 0, 0
+        raw = result.get("raw")
+        usage = _model_usage(raw)
+        return (
+            parsed,
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            usage.get("reasoning_tokens", 0),
+            _response_model(raw) or "",
+        )
+    return result, 0, 0, 0, ""
 
 
-def _tool_call_events(msg: Any) -> list[ProviderEvent]:
-    """Map complete parsed tool calls to provider events."""
+def _tool_call_events(msg: Any, ids: Any = None) -> list[ProviderEvent]:
+    """Map complete AI-message tool calls to provider events."""
     return [
         ToolCallEvent(
-            name=tc.get("name", ""),
-            input=json.dumps(tc.get("args", {})),
-            call_id=tc.get("id", ""),
+            name=call.get("name", ""),
+            input=json.dumps(call.get("args", {}), ensure_ascii=False, separators=(",", ":")),
+            call_id=call.get("id")
+            or (ids.call_id(call.get("name", ""), call.get("args", {})) if ids else ""),
         )
-        for tc in msg.tool_calls or []
+        for call in msg.tool_calls or []
     ]
+
 
 
 def _process_ai_message(
     msg: Any,
+    ids: Any = None,
     *,
     include_tool_calls: bool = True,
 ) -> tuple[list[ProviderEvent], str, int, int]:
     """Map one AIMessage chunk to provider events and token deltas."""
-    events: list[ProviderEvent] = _tool_call_events(msg) if include_tool_calls else []
+    events: list[ProviderEvent] = _tool_call_events(msg, ids) if include_tool_calls else []
     text_delta = ""
     input_tokens = 0
     output_tokens = 0
 
     for block in getattr(msg, "content_blocks", []):
         btype = block["type"] if isinstance(block, dict) else getattr(block, "type", "")
-        if btype == "reasoning":
+        if btype == "non_standard":
+            block = (
+                block.get("value", {}) if isinstance(block, dict) else getattr(block, "value", {})
+            )
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+        if btype in ("reasoning", "thinking"):
             reasoning = (
-                block.get("reasoning", "")
+                block.get("reasoning", block.get("thinking", ""))
                 if isinstance(block, dict)
                 else getattr(block, "reasoning", "")
             )
-            events.append(ThinkingDeltaEvent(thinking=reasoning))
-            events.append(ContentBlockStopEvent())
+            if isinstance(reasoning, str) and reasoning:
+                events.append(ThinkingDeltaEvent(thinking=reasoning))
+                events.append(ContentBlockStopEvent())
         elif btype == "text":
             text = block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
             if text:
@@ -294,10 +807,9 @@ def _process_ai_message(
             events.append(TextDeltaEvent(text=content))
             text_delta += content
 
-    usage = getattr(msg, "usage_metadata", None)
-    if usage:
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
+    usage = _model_usage(msg)
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
 
     return events, text_delta, input_tokens, output_tokens
 
@@ -310,6 +822,7 @@ class DeepAgentsProvider(AgentProvider):
     async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
+        from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 
         classifier_model: Any | None = None
         inspection_middleware: Any | None = None
@@ -335,7 +848,6 @@ class DeepAgentsProvider(AgentProvider):
         }
 
         if options.tool_output_inspection_enabled:
-            from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 
             try:
                 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
@@ -391,7 +903,7 @@ class DeepAgentsProvider(AgentProvider):
                 raise ToolResultSafetyInspectionFailed() from exc
 
         if has_skills(options.cwd):
-            agent_kwargs["skills"] = [options.cwd]
+            agent_kwargs["skills"] = ["/"]
 
         schema_model: Any | None = None
         if options.output_schema:
@@ -436,10 +948,17 @@ class DeepAgentsProvider(AgentProvider):
             "configurable": {"thread_id": thread_id},
             "recursion_limit": options.max_turns,
         }
+        telemetry_handler = (
+            _telemetry_handler(options.telemetry, options.model) if options.telemetry else None
+        )
+        if telemetry_handler is not None:
+            stream_config["callbacks"] = [telemetry_handler]
         result_text = ""
-        pending_tool_results: list[tuple[str, str, str, Any, ToolResultEvent]] = []
+        pending_tool_results: list[tuple[str, str, str, Any]] = []
         total_input_tokens = 0
         total_output_tokens = 0
+        streamed_reasoning_tokens = 0
+        streamed_response_model = ""
         pending_tool_call_chunk: Any | None = None
         input_state = {"messages": [{"role": "user", "content": options.prompt}]}
 
@@ -447,7 +966,7 @@ class DeepAgentsProvider(AgentProvider):
             nonlocal pending_tool_call_chunk
             if pending_tool_call_chunk is None:
                 return []
-            events = _tool_call_events(pending_tool_call_chunk)
+            events = _tool_call_events(pending_tool_call_chunk, telemetry_handler)
             pending_tool_call_chunk = None
             return events
 
@@ -458,45 +977,41 @@ class DeepAgentsProvider(AgentProvider):
                 stream_mode="messages",
             ):
                 if msg.type in ("ai", "AIMessageChunk"):
+                    is_chunk = msg.type == "AIMessageChunk"
+                    tool_call_chunks = getattr(msg, "tool_call_chunks", None) if is_chunk else None
                     if inspection_middleware is not None:
-                        for (
-                            tool_name,
-                            result_type,
-                            call_id,
-                            content,
-                            pending_event,
-                        ) in pending_tool_results:
+                        for tool_name, result_type, call_id, content in pending_tool_results:
+                            model_content = content
+                            if telemetry_handler is not None:
+                                has_model_content, model_content = telemetry_handler.model_tool_result(
+                                    call_id
+                                )
+                                if not has_model_content:
+                                    raise ToolResultSafetyInspectionFailed()
                             if not inspection_middleware.is_passed(
                                 tool_name,
                                 result_type,
                                 call_id,
-                                content,
+                                model_content,
                             ):
                                 raise ToolResultSafetyInspectionFailed()
-                            yield pending_event
+                            yield ToolResultEvent(
+                                output=stringify(model_content),
+                                call_id=call_id,
+                            )
                         pending_tool_results.clear()
 
-                    include_tool_calls = msg.type != "AIMessageChunk"
-                    if msg.type == "AIMessageChunk":
-                        is_last_chunk = getattr(msg, "chunk_position", None) == "last"
-                        tool_call_chunks = getattr(msg, "tool_call_chunks", []) or []
-                        if tool_call_chunks or (
-                            pending_tool_call_chunk is not None and is_last_chunk
-                        ):
-                            current_tool_call_chunk = type(msg)(
-                                content="",
-                                tool_call_chunks=tool_call_chunks,
-                                chunk_position="last" if is_last_chunk else None,
-                            )
-                            pending_tool_call_chunk = (
-                                current_tool_call_chunk
-                                if pending_tool_call_chunk is None
-                                else pending_tool_call_chunk + current_tool_call_chunk
-                            )
-                        if is_last_chunk:
-                            for event in flush_pending_tool_calls():
-                                yield event
-                    elif pending_tool_call_chunk is not None:
+                    if tool_call_chunks:
+                        current_tool_call_chunk = type(msg)(
+                            content="",
+                            tool_call_chunks=tool_call_chunks,
+                        )
+                        pending_tool_call_chunk = (
+                            current_tool_call_chunk
+                            if pending_tool_call_chunk is None
+                            else pending_tool_call_chunk + current_tool_call_chunk
+                        )
+                    elif not is_chunk and pending_tool_call_chunk is not None:
                         if getattr(msg, "tool_calls", None):
                             pending_tool_call_chunk = None
                         else:
@@ -505,13 +1020,19 @@ class DeepAgentsProvider(AgentProvider):
 
                     events, text_delta, in_tok, out_tok = _process_ai_message(
                         msg,
-                        include_tool_calls=include_tool_calls,
+                        telemetry_handler,
+                        include_tool_calls=not (is_chunk and bool(tool_call_chunks)),
                     )
-                    for provider_event in events:
-                        yield provider_event
+                    for event in events:
+                        yield event
                     result_text += text_delta
                     total_input_tokens += in_tok
                     total_output_tokens += out_tok
+                    streamed_reasoning_tokens += _model_usage(msg).get("reasoning_tokens", 0)
+                    streamed_response_model = _response_model(msg) or streamed_response_model
+                    if is_chunk and getattr(msg, "chunk_position", None) == "last":
+                        for event in flush_pending_tool_calls():
+                            yield event
 
                 elif msg.type in ("tool", "ToolMessageChunk"):
                     for event in flush_pending_tool_calls():
@@ -520,38 +1041,64 @@ class DeepAgentsProvider(AgentProvider):
                     result_type = (
                         "error" if getattr(msg, "status", "success") == "error" else "result"
                     )
-                    call_id = getattr(msg, "tool_call_id", "") or ""
-                    tool_result_event = ToolResultEvent(
-                        output=stringify(msg.content),
-                        call_id=call_id,
+                    call_id = getattr(msg, "tool_call_id", "") or (
+                        telemetry_handler.result_id(msg, stream=True) if telemetry_handler else ""
                     )
                     if inspection_middleware is None:
-                        yield tool_result_event
-                    else:
-                        pending_tool_results.append(
-                            (tool_name, result_type, call_id, msg.content, tool_result_event)
+                        yield ToolResultEvent(
+                            output=stringify(msg.content),
+                            call_id=call_id,
                         )
+                    else:
+                        pending_tool_results.append((tool_name, result_type, call_id, msg.content))
             for event in flush_pending_tool_calls():
                 yield event
+        except ToolResultSafetyInspectionFailed as exc:
+            if telemetry_handler is not None:
+                telemetry_handler.fail_pending_tool_results(exc)
+            raise
         finally:
             await _close_model_clients(chat_model)
             if classifier_model is not None:
                 await _close_model_clients(classifier_model)
 
+        response_model = (
+            (telemetry_handler.response_model or streamed_response_model)
+            if telemetry_handler and telemetry_handler.model_completed
+            else streamed_response_model
+        )
+        reasoning_tokens = (
+            telemetry_handler.reasoning_tokens
+            if telemetry_handler and telemetry_handler.usage_seen
+            else streamed_reasoning_tokens
+        )
+        if telemetry_handler and telemetry_handler.usage_seen:
+            total_input_tokens = telemetry_handler.input_tokens
+            total_output_tokens = telemetry_handler.output_tokens
         if schema_model is not None:
-            structured, in_tok, out_tok = await _shape_structured_output(
+            shape_args = (
                 options.model,
                 schema_model,
                 options.system_prompt,
                 options.prompt,
                 result_text,
             )
+            structured, in_tok, out_tok, shape_reasoning, shape_model = (
+                await _shape_structured_output(*shape_args, telemetry=options.telemetry)
+                if options.telemetry
+                else await _shape_structured_output(*shape_args)
+            )
+            if isinstance(shape_model, str) and shape_model:
+                response_model = shape_model
             result_text = stringify(structured)
             total_input_tokens += in_tok
             total_output_tokens += out_tok
+            reasoning_tokens += shape_reasoning
 
         yield ResultEvent(
             text=result_text,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            response_model=response_model,
         )

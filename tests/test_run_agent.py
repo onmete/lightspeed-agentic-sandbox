@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
 from langchain_core.messages import ToolMessage
+from opentelemetry.trace import SpanKind, StatusCode
 
 from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 from lightspeed_agentic.inspection.middleware import ToolResultInspectionMiddleware
 from lightspeed_agentic.run_agent import ContextFormatError, format_context_prefix, run_agent_query
-from lightspeed_agentic.types import (
-    ProviderEvent,
-    ProviderQueryOptions,
-    ResultEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-)
+from lightspeed_agentic.types import ProviderEvent, ProviderQueryOptions, ResultEvent
 
 from .conftest import MockProvider
 
@@ -98,51 +96,199 @@ async def test_run_agent_query_with_output_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_accepts_traceparent() -> None:
-    """W3C traceparent (operator TRACEPARENT env) links inference span to phase trace."""
+async def test_agent_transcript_has_actual_model_and_tool_children(
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two observed calls and a local tool share the fixed agent parent."""
+    monkeypatch.setenv("LIGHTSPEED_PROVIDER", "vertex")
+    final = {"success": False, "summary": "Post-shaped", "diagnosis": {"cause": "RBAC"}}
+
+    class ObservedProvider(MockProvider):
+        async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            assert options.telemetry is not None
+            first = options.telemetry.start_model(
+                [{"role": "user", "parts": [{"type": "text", "content": options.prompt}]}],
+                [{"type": "text", "content": options.system_prompt}],
+                options.model,
+            )
+            options.telemetry.end_model(
+                first,
+                [
+                    {
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool_call",
+                                "id": "call-1",
+                                "name": "read_file",
+                                "arguments": {"path": "SKILL.md"},
+                            },
+                        ],
+                        "finish_reason": "tool_call",
+                    }
+                ],
+                None,
+                {"input_tokens": 4},
+                None,
+            )
+            tool = options.telemetry.start_tool("read_file", "call-1", {"path": "SKILL.md"})
+            options.telemetry.end_tool(tool, {"content": "full skill"}, None)
+            second = options.telemetry.start_model(
+                [
+                    {
+                        "role": "tool",
+                        "parts": [
+                            {
+                                "type": "tool_call_response",
+                                "id": "call-1",
+                                "response": {"content": "full skill"},
+                            },
+                        ],
+                    }
+                ],
+                None,
+                options.model,
+            )
+            options.telemetry.end_model(
+                second,
+                [
+                    {
+                        "role": "assistant",
+                        "parts": [
+                            {"type": "text", "content": "Intermediate different text"},
+                        ],
+                        "finish_reason": "stop",
+                    }
+                ],
+                None,
+                {"output_tokens": 3},
+                None,
+            )
+            yield ResultEvent(text=json.dumps(final))
+
     result = await run_agent_query(
-        MockProvider(),
-        prompt="test",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context=None,
+        ObservedProvider(),
+        prompt="fix it",
+        system_prompt="Respect approvals",
+        output_schema={"type": "object"},
+        context={"targetNamespaces": ["prod"]},
         skills_dir="/workspace",
         model="test-model",
         max_turns=200,
         timeout_seconds=300,
         traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-    )
-    assert result.output["success"] is True
-
-
-@pytest.mark.asyncio
-async def test_run_agent_query_stamps_inference_correlation(span_exporter) -> None:
-    await run_agent_query(
-        MockProvider(),
-        prompt="test",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context=None,
-        skills_dir="/workspace",
-        model="test-model",
-        max_turns=200,
-        timeout_seconds=300,
         agenticrun_uid="run-uid",
         step="execution",
     )
-
-    chat_span = next(s for s in span_exporter.get_finished_spans() if s.name == "chat test-model")
-    attrs = dict(chat_span.attributes)
-    assert attrs["agenticrun.uid"] == "run-uid"
-    assert attrs["agenticrun.phase"] == "execution"
+    assert result.output == final
+    spans = span_exporter.get_finished_spans()
+    agent = next(s for s in spans if s.attributes.get("gen_ai.operation.name") == "invoke_agent")
+    children = [s for s in spans if s is not agent]
+    assert len(children) == 3
+    assert [s.attributes["gen_ai.operation.name"] for s in children].count("chat") == 2
+    assert agent.kind == SpanKind.INTERNAL
+    assert agent.parent.span_id == int("00f067aa0ba902b7", 16)
+    assert agent.context.trace_id == int("4bf92f3577b34da6a3ce929d0e0e4736", 16)
+    assert all(s.parent.span_id == agent.context.span_id for s in children)
+    assert agent.attributes["gen_ai.provider.name"] == "gcp.vertex_ai"
+    assert agent.attributes["gen_ai.agent.name"] == "lightspeed"
+    assert agent.attributes["gen_ai.output.type"] == "json"
+    assert agent.attributes["agenticrun.uid"] == "run-uid"
+    assert agent.attributes["agenticrun.phase"] == "execution"
+    assert agent.status.status_code == StatusCode.UNSET
+    assert all(s.attributes["agenticrun.uid"] == "run-uid" for s in children)
+    assert all(
+        s.attributes["gen_ai.provider.name"] == "gcp.vertex_ai"
+        for s in children
+        if s.attributes["gen_ai.operation.name"] == "chat"
+    )
+    assert json.loads(agent.attributes["gen_ai.input.messages"]) == [
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "type": "text",
+                    "content": "[context]\nTarget namespaces: prod\n[/context]\n\nfix it",
+                },
+            ],
+        },
+    ]
+    assert json.loads(agent.attributes["gen_ai.system_instructions"]) == [
+        {"type": "text", "content": "Respect approvals"},
+    ]
+    output = json.loads(agent.attributes["gen_ai.output.messages"])
+    Draft202012Validator(
+        json.loads(
+            await asyncio.to_thread(Path("tests/fixtures/genai-v1.41-output.json").read_text)
+        )
+    ).validate(output)
+    assert json.loads(output[0]["parts"][0]["content"]) == result.output
+    assert output[0]["finish_reason"] == "stop"
+    assert any("gen_ai.tool.call.result" in s.attributes for s in children)
+    assert all(not s.events for s in spans)
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_does_not_invent_correlation(span_exporter) -> None:
+@pytest.mark.parametrize(
+    ("route", "model_provider", "expected"),
+    [
+        ("vertex", "google", "gcp.vertex_ai"),
+        (None, "google", "gcp.gen_ai"),
+    ],
+)
+async def test_gemini_provider_name_reflects_endpoint(
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str | None,
+    model_provider: str | None,
+    expected: str,
+) -> None:
+    """Gemini's SDK label never replaces the configured endpoint on GenAI spans."""
+    if route is None:
+        monkeypatch.delenv("LIGHTSPEED_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("LIGHTSPEED_PROVIDER", route)
+    if model_provider is None:
+        monkeypatch.delenv("LIGHTSPEED_MODEL_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("LIGHTSPEED_MODEL_PROVIDER", model_provider)
+
+    class ObservedGeminiProvider(MockProvider):
+        @property
+        def name(self) -> str:
+            return "gemini"
+
+        async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            assert options.telemetry is not None
+            model_span = options.telemetry.start_model([], None, options.model)
+            options.telemetry.end_model(model_span, [], None, {}, None)
+            yield ResultEvent(text='{"success": true, "summary": "gemini response"}')
+
+    await run_agent_query(
+        ObservedGeminiProvider(),
+        prompt="test",
+        system_prompt="sys",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="gemini-2.5-flash",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+    spans = span_exporter.get_finished_spans()
+    agent = next(s for s in spans if s.attributes.get("gen_ai.operation.name") == "invoke_agent")
+    model = next(s for s in spans if s.attributes.get("gen_ai.operation.name") == "chat")
+    assert agent.attributes["gen_ai.provider.name"] == expected
+    assert model.attributes["gen_ai.provider.name"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_invent_correlation(span_exporter) -> None:
     await run_agent_query(
         MockProvider(),
         prompt="test",
-        system_prompt="You are an AI agent.",
+        system_prompt="sys",
         output_schema=None,
         context=None,
         skills_dir="/workspace",
@@ -150,11 +296,9 @@ async def test_run_agent_query_does_not_invent_correlation(span_exporter) -> Non
         max_turns=200,
         timeout_seconds=300,
     )
-
-    chat_span = next(s for s in span_exporter.get_finished_spans() if s.name == "chat test-model")
-    attrs = dict(chat_span.attributes)
-    assert "agenticrun.uid" not in attrs
-    assert "agenticrun.phase" not in attrs
+    agent = span_exporter.get_finished_spans()[0]
+    assert "agenticrun.uid" not in agent.attributes
+    assert "agenticrun.phase" not in agent.attributes
 
 
 @pytest.mark.asyncio
@@ -213,19 +357,20 @@ async def test_run_agent_query_deadline_during_inspection_is_safety_failure() ->
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_timeout() -> None:
-    """Wall-clock timeout yields agent failure with a timed-out summary."""
+async def test_run_agent_query_timeout(span_exporter) -> None:
+    """Timeout closes unfinished child spans and omits terminal output."""
 
     class SlowProvider(MockProvider):
         async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            assert options.telemetry is not None
+            options.telemetry.start_model([], None, options.model)
             await asyncio.sleep(2)
-            async for event in super().query(options):
-                yield event
+            yield ResultEvent(text="late")
 
     result = await run_agent_query(
         SlowProvider(),
         prompt="test",
-        system_prompt="You are an AI agent.",
+        system_prompt="sys",
         output_schema=None,
         context=None,
         skills_dir="/workspace",
@@ -233,9 +378,52 @@ async def test_run_agent_query_timeout() -> None:
         max_turns=200,
         timeout_seconds=0.05,
     )
+    assert result.timed_out
     assert result.output["success"] is False
-    assert "timeout" in result.output["summary"].lower()
-    assert result.timed_out is True
+    agent = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes["gen_ai.operation.name"] == "invoke_agent"
+    )
+    child = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes["gen_ai.operation.name"] == "chat"
+    )
+    assert agent.status.status_code == StatusCode.ERROR
+    assert agent.attributes["error.type"] == "TimeoutError"
+    assert "gen_ai.output.messages" not in agent.attributes
+    assert child.attributes["error.type"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_omits_terminal_output(span_exporter) -> None:
+    class FailingProvider(MockProvider):
+        async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            raise RuntimeError("private provider exception")
+            yield ResultEvent(text="unreachable")
+
+    result = await run_agent_query(
+        FailingProvider(),
+        prompt="test",
+        system_prompt="sys",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+    assert result.output["success"] is False
+    agent = next(
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes["gen_ai.operation.name"] == "invoke_agent"
+    )
+    assert agent.status.status_code == StatusCode.ERROR
+    assert agent.attributes["error.type"] == "RuntimeError"
+    assert "gen_ai.output.messages" not in agent.attributes
+    assert not agent.events
 
 
 @pytest.mark.asyncio
@@ -273,91 +461,6 @@ async def test_run_agent_query_text_response() -> None:
     assert result.output["success"] is True
     assert result.output["summary"] == "plain text answer"
 
-
-@pytest.mark.asyncio
-async def test_run_agent_query_audit_enabled() -> None:
-    """audit_enabled=True runs the audit path without changing agent outcome."""
-    result = await run_agent_query(
-        MockProvider(),
-        prompt="test",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context=None,
-        skills_dir="/workspace",
-        model="test-model",
-        max_turns=200,
-        timeout_seconds=300,
-        audit_enabled=True,
-    )
-    assert result.output["success"] is True
-
-
-@pytest.mark.asyncio
-async def test_deepagents_logs_redact_tool_payloads_but_audit_keeps_passed_content(
-    span_exporter,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class DeepAgentsProvider(MockProvider):
-        @property
-        def name(self) -> str:
-            return "deepagents"
-
-    caplog.set_level(logging.INFO, logger="lightspeed_agentic")
-    result = await run_agent_query(
-        DeepAgentsProvider(
-            events=[
-                ToolCallEvent(name="execute", input="SECRET-TOOL-ARGUMENT", call_id="tool-1"),
-                ToolResultEvent(output="COMPLETE-PASSED-TOOL-RESULT", call_id="tool-1"),
-                ResultEvent(text='{"success":true,"summary":"done"}'),
-            ]
-        ),
-        prompt="test",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context=None,
-        skills_dir="/workspace",
-        model="test-model",
-        max_turns=200,
-        timeout_seconds=300,
-        audit_enabled=True,
-        capture_content=True,
-    )
-
-    assert result.output["success"] is True
-    assert "SECRET-TOOL-ARGUMENT" not in caplog.text
-    assert "COMPLETE-PASSED-TOOL-RESULT" not in caplog.text
-    tool_span = next(
-        span for span in span_exporter.get_finished_spans() if span.name == "execute_tool execute"
-    )
-    assert tool_span.attributes["tool.input"] == "SECRET-TOOL-ARGUMENT"
-    assert tool_span.attributes["tool.output"] == "COMPLETE-PASSED-TOOL-RESULT"
-
-
-@pytest.mark.asyncio
-async def test_run_agent_query_audit_with_tool_events() -> None:
-    """Tool call/result events are consumed when audit logging is enabled."""
-    events = [
-        ToolCallEvent(name="bash", input="ls"),
-        ToolResultEvent(output="file.txt"),
-        ResultEvent(
-            text='{"success": true, "summary": "done"}',
-            input_tokens=10,
-            output_tokens=5,
-        ),
-    ]
-    result = await run_agent_query(
-        MockProvider(events=events),
-        prompt="test",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context=None,
-        skills_dir="/workspace",
-        model="test-model",
-        max_turns=200,
-        timeout_seconds=300,
-        audit_enabled=True,
-    )
-    assert result.output["success"] is True
 
 
 def test_format_context_envelope_markers_only() -> None:

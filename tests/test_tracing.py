@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import re
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import lightspeed_agentic.tracing as _tracing_mod
 from lightspeed_agentic.tracing import (
@@ -57,6 +62,23 @@ class TestParseTraceparent:
         trace_id, ctx = parse_traceparent("00-abc-01")
         assert _TRACE_ID_RE.match(trace_id)
         assert ctx is not None
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra",
+        ],
+    )
+    def test_invalid_traceparent_format_generates_new_trace_id(self, header: str) -> None:
+        trace_id, ctx = parse_traceparent(header)
+
+        assert trace_id != "0af7651916cd43dd8448eb211c80319c"
+        assert _TRACE_ID_RE.match(trace_id)
+        assert ctx is not None
+        span_context = trace.get_current_span(ctx).get_span_context()
+        assert span_context.trace_id == int(trace_id, 16)
+        assert not span_context.is_remote
 
     def test_all_zero_trace_id_generates_new(self) -> None:
         header = "00-00000000000000000000000000000000-b7ad6b7169203331-01"
@@ -178,110 +200,110 @@ class TestInitTracer:
         init_tracer()
         assert _tracing_mod._state.logging_handler is None
 
-    def test_span_events_forwarded_to_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from opentelemetry.sdk._logs.export import (
-            InMemoryLogRecordExporter,
-            SimpleLogRecordProcessor,
-        )
-
+    @pytest.mark.parametrize("capture_content", [True, False])
+    def test_compliance_views_keep_identity_and_only_filter_content(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        capture_content: bool,
+    ) -> None:
         monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
         monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "true")
         monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_UID", "uid-1")
-        init_tracer(agenticrun_phase="execution")
-
-        exporter = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+        init_tracer(agenticrun_phase="execution", capture_content=capture_content)
+        logs = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
         assert _tracing_mod._state.logger_provider is not None
-        _tracing_mod._state.logger_provider.add_log_record_processor(
-            SimpleLogRecordProcessor(exporter)
-        )
-
+        _tracing_mod._state.logger_provider.add_log_record_processor(SimpleLogRecordProcessor(logs))
+        traces = InMemorySpanExporter()
         assert _tracing_mod._state.tracer_provider is not None
-        tracer = _tracing_mod._state.tracer_provider.get_tracer("test")
-        with tracer.start_as_current_span("chat") as span:
-            span.add_event("gen_ai.choice", {"gen_ai.completion": "hello"})
-
-        records = exporter.get_finished_logs()
-        assert len(records) >= 1
-        matching = [
-            r for r in records if (r.log_record.attributes or {}).get("event") == "gen_ai.choice"
-        ]
-        assert matching
-        rec = matching[0].log_record
-        attrs = rec.attributes or {}
-        # Collector postgresexporter reads these record attrs (not Resource).
-        # Stamped via logging extra → LoggingHandler (not direct OTel emit).
-        assert attrs.get("agenticrun.uid") == "uid-1"
-        assert attrs.get("agenticrun.phase") == "execution"
-        assert attrs.get("event") == "gen_ai.choice"
-        assert "hello" in str(rec.body)
-        assert rec.trace_id != 0
-
-    def test_empty_choice_body_when_no_event_attrs(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Capture-off style events (no content attrs) still forward with body {}."""
-        from opentelemetry.sdk._logs.export import (
-            InMemoryLogRecordExporter,
-            SimpleLogRecordProcessor,
-        )
-
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-        monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "true")
-        monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_UID", "uid-1")
-        init_tracer(agenticrun_phase="execution")
-
-        exporter = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
-        assert _tracing_mod._state.logger_provider is not None
-        _tracing_mod._state.logger_provider.add_log_record_processor(
-            SimpleLogRecordProcessor(exporter)
-        )
-
-        assert _tracing_mod._state.tracer_provider is not None
-        tracer = _tracing_mod._state.tracer_provider.get_tracer("test")
-        with tracer.start_as_current_span("chat") as span:
-            span.add_event("gen_ai.choice", {})
-
-        matching = [
-            r
-            for r in exporter.get_finished_logs()
-            if (r.log_record.attributes or {}).get("event") == "gen_ai.choice"
-        ]
-        assert matching
-        assert str(matching[0].log_record.body) in ("{}", "")
-
-    def test_exception_span_events_not_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from opentelemetry.sdk._logs.export import (
-            InMemoryLogRecordExporter,
-            SimpleLogRecordProcessor,
-        )
-
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-        monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "true")
-        monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_UID", "uid-1")
-        init_tracer(agenticrun_phase="execution")
-
-        exporter = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
-        assert _tracing_mod._state.logger_provider is not None
-        _tracing_mod._state.logger_provider.add_log_record_processor(
-            SimpleLogRecordProcessor(exporter)
-        )
-
-        assert _tracing_mod._state.tracer_provider is not None
-        tracer = _tracing_mod._state.tracer_provider.get_tracer("test")
-        with tracer.start_as_current_span("chat") as span:
-            span.add_event(
-                "exception",
-                {
-                    "exception.type": "ValueError",
-                    "exception.message": "boom",
-                    "exception.stacktrace": "traceback...",
-                },
+        _tracing_mod._state.tracer_provider.add_span_processor(SimpleSpanProcessor(traces))
+        tracer = _tracing_mod._state.tracer_provider.get_tracer("lightspeed_agentic")
+        with tracer.start_as_current_span(
+            "chat model",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "openai",
+                "gen_ai.request.model": "model",
+                "gen_ai.input.messages": (
+                    '[{"role":"user","parts":[{"type":"text","content":"secret"}]}]'
+                ),
+                "agenticrun.uid": "uid-1",
+                "agenticrun.phase": "execution",
+            },
+        ) as span:
+            span.set_attribute(
+                "gen_ai.output.messages",
+                '[{"role":"assistant","parts":[{"type":"text","content":"answer"}],"finish_reason":"stop"}]',
             )
-            span.add_event("gen_ai.choice", {"gen_ai.completion": "ok"})
 
-        events = [
-            (r.log_record.attributes or {}).get("event") for r in exporter.get_finished_logs()
+        product = traces.get_finished_spans()[0]
+        assert "secret" in product.attributes["gen_ai.input.messages"]
+        assert "answer" in product.attributes["gen_ai.output.messages"]
+        output = json.loads(capsys.readouterr().out)
+        stdout_span = output["resource_spans"][0]["scope_spans"][0]["spans"][0]
+        stdout_attrs = {attr["key"]: attr["value"] for attr in stdout_span["attributes"]}
+        assert (
+            stdout_span["trace_id"]
+            == base64.b64encode(product.context.trace_id.to_bytes(16, "big")).decode()
+        )
+        assert (
+            stdout_span["span_id"]
+            == base64.b64encode(product.context.span_id.to_bytes(8, "big")).decode()
+        )
+        assert stdout_span["start_time_unix_nano"] == str(product.start_time)
+        assert stdout_span["end_time_unix_nano"] == str(product.end_time)
+        assert "gen_ai.request.model" in stdout_attrs
+        assert ("gen_ai.input.messages" in stdout_attrs) is capture_content
+        assert ("gen_ai.output.messages" in stdout_attrs) is capture_content
+        matching = [
+            rec.log_record
+            for rec in logs.get_finished_logs()
+            if (rec.log_record.attributes or {}).get("event") == "chat"
         ]
-        assert "exception" not in events
-        assert "gen_ai.choice" in events
+        assert len(matching) == 1
+        record = matching[0]
+        assert record.trace_id == product.context.trace_id
+        assert record.span_id == product.context.span_id
+        assert record.attributes["agenticrun.uid"] == "uid-1"
+        assert record.attributes["agenticrun.phase"] == "execution"
+        body = json.loads(str(record.body))
+        assert body["gen_ai.request.model"] == "model"
+        assert ("gen_ai.input.messages" in body) is capture_content
+        assert ("gen_ai.output.messages" in body) is capture_content
+
+    def test_only_standard_operation_spans_become_compliance_logs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+        monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "true")
+        init_tracer()
+        logs = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+        assert _tracing_mod._state.logger_provider is not None
+        _tracing_mod._state.logger_provider.add_log_record_processor(SimpleLogRecordProcessor(logs))
+        assert _tracing_mod._state.tracer_provider is not None
+        tracer = _tracing_mod._state.tracer_provider.get_tracer("lightspeed_agentic")
+        for operation in ("invoke_agent", "chat", "execute_tool", "other"):
+            with tracer.start_as_current_span(
+                operation, attributes={"gen_ai.operation.name": operation}
+            ) as span:
+                span.add_event("exception", {"exception.message": "private stack trace"})
+        with _tracing_mod._state.tracer_provider.get_tracer(
+            "gcp.vertex.agent"
+        ).start_as_current_span("native chat", attributes={"gen_ai.operation.name": "chat"}):
+            pass
+        matching = [
+            rec.log_record
+            for rec in logs.get_finished_logs()
+            if (rec.log_record.attributes or {}).get("event")
+            in ("invoke_agent", "chat", "execute_tool", "other")
+        ]
+        assert {rec.attributes["event"] for rec in matching} == {
+            "invoke_agent",
+            "chat",
+            "execute_tool",
+        }
+        assert all("private stack trace" not in str(rec.body) for rec in matching)
 
     def test_warns_when_agenticrun_env_unresolved(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -298,33 +320,44 @@ class TestInitTracer:
         )
         assert not any("LIGHTSPEED_AGENTICRUN_STEP" in r.message for r in caplog.records)
 
-    def test_span_events_not_forwarded_when_audit_disabled(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_compliance_bridge_disabled_without_audit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from opentelemetry.sdk._logs.export import (
-            InMemoryLogRecordExporter,
-            SimpleLogRecordProcessor,
-        )
-
         monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
         monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "false")
-        monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_UID", "uid-1")
         init_tracer()
+        logs = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+        assert _tracing_mod._state.logger_provider is not None
+        _tracing_mod._state.logger_provider.add_log_record_processor(SimpleLogRecordProcessor(logs))
+        assert _tracing_mod._state.tracer_provider is not None
+        tracer = _tracing_mod._state.tracer_provider.get_tracer("lightspeed_agentic")
+        with tracer.start_as_current_span(
+            "chat m",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": '[{"role":"user"}]',
+            },
+        ):
+            pass
+        assert not [
+            rec
+            for rec in logs.get_finished_logs()
+            if (rec.log_record.attributes or {}).get("event") == "chat"
+        ]
+
+    def test_adk_logs_scope_excluded_from_otlp_but_developer_logs_export(
+        self,
+    ) -> None:
+        from opentelemetry.sdk._logs import LoggerProvider
 
         exporter = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
-        assert _tracing_mod._state.logger_provider is not None
-        _tracing_mod._state.logger_provider.add_log_record_processor(
-            SimpleLogRecordProcessor(exporter)
-        )
-
-        assert _tracing_mod._state.tracer_provider is not None
-        tracer = _tracing_mod._state.tracer_provider.get_tracer("test")
-        with tracer.start_as_current_span("chat") as span:
-            span.add_event("gen_ai.choice", {"gen_ai.completion": "hello"})
-
-        matching = [
-            r
-            for r in exporter.get_finished_logs()
-            if (r.log_record.attributes or {}).get("event") == "gen_ai.choice"
-        ]
-        assert matching == []
+        provider = LoggerProvider()
+        processor = _tracing_mod._ADKFilteredBatchLogRecordProcessor(exporter)
+        provider.add_log_record_processor(processor)
+        provider.get_logger("gcp.vertex.agent").emit(body="SDK-generated content")
+        provider.get_logger("lightspeed_agentic").emit(body="developer diagnostic")
+        provider.force_flush()
+        records = exporter.get_finished_logs()
+        assert [record.log_record.body for record in records] == ["developer diagnostic"]
+        provider.shutdown()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import pytest
 from prometheus_client import REGISTRY
 
 from lightspeed_agentic.run_agent import run_agent_query
-from lightspeed_agentic.types import ResultEvent, ToolCallEvent, ToolResultEvent
+from lightspeed_agentic.types import ProviderEvent, ProviderQueryOptions, ResultEvent
 
 from .conftest import MockProvider
 
@@ -44,13 +46,13 @@ async def test_run_records_token_usage() -> None:
         "gen_ai_token_type": "input",
         "gen_ai_request_model": "test-model",
         "gen_ai_provider_name": "mock",
-        "gen_ai_operation_name": "chat",
+        "gen_ai_operation_name": "invoke_agent",
     }
     labels_out = {
         "gen_ai_token_type": "output",
         "gen_ai_request_model": "test-model",
         "gen_ai_provider_name": "mock",
-        "gen_ai_operation_name": "chat",
+        "gen_ai_operation_name": "invoke_agent",
     }
     before_in_count = _sample("gen_ai_client_token_usage_count", labels_in)
     before_out_count = _sample("gen_ai_client_token_usage_count", labels_out)
@@ -71,7 +73,7 @@ async def test_run_records_operation_duration() -> None:
     labels = {
         "gen_ai_request_model": "test-model",
         "gen_ai_provider_name": "mock",
-        "gen_ai_operation_name": "chat",
+        "gen_ai_operation_name": "invoke_agent",
     }
     before_count = _sample("gen_ai_client_operation_duration_seconds_count", labels)
     before_sum = _sample("gen_ai_client_operation_duration_seconds_sum", labels)
@@ -85,24 +87,21 @@ async def test_run_records_operation_duration() -> None:
 
 @pytest.mark.asyncio
 async def test_run_records_tool_duration() -> None:
-    events = [
-        ToolCallEvent(name="bash", input="ls"),
-        ToolResultEvent(output="file.txt"),
-        ResultEvent(
-            text='{"success": true, "summary": "done"}',
-            input_tokens=10,
-            output_tokens=5,
-        ),
-    ]
+    class ToolProvider(MockProvider):
+        async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            assert options.telemetry is not None
+            tool = options.telemetry.start_tool("bash", "call-1", {"command": "ls"})
+            options.telemetry.end_tool(tool, {"content": "file.txt"}, None)
+            yield ResultEvent(text='{"success": true, "summary": "done"}')
+
     labels = {"gen_ai_tool_name": "bash"}
     before_count = _sample("gen_ai_execute_tool_duration_seconds_count", labels)
     before_sum = _sample("gen_ai_execute_tool_duration_seconds_sum", labels)
 
-    await _run(MockProvider(events=events))
+    await _run(ToolProvider())
 
     assert _sample("gen_ai_execute_tool_duration_seconds_count", labels) == before_count + 1
-    delta = _sample("gen_ai_execute_tool_duration_seconds_sum", labels) - before_sum
-    assert delta > 0, "tool duration must be positive"
+    assert _sample("gen_ai_execute_tool_duration_seconds_sum", labels) > before_sum
 
 
 @pytest.mark.asyncio
@@ -110,7 +109,7 @@ async def test_empty_response_records_metrics() -> None:
     labels = {
         "gen_ai_request_model": "test-model",
         "gen_ai_provider_name": "mock",
-        "gen_ai_operation_name": "chat",
+        "gen_ai_operation_name": "invoke_agent",
     }
     before = _sample("gen_ai_client_operation_duration_seconds_count", labels)
 
@@ -126,7 +125,7 @@ async def test_zero_tokens_not_recorded() -> None:
         "gen_ai_token_type": "input",
         "gen_ai_request_model": "test-model",
         "gen_ai_provider_name": "mock",
-        "gen_ai_operation_name": "chat",
+        "gen_ai_operation_name": "invoke_agent",
     }
     before = _sample("gen_ai_client_token_usage_count", labels_in)
 

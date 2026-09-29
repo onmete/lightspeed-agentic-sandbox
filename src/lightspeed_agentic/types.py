@@ -4,7 +4,7 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from lightspeed_agentic.mcp import AdmittedMCPProviderServer
@@ -74,6 +74,32 @@ ProviderEvent = (
 )
 
 
+class ProviderTelemetry(Protocol):
+    """Provider-independent span hooks for complete GenAI messages and tool I/O."""
+
+    def start_model(
+        self,
+        input_messages: list[dict[str, Any]],
+        system_instructions: list[dict[str, Any]] | None,
+        request_model: str,
+        *,
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> Any: ...
+
+    def end_model(
+        self,
+        handle: Any,
+        output_messages: list[dict[str, Any]] | None,
+        response_model: str | None,
+        usage: dict[str, int],
+        error: BaseException | None,
+    ) -> None: ...
+
+    def start_tool(self, name: str, call_id: str, arguments: Any) -> Any: ...
+
+    def end_tool(self, handle: Any, result: Any, error: BaseException | None) -> None: ...
+
+
 @dataclass
 class ProviderQueryOptions:
     prompt: str
@@ -88,6 +114,7 @@ class ProviderQueryOptions:
     reasoning_config: dict[str, Any] | None = None
     tool_output_inspection_enabled: bool = True
     deadline: float | None = None
+    telemetry: ProviderTelemetry | None = None
 
 
 class AgentProvider(ABC):

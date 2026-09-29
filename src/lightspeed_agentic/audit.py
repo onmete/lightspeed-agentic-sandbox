@@ -1,165 +1,175 @@
-"""Audit instrumentation — OTel spans and span events for compliance."""
+"""Provider operation spans using OTel GenAI semantic conventions."""
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
-from opentelemetry import trace
+from opentelemetry import context as otel_context
 from opentelemetry.context import Context
-from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.trace import Span, SpanKind, StatusCode
 
+from lightspeed_agentic.genai_messages import encode_messages, encode_tool_object
 from lightspeed_agentic.metrics import tool_duration
 from lightspeed_agentic.tracing import get_tracer
-from lightspeed_agentic.types import ProviderEvent
 
 
-class AuditLogger:
-    """Map provider stream events to OTel tool spans and ``gen_ai.choice`` span events."""
+class GenAIRecorder:
+    """Record model and tool operations as siblings beneath one run context."""
 
     def __init__(
         self,
         *,
         phase: str,
-        model: str,
         provider: str,
-        enabled: bool = True,
         capture_content: bool = False,
         agenticrun_uid: str = "",
+        parent_context: Context | None = None,
+        output_type: str | None = None,
+        server_address: str | None = None,
     ) -> None:
-        """Configure audit emission for one agent run.
-
-        ``phase`` is the operator-provided AgenticRun phase from
-        ``LIGHTSPEED_AGENTICRUN_STEP``. When ``enabled`` is false, buffers are
-        cleared without emitting span events.
-        """
-        self._agenticrun_phase = phase
-        self._model = model
+        self._phase = phase
         self._provider = provider
-        self._enabled = enabled
         self._capture_content = capture_content
         self._agenticrun_uid = agenticrun_uid
-        self._text_buffer: list[str] = []
-        self._thinking_buffer: list[str] = []
-        self._tool_spans: dict[str, tuple[Any, float]] = {}
-        self._next_call_id: int = 0
+        self._parent_context = (
+            parent_context if parent_context is not None else otel_context.get_current()
+        )
+        self._output_type = output_type
+        self._server_address = server_address
         self._tracer = get_tracer()
-        self._parent_context: Context | None = None
+        self._model_spans: set[Span] = set()
+        self._tool_spans: dict[Span, tuple[str, float]] = {}
 
-    def set_parent_context(self, ctx: Context) -> None:
-        """Set OTel context so tool spans are children of the inference span."""
-        self._parent_context = ctx
+    def _correlation(self) -> dict[str, str]:
+        attributes = {}
+        if self._agenticrun_uid:
+            attributes["agenticrun.uid"] = self._agenticrun_uid
+        if self._phase:
+            attributes["agenticrun.phase"] = self._phase
+        return attributes
 
-    def process_event(self, event: ProviderEvent) -> None:
-        """Consume one normalized provider event; buffer text or open/close tool spans."""
-        match event.type:
-            case "text_delta":
-                self._text_buffer.append(event.text)
-            case "thinking_delta":
-                self._thinking_buffer.append(event.thinking)
-            case "content_block_stop":
-                self._flush_buffers()
-            case "tool_call":
-                self._flush_buffers()
-                call_id = event.call_id or f"_auto_{self._next_call_id}"
-                self._next_call_id += 1
-                tool_name = event.name or "unknown"
-                attrs: dict[str, str] = {
-                    "gen_ai.operation.name": "execute_tool",
-                    "gen_ai.tool.name": tool_name,
-                    "gen_ai.tool.call.id": call_id,
-                    "gen_ai.tool.type": "function",
-                }
-                if self._agenticrun_uid:
-                    attrs["agenticrun.uid"] = self._agenticrun_uid
-                if self._agenticrun_phase:
-                    attrs["agenticrun.phase"] = self._agenticrun_phase
-                if event.input:
-                    attrs["tool.input"] = event.input
-                span = self._tracer.start_span(
-                    f"execute_tool {tool_name}",
-                    kind=SpanKind.INTERNAL,
-                    context=self._parent_context,
-                    attributes=attrs,
-                )
-                self._tool_spans[call_id] = (span, time.monotonic())
-            case "tool_result":
-                call_id = event.call_id
-                entry = self._tool_spans.pop(call_id, None) if call_id else None
-                if entry is None and not call_id and self._tool_spans:
-                    entry = self._tool_spans.pop(next(iter(self._tool_spans)))
-                if entry is not None:
-                    tool_span, start = entry
-                    tool_name = (
-                        tool_span.attributes.get("gen_ai.tool.name", "unknown")
-                        if hasattr(tool_span, "attributes")
-                        else "unknown"
-                    )
-                    tool_duration.labels(gen_ai_tool_name=tool_name).observe(
-                        time.monotonic() - start
-                    )
-                    if event.output:
-                        tool_span.set_attribute("tool.output", event.output)
-                    tool_span.set_status(StatusCode.OK)
-                    tool_span.end()
-            case "result":
-                self._flush_buffers()
-
-    def complete(
+    def start_model(
         self,
+        input_messages: list[dict[str, Any]],
+        system_instructions: list[dict[str, Any]] | None,
+        request_model: str,
         *,
-        success: bool,
-        input_tokens: int,
-        output_tokens: int,
-        reasoning_tokens: int = 0,
-        response_model: str = "",
-        span: Any = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> Span:
+        attributes: dict[str, str] = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": self._provider,
+            "gen_ai.request.model": request_model,
+            **self._correlation(),
+        }
+        if self._output_type:
+            attributes["gen_ai.output.type"] = self._output_type
+        if self._server_address:
+            attributes["server.address"] = self._server_address
+        if self._capture_content:
+            attributes["gen_ai.input.messages"] = encode_messages(input_messages)
+            if system_instructions is not None:
+                attributes["gen_ai.system_instructions"] = encode_messages(system_instructions)
+            if tool_definitions is not None:
+                attributes["gen_ai.tool.definitions"] = encode_messages(tool_definitions)
+        span = self._tracer.start_span(
+            f"chat {request_model}",
+            kind=SpanKind.CLIENT,
+            context=self._parent_context,
+            attributes=attributes,
+        )
+        self._model_spans.add(span)
+        return span
+
+    def end_model(
+        self,
+        handle: Span,
+        output_messages: list[dict[str, Any]] | None,
+        response_model: str | None,
+        usage: dict[str, int],
+        error: BaseException | None,
     ) -> None:
-        """Flush buffers, close open tool spans, and stamp usage on the inference span."""
-        self._flush_buffers(span)
-        for _call_id, (tool_span, start) in self._tool_spans.items():
-            tool_name = (
-                tool_span.attributes.get("gen_ai.tool.name", "unknown")
-                if hasattr(tool_span, "attributes")
-                else "unknown"
-            )
-            tool_duration.labels(gen_ai_tool_name=tool_name).observe(time.monotonic() - start)
-            tool_span.set_status(StatusCode.ERROR, "tool span not closed by result event")
-            tool_span.end()
-        self._tool_spans.clear()
-        if span is not None and span.is_recording():
+        span = handle
+        self._model_spans.remove(span)
+        try:
+            if self._capture_content and output_messages is not None:
+                span.set_attribute("gen_ai.output.messages", encode_messages(output_messages))
             if response_model:
                 span.set_attribute("gen_ai.response.model", response_model)
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-            if reasoning_tokens:
-                span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
-            if not success:
-                span.set_status(StatusCode.ERROR, "agent run failed")
+            if "input_tokens" in usage:
+                span.set_attribute("gen_ai.usage.input_tokens", usage["input_tokens"])
+            if "output_tokens" in usage:
+                span.set_attribute("gen_ai.usage.output_tokens", usage["output_tokens"])
+            if "reasoning_tokens" in usage:
+                span.set_attribute(
+                    "gen_ai.usage.reasoning.output_tokens", usage["reasoning_tokens"]
+                )
+            if error is not None:
+                span.set_attribute("error.type", type(error).__name__)
+                span.set_status(StatusCode.ERROR)
+        except BaseException as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(StatusCode.ERROR)
+            raise
+        finally:
+            span.end()
 
-    def _flush_buffers(self, explicit_span: Any = None) -> None:
-        """Emit buffered completion/thinking text as ``gen_ai.choice`` span events."""
-        if not self._enabled:
-            if self._text_buffer:
-                self._text_buffer.clear()
-            if self._thinking_buffer:
-                self._thinking_buffer.clear()
-            return
+    def start_tool(self, name: str, call_id: str, arguments: Any) -> Span:
+        attributes = {
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": name,
+            "gen_ai.tool.call.id": call_id,
+            "gen_ai.tool.type": "function",
+            **self._correlation(),
+        }
+        if self._capture_content:
+            attributes["gen_ai.tool.call.arguments"] = json.dumps(
+                encode_tool_object(arguments), ensure_ascii=False, separators=(",", ":")
+            )
+        span = self._tracer.start_span(
+            f"execute_tool {name}",
+            kind=SpanKind.INTERNAL,
+            context=self._parent_context,
+            attributes=attributes,
+        )
+        self._tool_spans[span] = (name, time.monotonic())
+        return span
 
-        span = explicit_span or trace.get_current_span()
-        if not span or not span.is_recording():
-            self._text_buffer.clear()
-            self._thinking_buffer.clear()
-            return
-        if self._text_buffer:
-            text = "".join(self._text_buffer)
-            self._text_buffer.clear()
-            if text:
-                attrs = {"gen_ai.completion": text} if self._capture_content else {}
-                span.add_event("gen_ai.choice", attributes=attrs)
-        if self._thinking_buffer:
-            thinking = "".join(self._thinking_buffer)
-            self._thinking_buffer.clear()
-            if thinking:
-                attrs = {"gen_ai.reasoning_content": thinking} if self._capture_content else {}
-                span.add_event("gen_ai.choice", attributes=attrs)
+    def end_tool(self, handle: Span, result: Any, error: BaseException | None) -> None:
+        span = handle
+        name, start = self._tool_spans.pop(span)
+        try:
+            if error is not None:
+                span.set_attribute("error.type", type(error).__name__)
+                span.set_status(StatusCode.ERROR)
+            else:
+                if self._capture_content:
+                    span.set_attribute(
+                        "gen_ai.tool.call.result",
+                        json.dumps(
+                            encode_tool_object(result), ensure_ascii=False, separators=(",", ":")
+                        ),
+                    )
+        except BaseException as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(StatusCode.ERROR)
+            raise
+        finally:
+            tool_duration.labels(gen_ai_tool_name=name).observe(time.monotonic() - start)
+            span.end()
+
+    def close(self) -> None:
+        """End any operations that the provider left unfinished."""
+        for span in self._model_spans:
+            span.set_attribute("error.type", "incomplete")
+            span.set_status(StatusCode.ERROR)
+            span.end()
+        self._model_spans.clear()
+        for span, (name, start) in self._tool_spans.items():
+            span.set_attribute("error.type", "incomplete")
+            span.set_status(StatusCode.ERROR)
+            tool_duration.labels(gen_ai_tool_name=name).observe(time.monotonic() - start)
+            span.end()
+        self._tool_spans.clear()

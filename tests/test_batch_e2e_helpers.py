@@ -276,11 +276,26 @@ class TestOtelVerify:
     RUN_UID = "a" * 32
 
     def test_traces_positive(self) -> None:
-        logs = f"ResourceSpans #0\nSpan #0\n     -> agenticrun.uid: Str({self.RUN_UID})"
+        logs = (
+            f"ResourceSpans #0\nSpan #0\n     -> agenticrun.uid: Str({self.RUN_UID})\n"
+            "     -> gen_ai.operation.name: Str(invoke_agent)\n"
+            "     -> gen_ai.input.messages: Str([...])"
+        )
         assert logs_contain_traces_for_run(logs, self.RUN_UID)
 
     def test_traces_negative_without_span_markers(self) -> None:
         logs = f"agenticrun.uid={self.RUN_UID}"
+        assert not logs_contain_traces_for_run(logs, self.RUN_UID)
+
+    def test_traces_reject_run_and_operation_from_different_spans(self) -> None:
+        logs = (
+            "ResourceSpans #0\n"
+            f"Span #0\n     -> agenticrun.uid: Str({self.RUN_UID})\n"
+            "     -> gen_ai.operation.name: Str(retrieval)\n"
+            "Span #1\n"
+            "     -> agenticrun.uid: Str(other-run)\n"
+            "     -> gen_ai.operation.name: Str(chat)"
+        )
         assert not logs_contain_traces_for_run(logs, self.RUN_UID)
 
     def test_audit_logs_positive(self) -> None:
@@ -288,7 +303,7 @@ class TestOtelVerify:
             "LogsExporter\nLogRecord #0\n"
             f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
             "     -> agenticrun.phase: Str(analysis)\n"
-            "     -> event: Str(gen_ai.choice)"
+            "     -> event: Str(chat)"
         )
         assert logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
 
@@ -297,7 +312,20 @@ class TestOtelVerify:
             "LogsExporter\nLogRecord #0\n"
             f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
             "     -> agenticrun.phase: Str(execution)\n"
-            "     -> event: Str(gen_ai.choice)"
+            "     -> event: Str(chat)"
+        )
+        assert not logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
+
+    def test_audit_logs_reject_fields_from_different_records(self) -> None:
+        logs = (
+            "LogsExporter\nLogRecord #0\n"
+            f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
+            "     -> agenticrun.phase: Str(analysis)\n"
+            "     -> event: Str(started)\n"
+            "LogRecord #1\n"
+            "     -> agenticrun.uid: Str(other-run)\n"
+            "     -> agenticrun.phase: Str(execution)\n"
+            "     -> event: Str(chat)"
         )
         assert not logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
 

@@ -50,7 +50,18 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 22. **Structured output.** When `output_schema` is set: DeepAgents converts the JSON schema to a Pydantic model and MUST NOT pass `response_format` to `create_deep_agent()` (native schema binding on the agent pass plus the deepagents tool surface exceeds Bedrock grammar limits and conflicts with extended thinking when enabled). After the agent run completes, the adapter MUST always run a second tool-free `with_structured_output(...)` call on a `ChatAnthropic*` model constructed **without** thinking, using the agent's text output as shaping input. The shape pass uses `method="json_schema"` on direct API and Vertex; on Bedrock it uses `method="function_calling"` because `json_schema` grammar compilation fails for large operator schemas. Phase 1 MAY use thinking when `reasoning_config.thinking` is set; the shape pass MUST NOT enable thinking. Schema conversion supports `properties`, `required`, `type`, `enum`, nested objects, and arrays; does not support `$ref`, `oneOf`, `allOf`, `additionalProperties`. Gemini sets native response MIME type and response schema on the content config. OpenAI uses two strategies based on endpoint type: **Native OpenAI endpoints** (api.openai.com) wrap the schema for the agents SDK output type with strict JSON-schema mode enabled. When strict mode is enabled, the schema is transformed to add `additionalProperties: false` and list all properties as required at every object level, as OpenAI's strict mode requires. Additionally, `oneOf` is rewritten to `anyOf` because OpenAI Structured Outputs rejects `oneOf`; `allOf` is left unchanged. **Non-native endpoints** (vLLM or OpenAI-compatible via `OPENAI_BASE_URL`) MUST use a two-pass pattern: Phase 1 runs the agent without `response_format` to allow tools to flow freely; Phase 2 runs a tool-free `with_structured_output(..., method="json_schema")` call using the agent's text output as shaping input, analogous to the DeepAgents strategy. Non-native endpoints do not support strict JSON-schema mode, so schema transformation (additionalProperties, oneOf rewrite) is skipped.
 
-23. **Skills.** `cwd` is the skills root. Skill content lives at `cwd/<name>/SKILL.md`. DeepAgents and OpenAI MUST enable their SDK skills mechanism only when at least one immediate subdirectory of `cwd` contains a `SKILL.md` (`has_skills(cwd)`). DeepAgents then passes `skills=[cwd]` to `create_deep_agent()` (`SkillsMiddleware`). OpenAI registers the `Skills` capability with `LocalDirLazySkillSource` rooted at `cwd`; `skills_path="skills/.agents"` is the sandbox materialization path relative to the manifest root (`cwd.parent`), matching the operator emptyDir at `/app/skills/.agents` — it is not a host discovery path. An empty `cwd/.agents` directory MUST NOT enable skills. Gemini loads a skill toolset from the skill directory listing and omits it when none are found.
+23. **Skills.** `cwd` is the skills root. Skill content lives at `cwd/<name>/SKILL.md`.
+   DeepAgents and OpenAI MUST enable their SDK skills mechanism only when at least
+   one immediate subdirectory of `cwd` contains a `SKILL.md` (`has_skills(cwd)`).
+   DeepAgents uses `LocalShellBackend(root_dir=cwd)` and MUST pass `skills=["/"]`
+   to `create_deep_agent()` (`SkillsMiddleware`); DeepAgents skill sources are POSIX
+   virtual paths relative to the backend root, so `/` lists skills directly under
+   `cwd`. OpenAI registers the `Skills` capability with `LocalDirLazySkillSource`
+   rooted at `cwd`; `skills_path="skills/.agents"` is the sandbox materialization
+   path relative to the manifest root (`cwd.parent`), matching the operator
+   emptyDir at `/app/skills/.agents` — it is not a host discovery path. An empty
+   `cwd/.agents` directory MUST NOT enable skills. Gemini loads a skill toolset from
+   the skill directory listing and omits it when none are found.
 
 24. **Default allowed tools list.** Shared default names: `Bash`, `Read`, `Glob`, `Grep`, `Skill`. `run_agent_query()` always passes this list unless a future contract exposes overrides. [PLANNED: OLS-3033]
 
@@ -98,21 +109,45 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 ### Agentic product trace normalization
 
-39. [PLANNED: OLS-3569] Provider adapters MUST expose the complete provider-neutral completion, reasoning, tool call/result, explicit skill load/use, and terminal-result values required by `data-collection.md`. Provider-specific SDK object shapes MUST stop at the adapter boundary and MUST NOT create alternate content-event names.
+39. Provider adapters MUST expose available complete ordered text, reasoning, and tool I/O through the standard GenAI v1.41 `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, and `gen_ai.tool.call.result` **span attributes**. Reasoning appears as a supported `reasoning` message part; tool calls/responses appear as linked message parts and actual tool spans. Provider-specific SDK object shapes stop at the adapter boundary; do not create alternate GenAI events or `gen_ai.reasoning_content`.
 
-40. [PLANNED: OLS-3569] Tool input/result and assistant/reasoning values retained for content trace events MUST NOT be length-truncated. The existing `EventLogger` can truncate its developer-log rendering. For DeepAgents tool calls and results, OLS-3928 rule 6 prohibits payload content in that rendering.
+40. Tool arguments/results and assistant/reasoning values retained for recording source spans MUST NOT be length-truncated. Compliance projections may omit content under `LIGHTSPEED_CAPTURE_CONTENT` without changing the source spans. The existing EventLogger MAY continue to truncate its developer-log rendering.
 
-41. [PLANNED: OLS-3569] Every adapter's terminal `result` MUST carry the exact final response, requested-model fallback or actual response model, input tokens, output tokens, and reasoning tokens. When an SDK does not expose the actual model or a token category, the adapter MUST use the requested model or zero respectively; it MUST NOT omit the field or invent usage.
+41. Every adapter's terminal `result` MUST carry the final response and observed token/model metadata when exposed by its SDK. `ResultEvent` field defaults MUST NOT be treated as observed per-request `chat` span usage or an observed provider response model; unexposed span attributes MUST be omitted, not invented.
+42. Gemini MUST retain terminal text from non-streamed ADK responses and pass it through the terminal `result`; it MUST NOT leave the final value empty because the text arrived in a non-partial event. Observed model and token metadata belong on the corresponding actual SDK model-request span under rule 41.
+43. DeepAgents structured output MUST preserve the first agent pass's ordered completion, reasoning, and tool signals and pass the second tool-free shape result as terminal `result` text. Usage totals MUST include both passes when exposed, without inventing unavailable provider usage or model identifiers.
+44. OpenAI MUST serialize `result.final_output` as the terminal `result` value and expose observed model and token metadata, including reasoning tokens from output-token details when available.
 
-42. [PLANNED: OLS-3569] Gemini MUST retain terminal text from non-streamed ADK responses and pass it through the terminal `result`; it MUST NOT leave the final value empty because the text arrived in a non-partial event. Gemini MUST also expose response-model and token metadata under rule 41.
+45. Actual registered skill instruction loads are ordinary provider tool executions. Gemini's native `load_skill` retains its real name, arguments, and full raw result on the tool span; model-visible results after SDK trimming remain separately visible in the next model request. Other adapters likewise preserve their actual registered loader/read operations rather than fabricating a second `load_skill` execution. No `gen_ai.skill.*` attributes or events are emitted, and an arbitrary `SKILL.md` file is not proof of a registered skill load.
 
-43. [PLANNED: OLS-3569] DeepAgents structured output MUST preserve the first agent pass's ordered completion, reasoning, tool, and skill signals and pass the second tool-free shape result as terminal `result` text. Usage totals MUST include both passes, and response-model fallback follows rule 41.
+46. Adapters MUST preserve the same stable call ID across the model's tool-call part, corresponding tool-execution span, and later tool-response part. When the SDK omits a call ID, generate one before SDK finalization and retain it across that chain; supplied SDK IDs remain unchanged. A failed execution marks its tool span as failed and has no success-only `gen_ai.tool.call.result`.
 
-44. [PLANNED: OLS-3569] OpenAI MUST serialize `result.final_output` as the terminal `result` value and expose model and token metadata under rule 41, including reasoning tokens from output-token details when available.
+### Gemini model/tool telemetry
 
-45. [PLANNED: OLS-3569] Adapters MUST emit skill-loaded and skill-used signals only when their SDK or sandbox integration explicitly exposes those facts. They MUST include identity and all available content or metadata without redaction or truncation and MUST NOT infer skill use from model text or generic tool output.
-
-46. [PLANNED: OLS-3569] Adapters MUST preserve the same tool name and stable call ID across each tool call/result pair and the corresponding operational tool span, retain complete input and output, and normalize result status to `ok` or `error`. When the SDK omits a call ID, the adapter MUST generate one stable ID for the pair.
+When `ProviderQueryOptions.telemetry` is provided, the Gemini adapter records
+one provider-neutral `chat` span per actual SDK request and one `execute_tool`
+span per locally executed ADK tool. Model input is captured after Gemini's
+request preprocessing and automatic continuation message, not at
+`before_model_callback` (which runs earlier), and represents the SDK's effective
+`LlmRequest` rather than exact HTTP bytes. The SDK's final non-partial response
+provides ordered thought/text/function-call parts, observed finish reason,
+model version, and per-request usage; unknown model/usage are omitted.
+When a successful response lacks an SDK finish reason and no tool call is
+observed, the required output-message finish reason is the literal `unknown`
+sentinel (v1.41 permits provider-defined reason strings), never an invented
+`stop`. An observed tool call maps to `tool_call`.
+`FunctionResponse.response` appears in the v1.41
+`tool_call_response.response` field. ADK's synthesized IDs are otherwise
+assigned only after response callbacks: the adapter first assigns an ID to each
+ID-less SDK call, so output, `ToolContext.function_call_id`, tool execution,
+and the next request's tool response share the same ID. Existing SDK IDs are
+unchanged. ADK's after-tool callback receives the original execution result;
+the observer records it before the existing response trimmer replaces an
+oversized result for the model. Error callbacks mark failures without recording
+the error string as a successful tool result. Native `load_skill` is recorded
+as an ordinary tool, not a synthetic skill operation. ADK's per-run telemetry
+uses stable semconv and `NO_CONTENT`, leaving standard v1.41 transcript content
+on the custom spans alone. The ADK Logs API scope is filtered at export.
 
 ### Tool-Result Prompt-Injection Inspection [PLANNED: OLS-3928]
 
@@ -126,7 +161,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
  5. **Local paths.** The interception paths include normal results, tool-generated errors, shell output, MCP output, file reads, and search results. They also include offload previews and references. Each later model-visible artifact read or search result MUST pass through the same middleware.
 
- 6. **Event boundary.** For DeepAgents tool calls and results, the adapter MUST send only controlled, payload-free metadata to `EventLogger`. After a pass, the adapter MUST send the complete normalized `ToolResultEvent` to `AuditLogger`. This path retains the full result required by rules 39–46. A failed inspection MUST raise `ToolResultSafetyInspectionFailed` and send no result event to either logger.
+ 6. **Event boundary.** For DeepAgents tool calls and results, the adapter MUST send only controlled, payload-free metadata to `EventLogger`; developer logs MUST NOT contain tool arguments, results, or tool-generated errors. At the next model request boundary, the adapter MUST add the full callback result to the matching `GenAIRecorder` tool span (`gen_ai.tool.call.result`) and record the exact effective, potentially transformed `ToolMessage` in the model input. When inspection is enabled, that boundary follows successful inspection. An inspection failure MUST raise `ToolResultSafetyInspectionFailed`, close the pending tool span as an error without result content, and emit no successful tool result.
 
  7. **Disabled behavior.** When `LIGHTSPEED_TOOL_OUTPUT_INSPECTION_ENABLED` is false, the middleware MUST skip inspection calls and inspection-based termination. The main-system safety instruction remains active for every provider.
 
@@ -153,7 +188,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 ## Verification
 
-- Unit: [test_run_agent.py](../../../tests/test_run_agent.py) — event stream, structured output, context prefix; [test_deepagents.py](../../../tests/test_deepagents.py) — DeepAgents structured output and admitted-name filtering; [test_mcp.py](../../../tests/test_mcp.py) — canonical admission projections and Gemini/OpenAI native filters; [test_openai_schema.py](../../../tests/test_openai_schema.py) — OpenAI complete-set initialization and fail-closed behavior
+- Unit: [test_run_agent.py](../../../tests/test_run_agent.py) — event stream, structured output, context prefix, timeout spans, and inspection-failure propagation; [test_deepagents.py](../../../tests/test_deepagents.py) — DeepAgents structured-output strategy, skills, inspection boundary, ordered tool calls, and GenAI spans; [test_mcp.py](../../../tests/test_mcp.py) — canonical admission projections and Gemini/OpenAI native filters; [test_openai_schema.py](../../../tests/test_openai_schema.py) — OpenAI complete-set initialization and fail-closed behavior; [test_gemini_telemetry.py](../../../tests/test_gemini_telemetry.py) and [test_genai_messages.py](../../../tests/test_genai_messages.py) — message schemas and Gemini spans
 - [PLANNED: OLS-3928] Fast mock tests verify contract conformance, offloaded read paths, disabled inspection, and controlled sandbox failure.
 - [PLANNED: OLS-3928] Integration tests verify inspection before `ToolResultEvent` emission. They verify payload-free `EventLogger` records and full-fidelity `AuditLogger` events after a pass. They also verify rejected-event suppression and controlled termination without a Result CR.
 - The cross-repository real-model corpus and reporting requirements are owned by `openshift/ols/.ai/spec/what/tool-result-inspection.md`.

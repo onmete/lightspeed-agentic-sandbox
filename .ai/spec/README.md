@@ -18,8 +18,8 @@ These specs define the behavioral rules and codebase navigation for the lightspe
 | [provider-contract.md](what/provider-contract.md) | AgentProvider ABC, event model, structured output, thin-adapter principle, skills delegation |
 | [configuration.md](what/configuration.md) | Environment variables, provider selection, model resolution, container layout, build system |
 | [health-probes.md](what/health-probes.md) | Readiness checks at batch startup (R1); HTTP probes superseded |
-| [audit-logging.md](what/audit-logging.md) | OTel GenAI semantic conventions, span events for LLM calls and tool execution, compliance audit trail |
-| [data-collection.md](what/data-collection.md) | [PLANNED: OLS-3569] Sandbox production of full-fidelity, ordered agent-content trace events |
+| [audit-logging.md](what/audit-logging.md) | OTel GenAI v1.41 agent, inference and tool span attributes; independent compliance audit views |
+| [data-collection.md](what/data-collection.md) | Sandbox GenAI trace production for downstream candidate collection (cross-repository collection is owned by the workspace parent spec) |
 | [e2e-testing.md](what/e2e-testing.md) | Batch cluster BDD harness: OpenShift Jobs, fixtures, live vs unit split |
 
 ### how/ — Architecture Specifications
@@ -69,7 +69,7 @@ AI agents. Content is optimized for precision and machine consumption.
 - **Rule numbering:** behavioral rules are numbered sequentially within each what/ file.
 - **Planned changes:** unimplemented behavior is marked with `[PLANNED]` or `[PLANNED: OLS-XXXX]` inline next to the rule it affects.
 - **Environment variables:** reference the actual env var (e.g., `LIGHTSPEED_PROVIDER`).
-- **Constraints:** component-specific and cross-cutting constraints go in the relevant what/ file's Constraints section, co-located with behavioral rules. Development conventions go in CLAUDE.md.
+- **Constraints:** component-specific and cross-cutting constraints go in the relevant what/ file's Constraints section, co-located with behavioral rules. Development conventions go in AGENTS.md.
 - **Authority:** what/ specs are authoritative for behavior. how/ specs are authoritative for implementation. When they conflict, what/ wins.
 - **When to create a new file vs. extend an existing one:** if the new concern has its own lifecycle, configuration surface, and can be understood independently, it gets its own file. If it's a capability added to an existing component, it goes in that component's file.
 

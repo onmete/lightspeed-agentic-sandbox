@@ -160,6 +160,8 @@ def main() -> None:
 
     agenticrun_uid = os.environ.get("LIGHTSPEED_AGENTICRUN_UID", "").strip()
     agenticrun_phase = os.environ.get("LIGHTSPEED_AGENTICRUN_STEP", "").strip()
+    audit_enabled = os.environ.get("LIGHTSPEED_AUDIT_ENABLED", "").strip().lower() == "true"
+    capture_content = _resolve_capture_content(audit_enabled)
 
     target_ns = _pick_namespace(inputs.context)
     logger.info(
@@ -189,6 +191,7 @@ def main() -> None:
             init_tracer(
                 agenticrun_uid=agenticrun_uid,
                 agenticrun_phase=agenticrun_phase,
+                capture_content=capture_content,
             )
             otel_active = True
 
@@ -196,8 +199,6 @@ def main() -> None:
         provider_mcp_servers, mcp_policies = split_admitted_mcp_servers(admitted_mcp_servers)
         provider = create_provider(sdk.name)
         startup_model = resolve_startup_model(sdk.name)
-        audit_enabled = os.environ.get("LIGHTSPEED_AUDIT_ENABLED", "").strip().lower() == "true"
-        capture_content = _resolve_capture_content(audit_enabled)
         skills_dir = os.environ.get("LIGHTSPEED_SKILLS_DIR", DEFAULT_SKILLS_DIR)
         model = resolve_router_model(provider.name, startup_model)
 
@@ -230,8 +231,6 @@ def main() -> None:
                 mcp_servers=provider_mcp_servers,
                 reasoning_config=reasoning_config,
                 tool_output_inspection_enabled=tool_output_inspection_enabled,
-                audit_enabled=audit_enabled,
-                capture_content=capture_content,
                 agenticrun_uid=agenticrun_uid,
                 traceparent=traceparent,
                 step=agenticrun_phase,
@@ -311,7 +310,7 @@ def _resolve_traceparent() -> str | None:
 
 
 def _resolve_capture_content(audit_enabled: bool) -> bool:
-    """Resolve whether ``gen_ai.choice`` events include completion/reasoning text.
+    """Resolve the compliance stdout/templog content policy, not product tracing.
 
     Defaults to ``audit_enabled`` when ``LIGHTSPEED_CAPTURE_CONTENT`` is unset.
     Explicit ``true`` / ``false`` overrides the default.

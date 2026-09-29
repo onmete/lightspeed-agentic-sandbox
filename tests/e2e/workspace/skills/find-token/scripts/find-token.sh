@@ -20,7 +20,7 @@ cat <<EOF
         "description": "Return the generated tokens for verification",
         "actions": [
           {
-            "command": "bash scripts/find-token.sh",
+            "command": "bash find-token/scripts/find-token.sh",
             "type": "verify",
             "description": "Generate cryptographic tokens"
           }

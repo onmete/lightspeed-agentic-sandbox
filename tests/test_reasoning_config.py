@@ -139,8 +139,14 @@ class TestGeminiReasoningConfig:
         mock_types.Part = FakePart
         mock_types.HttpOptions = MagicMock(side_effect=lambda **kwargs: kwargs)
 
+        class FakeGemini:
+            def __init__(self, **kwargs):
+                captured["model_kwargs"] = kwargs
+
+            def _maybe_append_user_content(self, llm_request):
+                pass
+
         mock_agent_cls = MagicMock()
-        mock_gemini_cls = MagicMock()
         mock_runner = MagicMock()
 
         async def _empty_run(**_kwargs):
@@ -167,7 +173,12 @@ class TestGeminiReasoningConfig:
         agents_mod.Agent = mock_agent_cls  # type: ignore[attr-defined]
         agents_mod.RunConfig = MagicMock()  # type: ignore[attr-defined]
         models_mod = ModuleType("google.adk.models")
-        models_mod.Gemini = mock_gemini_cls  # type: ignore[attr-defined]
+        models_mod.Gemini = FakeGemini  # type: ignore[attr-defined]
+        telemetry_mod = ModuleType("google.adk.telemetry")
+        telemetry_mod.__path__ = []  # type: ignore[attr-defined]
+        telemetry_context_mod = ModuleType("google.adk.telemetry.context")
+        telemetry_context_mod.ContentCapturingMode = MagicMock(NO_CONTENT="NO_CONTENT")  # type: ignore[attr-defined]
+        telemetry_context_mod.TelemetryConfig = MagicMock()  # type: ignore[attr-defined]
         run_config_mod = ModuleType("google.adk.agents.run_config")
         run_config_mod.StreamingMode = MagicMock(SSE="sse", NONE="none")  # type: ignore[attr-defined]
         runners_mod = ModuleType("google.adk.runners")
@@ -190,6 +201,8 @@ class TestGeminiReasoningConfig:
             "google.adk.agents": agents_mod,
             "google.adk.agents.run_config": run_config_mod,
             "google.adk.models": models_mod,
+            "google.adk.telemetry": telemetry_mod,
+            "google.adk.telemetry.context": telemetry_context_mod,
             "google.adk.runners": runners_mod,
             "google.adk.sessions": sessions_mod,
             "google.adk.tools": tools_mod,
@@ -218,7 +231,7 @@ class TestGeminiReasoningConfig:
                 pass
 
         captured["gen_config"].run_config = agents_mod.RunConfig.call_args.kwargs
-        captured["gen_config"].model_kwargs = mock_gemini_cls.call_args.kwargs
+        captured["gen_config"].model_kwargs = captured["model_kwargs"]
         captured["gen_config"].agent_tools = mock_agent_cls.call_args.kwargs["tools"]
         return captured["gen_config"]
 

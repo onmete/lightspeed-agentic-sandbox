@@ -1,19 +1,8 @@
-"""OTEL tracing and logging — provider initialization and traceparent parsing.
+"""OTEL traces and logs with independently gated compliance projections.
 
-At startup we configure both signals from env: TracerProvider (traces) and
-LoggerProvider (logs), sharing one Resource from ``Resource.create()``
-with ``service.name`` set to ``lightspeed-agentic-sandbox``. Stdout audit
-remains the existing span → OTLP-JSON exporter when audit is enabled.
-When an OTLP endpoint is set **and** audit is enabled, a span processor
-forwards AuditLogger span events (e.g. ``gen_ai.choice``) through stdlib
-``logging`` so ``LoggingHandler`` dual-ships them to stderr and OTLP
-(templog). When an OTLP endpoint is set, all stdlib ``logging`` is
-dual-shipped the same way.
-
-Templog (lightspeed-otel-collector postgresexporter) reads log **record**
-attributes, so bridged logs stamp ``agenticrun.uid`` / ``agenticrun.phase`` /
-``event`` via ``logging`` ``extra``. Phase comes from ``result-template.kind``
-via ``init_tracer(agenticrun_phase=…)``; uid from env when set.
+Product GenAI spans are exported unchanged to OTLP traces. Audit stdout and
+templog are derived views of completed operation spans, not a second product
+transcript or additional span events. Developer logs retain LoggingHandler.
 """
 
 from __future__ import annotations
@@ -42,10 +31,10 @@ from opentelemetry.exporter.otlp.proto.http._log_exporter import (
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpSpanExporter,
 )
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler, ReadWriteLogRecord
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, LogRecordExporter
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     SimpleSpanProcessor,
@@ -53,12 +42,26 @@ from opentelemetry.sdk.trace.export import (
     SpanExportResult,
 )
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 _DEFAULT_SERVICE_NAME = "lightspeed-agentic-sandbox"
 _TRACER_NAME = "lightspeed_agentic"
 _ATTR_AGENTICRUN_UID = "agenticrun.uid"
 _ATTR_AGENTICRUN_PHASE = "agenticrun.phase"
 _logger = logging.getLogger(__name__)
+_TRACE_CONTEXT_PROPAGATOR = TraceContextTextMapPropagator()
+_CONTENT_KEYS = frozenset(
+    {
+        "gen_ai.input.messages",
+        "gen_ai.output.messages",
+        "gen_ai.system_instructions",
+        "gen_ai.tool.definitions",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+    }
+)
+_AUDIT_OPERATIONS = frozenset({"invoke_agent", "chat", "execute_tool"})
+_ADK_LOG_SCOPE = "gcp.vertex.agent"
 _audit_bridge_logger = logging.getLogger("lightspeed_agentic.audit")
 
 
@@ -80,10 +83,20 @@ def otel_runtime_enabled() -> bool:
 
 
 class OTLPJsonStdoutExporter(SpanExporter):
-    """Exports spans as OTLP JSON wire format to stdout (one line per batch)."""
+    """Export a cloned OTLP-JSON compliance view; never mutate product spans."""
+
+    def __init__(self, *, capture_content: bool = True) -> None:
+        self._capture_content = capture_content
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         pb = encode_spans(spans)
+        if not self._capture_content:
+            for resource_spans in pb.resource_spans:
+                for scope_spans in resource_spans.scope_spans:
+                    for span in scope_spans.spans:
+                        for index in reversed(range(len(span.attributes))):
+                            if span.attributes[index].key in _CONTENT_KEYS:
+                                del span.attributes[index]
         line = json.dumps(MessageToDict(pb, preserving_proto_field_name=True))
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
@@ -93,21 +106,17 @@ class OTLPJsonStdoutExporter(SpanExporter):
         pass
 
 
-class _SpanEventsToLogsProcessor(SpanProcessor):
-    """Forward span events through stdlib logging (templog via LoggingHandler).
+class _GenAISpansToLogsProcessor(SpanProcessor):
+    """Emit one audit-gated templog projection for each GenAI operation span."""
 
-    AuditLogger still emits once (span events). This is only a second
-    destination — one stdlib log record per span event, body = event attrs
-    JSON. ``LoggingHandler`` dual-ships to stderr and OTLP.
-
-    Stamps ``agenticrun.uid`` / ``agenticrun.phase`` / ``event`` on each
-    record via ``logging`` ``extra`` for the collector postgresexporter.
-
-    Skips OTel automatic ``exception`` events (stack traces) so templog stays
-    intentional audit events without hard-coding a gen_ai.* allowlist.
-    """
-
-    def __init__(self, *, agenticrun_uid: str = "", agenticrun_phase: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        agenticrun_uid: str = "",
+        agenticrun_phase: str = "",
+        capture_content: bool = True,
+    ) -> None:
+        self._capture_content = capture_content
         self._attrs: dict[str, str] = {}
         if agenticrun_uid:
             self._attrs[_ATTR_AGENTICRUN_UID] = agenticrun_uid
@@ -115,28 +124,54 @@ class _SpanEventsToLogsProcessor(SpanProcessor):
             self._attrs[_ATTR_AGENTICRUN_PHASE] = agenticrun_phase
 
     def on_end(self, span: ReadableSpan) -> None:
-        events = span.events
-        if not events:
+        # SDK-native spans are operational Actions, not a second audit copy.
+        scope = span.instrumentation_scope
+        if scope is None or scope.name != _TRACER_NAME:
+            return
+        attrs = span.attributes or {}
+        operation = attrs.get("gen_ai.operation.name")
+        if operation not in _AUDIT_OPERATIONS:
             return
         try:
-            self._emit_events(span, events)
-        except Exception:
-            # Never break span export / request path if log bridging fails.
-            _logger.exception("failed to forward span events to OTLP logs")
-
-    def _emit_events(self, span: ReadableSpan, events: Sequence[Event]) -> None:
-        # Attach ended span context so LoggingHandler stamps TraceID.
-        token = attach(_span_context_for_logs(span))
-        try:
-            for event in events:
-                if event.name == "exception":
-                    continue
+            content = {
+                key: value
+                for key, value in attrs.items()
+                if key not in _CONTENT_KEYS or self._capture_content
+            }
+            # Log bodies carry span metadata (including status/timing), while
+            # trace/span IDs come from the attached completed-span context.
+            content.update(
+                {
+                    "span.name": span.name,
+                    "span.status": span.status.status_code.name,
+                }
+            )
+            start_time = span.start_time
+            end_time = span.end_time
+            if start_time is not None:
+                content["span.start_time"] = start_time
+            if end_time is not None:
+                content["span.end_time"] = end_time
+            token = attach(_span_context_for_logs(span))
+            try:
                 _audit_bridge_logger.info(
-                    json.dumps(dict(event.attributes or {}), default=str),
-                    extra={"event": event.name, **self._attrs},
+                    json.dumps(content, ensure_ascii=False, default=str),
+                    extra={"event": operation, **self._attrs},
                 )
-        finally:
-            detach(token)
+            finally:
+                detach(token)
+        except Exception:
+            _logger.exception("failed to forward GenAI span to OTLP logs")
+
+
+class _ADKFilteredBatchLogRecordProcessor(BatchLogRecordProcessor):
+    """Keep SDK-native GenAI Logs API events out of the product OTLP endpoint."""
+
+    def on_emit(self, log_record: ReadWriteLogRecord) -> None:
+        scope = log_record.instrumentation_scope
+        if scope is not None and scope.name == _ADK_LOG_SCOPE:
+            return
+        super().on_emit(log_record)
 
 
 class _AgenticRunFilter(logging.Filter):
@@ -180,24 +215,13 @@ def init_tracer(
     *,
     agenticrun_uid: str | None = None,
     agenticrun_phase: str | None = None,
+    capture_content: bool = True,
 ) -> None:
-    """Initialize OTEL TracerProvider and LoggerProvider from env.
+    """Configure full-fidelity product traces and independent gated audit views.
 
-    ``agenticrun_phase`` should be the workflow step from ``result-template.kind``
-    (analysis, execution, verification, escalation). ``agenticrun_uid`` defaults
-    to ``LIGHTSPEED_AGENTICRUN_UID`` when omitted.
-
-    Traces:
-    - Stdout OTLP-JSON exporter when ``LIGHTSPEED_AUDIT_ENABLED=true``.
-    - OTLP span exporter when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set.
-
-    Logs:
-    - OTLP log exporter when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set.
-    - Stdlib ``logging`` dual-shipped to stderr and OTLP via ``LoggingHandler``
-      when the endpoint is set.
-    - Span-event → log bridge when endpoint is set **and** audit is enabled
-      (same gate as stdout): emits via stdlib so LoggingHandler dual-ships;
-      stamps uid/phase/event in ``extra`` for templog.
+    ``capture_content`` applies only to stdout OTLP-JSON and templog
+    projections. Product spans and developer LoggingHandler records are not
+    modified by the compliance content policy.
     """
     if _state.tracer_provider is not None or _state.logger_provider is not None:
         raise RuntimeError("OTEL providers already initialized; call shutdown_tracer() first")
@@ -252,13 +276,15 @@ def init_tracer(
 
     _state.tracer_provider = TracerProvider(resource=resource)
     if audit:
-        _state.tracer_provider.add_span_processor(SimpleSpanProcessor(OTLPJsonStdoutExporter()))
-    if endpoint and audit:
-        # Same gate as stdout audit: only forward when audit is enabled.
         _state.tracer_provider.add_span_processor(
-            _SpanEventsToLogsProcessor(
+            SimpleSpanProcessor(OTLPJsonStdoutExporter(capture_content=capture_content))
+        )
+    if endpoint and audit:
+        _state.tracer_provider.add_span_processor(
+            _GenAISpansToLogsProcessor(
                 agenticrun_uid=agenticrun_uid,
                 agenticrun_phase=agenticrun_phase,
+                capture_content=capture_content,
             )
         )
     _configure_trace_exporter(_state.tracer_provider, endpoint=endpoint, protocol=protocol)
@@ -282,14 +308,12 @@ def _configure_log_exporter(provider: LoggerProvider, *, endpoint: str, protocol
     if not endpoint:
         return
 
+    exporter: LogRecordExporter
     if protocol == "http/protobuf":
-        provider.add_log_record_processor(
-            BatchLogRecordProcessor(HttpLogExporter(endpoint=endpoint))
-        )
+        exporter = HttpLogExporter(endpoint=endpoint)
     else:
-        provider.add_log_record_processor(
-            BatchLogRecordProcessor(GrpcLogExporter(endpoint=endpoint))
-        )
+        exporter = GrpcLogExporter(endpoint=endpoint)
+    provider.add_log_record_processor(_ADKFilteredBatchLogRecordProcessor(exporter))
 
 
 def shutdown_tracer() -> None:
@@ -315,36 +339,12 @@ def get_tracer() -> trace.Tracer:
 
 
 def parse_traceparent(header: str | None) -> tuple[str, Context | None]:
-    """Parse W3C traceparent header and return (trace_id, context).
-
-    If the header is invalid or missing, generates a new trace ID.
-    """
+    """Parse W3C traceparent with the standard propagator; generate a root if invalid."""
     if header:
-        parts = header.split("-")
-        if len(parts) >= 4:
-            trace_id_hex = parts[1]
-            parent_id_hex = parts[2]
-            flags_hex = parts[3]
-            if (
-                len(trace_id_hex) == 32
-                and trace_id_hex != "0" * 32
-                and len(parent_id_hex) == 16
-                and parent_id_hex != "0" * 16
-            ):
-                try:
-                    trace_id = int(trace_id_hex, 16)
-                    parent_id = int(parent_id_hex, 16)
-                    flags = int(flags_hex, 16)
-                except ValueError:
-                    return _generate_trace_id()
-                span_ctx = SpanContext(
-                    trace_id=trace_id,
-                    span_id=parent_id,
-                    is_remote=True,
-                    trace_flags=TraceFlags(flags),
-                )
-                ctx = trace.set_span_in_context(NonRecordingSpan(span_ctx))
-                return trace_id_hex, ctx
+        context = _TRACE_CONTEXT_PROPAGATOR.extract({"traceparent": header})
+        span_context = trace.get_current_span(context).get_span_context()
+        if span_context.is_valid:
+            return f"{span_context.trace_id:032x}", context
     return _generate_trace_id()
 
 
