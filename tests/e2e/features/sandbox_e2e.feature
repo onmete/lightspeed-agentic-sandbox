@@ -1,3 +1,4 @@
+# CI trigger verification: behavior-neutral change for sandbox E2E pipelines.
 Feature: Sandbox E2E contract
   Verifies: .ai/spec/what/run-api.md (context), .ai/spec/what/audit-logging.md (OTLP traces and audit logs)
   Harness: .ai/spec/what/e2e-testing.md
