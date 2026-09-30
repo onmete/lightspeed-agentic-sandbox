@@ -283,7 +283,7 @@ class TestInitTracer:
         _tracing_mod._state.logger_provider.add_log_record_processor(SimpleLogRecordProcessor(logs))
         assert _tracing_mod._state.tracer_provider is not None
         tracer = _tracing_mod._state.tracer_provider.get_tracer("lightspeed_agentic")
-        for operation in ("invoke_agent", "chat", "execute_tool", "other"):
+        for operation in ("invoke_agent", "chat", "generate_content", "execute_tool", "other"):
             with tracer.start_as_current_span(
                 operation, attributes={"gen_ai.operation.name": operation}
             ) as span:
@@ -296,11 +296,12 @@ class TestInitTracer:
             rec.log_record
             for rec in logs.get_finished_logs()
             if (rec.log_record.attributes or {}).get("event")
-            in ("invoke_agent", "chat", "execute_tool", "other")
+            in ("invoke_agent", "chat", "generate_content", "execute_tool", "other")
         ]
         assert {rec.attributes["event"] for rec in matching} == {
             "invoke_agent",
             "chat",
+            "generate_content",
             "execute_tool",
         }
         assert all("private stack trace" not in str(rec.body) for rec in matching)

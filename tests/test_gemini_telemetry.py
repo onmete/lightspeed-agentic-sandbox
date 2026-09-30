@@ -13,6 +13,7 @@ from google.adk.telemetry.context import ContentCapturingMode
 from google.genai import types
 from jsonschema import Draft202012Validator
 
+from lightspeed_agentic.audit import GenAIRecorder
 from lightspeed_agentic.providers.gemini import (
     GeminiProvider,
     _finish_reason,
@@ -42,6 +43,58 @@ def _event(content, **kwargs):
         get_function_calls=lambda: calls,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_model_span_uses_generate_content_operation(tmp_path, span_exporter):
+    recorder = GenAIRecorder(phase="analysis", provider="gcp.gen_ai", capture_content=True)
+
+    async def fake_base(self, llm_request, **_kwargs):
+        self._maybe_append_user_content(llm_request)
+        yield _response(
+            types.Content(role="model", parts=[types.Part(text="answer")]),
+            finish_reason="STOP",
+        )
+
+    class FakeRunner:
+        def __init__(self, *, agent, **_kwargs):
+            self.agent = agent
+
+        async def run_async(self, *, new_message, **_kwargs):
+            request = SimpleNamespace(
+                model="gemini-requested",
+                contents=[new_message],
+                config=SimpleNamespace(system_instruction="system", tools=[]),
+            )
+            async for response in self.agent.model.generate_content_async(request):
+                yield _event(response.content)
+
+    options = ProviderQueryOptions(
+        prompt="ask",
+        system_prompt="system",
+        model="gemini-requested",
+        max_turns=3,
+        allowed_tools=[],
+        cwd=str(tmp_path),
+        telemetry=recorder,
+    )
+    with (
+        patch.object(Gemini, "generate_content_async", fake_base),
+        patch("google.adk.runners.Runner", FakeRunner),
+        patch("lightspeed_agentic.providers.gemini._load_skills_toolset", return_value=None),
+    ):
+        [event async for event in GeminiProvider().query(options)]
+
+    (model_span,) = span_exporter.get_finished_spans()
+    assert model_span.name == "generate_content gemini-requested"
+    assert model_span.attributes["gen_ai.operation.name"] == "generate_content"
+    assert json.loads(model_span.attributes["gen_ai.output.messages"]) == [
+        {
+            "role": "assistant",
+            "parts": [{"type": "text", "content": "answer"}],
+            "finish_reason": "stop",
+        }
+    ]
 
 
 @pytest.mark.parametrize(

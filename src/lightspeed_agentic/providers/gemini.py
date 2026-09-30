@@ -270,6 +270,7 @@ class GeminiProvider(AgentProvider):
                     _messages(llm_request.contents),
                     system,
                     llm_request.model,
+                    operation_name="generate_content",
                     tool_definitions=_tool_definitions(llm_request.config),
                 )
 

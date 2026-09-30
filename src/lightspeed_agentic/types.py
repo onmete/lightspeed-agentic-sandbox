@@ -83,6 +83,7 @@ class ProviderTelemetry(Protocol):
         system_instructions: list[dict[str, Any]] | None,
         request_model: str,
         *,
+        operation_name: str = "chat",
         tool_definitions: list[dict[str, Any]] | None = None,
     ) -> Any: ...
 

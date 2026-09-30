@@ -56,10 +56,11 @@ class GenAIRecorder:
         system_instructions: list[dict[str, Any]] | None,
         request_model: str,
         *,
+        operation_name: str = "chat",
         tool_definitions: list[dict[str, Any]] | None = None,
     ) -> Span:
         attributes: dict[str, str] = {
-            "gen_ai.operation.name": "chat",
+            "gen_ai.operation.name": operation_name,
             "gen_ai.provider.name": self._provider,
             "gen_ai.request.model": request_model,
             **self._correlation(),
@@ -75,7 +76,7 @@ class GenAIRecorder:
             if tool_definitions is not None:
                 attributes["gen_ai.tool.definitions"] = encode_messages(tool_definitions)
         span = self._tracer.start_span(
-            f"chat {request_model}",
+            f"{operation_name} {request_model}",
             kind=SpanKind.CLIENT,
             context=self._parent_context,
             attributes=attributes,

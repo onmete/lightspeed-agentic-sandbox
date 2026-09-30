@@ -67,7 +67,7 @@ def logs_contain_traces_for_run(logs: str, run_uid: str) -> bool:
         f"agenticrun.uid: Str({run_uid})" in record
         and any(
             f"gen_ai.operation.name: Str({operation})" in record
-            for operation in ("invoke_agent", "chat", "execute_tool")
+            for operation in ("invoke_agent", "chat", "generate_content", "execute_tool")
         )
         for record in _record_blocks(logs, "Span #")
     )
@@ -80,7 +80,7 @@ def logs_contain_audit_logs_for_run(logs: str, run_uid: str, *, phase: str) -> b
         and f"agenticrun.phase: Str({phase})" in record
         and any(
             f"event: Str({operation})" in record
-            for operation in ("invoke_agent", "chat", "execute_tool")
+            for operation in ("invoke_agent", "chat", "generate_content", "execute_tool")
         )
         for record in _record_blocks(logs, "LogRecord #")
     )

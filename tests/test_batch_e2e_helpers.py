@@ -275,10 +275,11 @@ class TestResolveHelpers:
 class TestOtelVerify:
     RUN_UID = "a" * 32
 
-    def test_traces_positive(self) -> None:
+    @pytest.mark.parametrize("operation", ["invoke_agent", "generate_content"])
+    def test_traces_positive(self, operation: str) -> None:
         logs = (
             f"ResourceSpans #0\nSpan #0\n     -> agenticrun.uid: Str({self.RUN_UID})\n"
-            "     -> gen_ai.operation.name: Str(invoke_agent)\n"
+            f"     -> gen_ai.operation.name: Str({operation})\n"
             "     -> gen_ai.input.messages: Str([...])"
         )
         assert logs_contain_traces_for_run(logs, self.RUN_UID)
@@ -298,12 +299,13 @@ class TestOtelVerify:
         )
         assert not logs_contain_traces_for_run(logs, self.RUN_UID)
 
-    def test_audit_logs_positive(self) -> None:
+    @pytest.mark.parametrize("operation", ["chat", "generate_content"])
+    def test_audit_logs_positive(self, operation: str) -> None:
         logs = (
             "LogsExporter\nLogRecord #0\n"
             f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
             "     -> agenticrun.phase: Str(analysis)\n"
-            "     -> event: Str(chat)"
+            f"     -> event: Str({operation})"
         )
         assert logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
 

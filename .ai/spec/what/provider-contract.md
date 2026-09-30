@@ -113,7 +113,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 40. Tool arguments/results and assistant/reasoning values retained for recording source spans MUST NOT be length-truncated. Compliance projections may omit content under `LIGHTSPEED_CAPTURE_CONTENT` without changing the source spans. The existing EventLogger MAY continue to truncate its developer-log rendering.
 
-41. Every adapter's terminal `result` MUST carry the final response and observed token/model metadata when exposed by its SDK. `ResultEvent` field defaults MUST NOT be treated as observed per-request `chat` span usage or an observed provider response model; unexposed span attributes MUST be omitted, not invented.
+41. Every adapter's terminal `result` MUST carry the final response and observed token/model metadata when exposed by its SDK. `ResultEvent` field defaults MUST NOT be treated as observed per-request model-span usage or an observed provider response model; unexposed span attributes MUST be omitted, not invented.
 42. Gemini MUST retain terminal text from non-streamed ADK responses and pass it through the terminal `result`; it MUST NOT leave the final value empty because the text arrived in a non-partial event. Observed model and token metadata belong on the corresponding actual SDK model-request span under rule 41.
 43. DeepAgents structured output MUST preserve the first agent pass's ordered completion, reasoning, and tool signals and pass the second tool-free shape result as terminal `result` text. Usage totals MUST include both passes when exposed, without inventing unavailable provider usage or model identifiers.
 44. OpenAI MUST serialize `result.final_output` as the terminal `result` value and expose observed model and token metadata, including reasoning tokens from output-token details when available.
@@ -125,7 +125,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 ### Gemini model/tool telemetry
 
 When `ProviderQueryOptions.telemetry` is provided, the Gemini adapter records
-one provider-neutral `chat` span per actual SDK request and one `execute_tool`
+one `generate_content` span per actual SDK request and one `execute_tool`
 span per locally executed ADK tool. Model input is captured after Gemini's
 request preprocessing and automatic continuation message, not at
 `before_model_callback` (which runs earlier), and represents the SDK's effective

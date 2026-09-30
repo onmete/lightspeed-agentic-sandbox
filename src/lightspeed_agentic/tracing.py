@@ -60,7 +60,7 @@ _CONTENT_KEYS = frozenset(
         "gen_ai.tool.call.result",
     }
 )
-_AUDIT_OPERATIONS = frozenset({"invoke_agent", "chat", "execute_tool"})
+_AUDIT_OPERATIONS = frozenset({"invoke_agent", "chat", "generate_content", "execute_tool"})
 _ADK_LOG_SCOPE = "gcp.vertex.agent"
 _audit_bridge_logger = logging.getLogger("lightspeed_agentic.audit")
 
