@@ -41,10 +41,9 @@ class TestMCPFunctionTools:
 
     @pytest.mark.asyncio
     async def test_non_native_conversion_exposes_only_admitted_tools(self) -> None:
-        from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        from mcp.types import Tool
+        from mcp.types import ListToolsResult, Tool
 
         from lightspeed_agentic.mcp import (  # type: ignore[import-untyped]
             AdmittedMCPProviderServer,
@@ -64,7 +63,7 @@ class TestMCPFunctionTools:
         rejected_tool = Tool(name="delete_pod", inputSchema={})
         server.session = MagicMock()
         server.session.list_tools = AsyncMock(
-            return_value=SimpleNamespace(tools=[admitted_tool, rejected_tool])
+            return_value=ListToolsResult(tools=[admitted_tool, rejected_tool])
         )
         converted_tool = object()
 

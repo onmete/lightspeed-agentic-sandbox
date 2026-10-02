@@ -71,7 +71,7 @@ def _load_skills_toolset(skills_dir: str) -> Any:
         if skills:
             return SkillToolset(
                 skills=skills,
-                code_executor=UnsafeLocalCodeExecutor(),  # type: ignore[no-untyped-call]
+                code_executor=UnsafeLocalCodeExecutor(),
             )
     except Exception as e:
         logger.debug("Failed to load skills toolset from %s: %s", skills_dir, e)
@@ -88,7 +88,7 @@ class GeminiProvider(AgentProvider):
 
     async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
         from google.adk.agents import Agent, RunConfig
-        from google.adk.agents.run_config import StreamingMode
+        from google.adk.agents.run_config import StreamingMode  # type: ignore[attr-defined]
         from google.adk.models import Gemini
         from google.adk.runners import Runner
         from google.adk.sessions import InMemorySessionService
@@ -187,7 +187,7 @@ class GeminiProvider(AgentProvider):
                 gen_cfg.response_mime_type = "application/json"
                 gen_cfg.response_schema = options.output_schema
 
-        session_service = InMemorySessionService()  # type: ignore[no-untyped-call]
+        session_service = InMemorySessionService()
         runner = Runner(
             app_name="lightspeed",
             agent=agent,

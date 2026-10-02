@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 deepagents = [
+    "anthropic<1",
     "deepagents>=0.7.18",
     "langchain-anthropic>=1.4.8",
     "langchain-google-vertexai>=3.2.4",
