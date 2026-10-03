@@ -29,12 +29,14 @@ class MockProvider(AgentProvider):
                 output_tokens=50,
             ),
         ]
+        self.last_options: ProviderQueryOptions | None = None
 
     @property
     def name(self) -> str:
         return "mock"
 
-    async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+    async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+        self.last_options = options
         for event in self._events:
             yield event
 

@@ -305,32 +305,338 @@ class TestResolveHelpers:
 
 class TestOtelVerify:
     RUN_UID = "a" * 32
+    EXPECTED_OPERATION = "chat"
+    EXPECTED_PROVIDER = "openai"
+
+    def _span_block(
+        self,
+        *,
+        span_uid: str | None,
+        resource_uid: str | None = None,
+        resource_phase: str | None = None,
+        operation: str = "chat",
+        provider: str = "openai",
+        trace_id: str = "1" * 32,
+        span_id: str = "2" * 16,
+        service_name: str = "lightspeed-agentic-sandbox",
+    ) -> str:
+        resource_attributes = [f"     -> service.name: Str({service_name})"]
+        if resource_uid is not None:
+            resource_attributes.append(f"     -> agenticrun.uid: Str({resource_uid})")
+        if resource_phase is not None:
+            resource_attributes.append(f"     -> agenticrun.phase: Str({resource_phase})")
+        span_attributes = [
+            f"     -> gen_ai.operation.name: Str({operation})",
+            f"     -> gen_ai.provider.name: Str({provider})",
+        ]
+        if span_uid is not None:
+            span_attributes.insert(0, f"     -> agenticrun.uid: Str({span_uid})")
+        lines = [
+            "ResourceSpans #0",
+            "Resource Schema URL: https://opentelemetry.io/schemas/1.41.0",
+            "Resource attributes:",
+            *resource_attributes,
+            "ScopeSpans #0",
+            "ScopeSpans Schema URL: https://opentelemetry.io/schemas/1.41.0",
+            "InstrumentationScope lightspeed_agentic.audit",
+            "Span #0",
+            f"    Trace ID       : {trace_id}",
+            f"    ID             : {span_id}",
+            f"    Name           : {operation} model",
+            "    Kind           : Client",
+            "    Status code    : Unset",
+            "Attributes:",
+            *span_attributes,
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _log_block(
+        self,
+        *,
+        uid: str | None = None,
+        phase: str | None = "analysis",
+        event: str | None = "chat",
+        body: str = '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai"}',
+        trace_id: str = "1" * 32,
+        span_id: str = "2" * 16,
+        resource_uid: str | None = None,
+        resource_phase: str | None = None,
+        service_name: str = "lightspeed-agentic-sandbox",
+    ) -> str:
+        resource_attributes = [f"     -> service.name: Str({service_name})"]
+        if resource_uid is not None:
+            resource_attributes.append(f"     -> agenticrun.uid: Str({resource_uid})")
+        if resource_phase is not None:
+            resource_attributes.append(f"     -> agenticrun.phase: Str({resource_phase})")
+        attributes = []
+        if uid is not None:
+            attributes.append(f"     -> agenticrun.uid: Str({uid})")
+        if phase is not None:
+            attributes.append(f"     -> agenticrun.phase: Str({phase})")
+        if event is not None:
+            attributes.append(f"     -> event: Str({event})")
+        lines = [
+            "ResourceLogs #0",
+            "Resource Schema URL: https://opentelemetry.io/schemas/1.41.0",
+            "Resource attributes:",
+            *resource_attributes,
+            "ScopeLogs #0",
+            "ScopeLogs Schema URL: https://opentelemetry.io/schemas/1.41.0",
+            "InstrumentationScope lightspeed_agentic.audit",
+            "LogRecord #0",
+            f"    Body: Str({body})",
+            "Attributes:",
+            *attributes,
+            f"    Trace ID       : {trace_id}",
+            f"    Span ID        : {span_id}",
+        ]
+        return "\n".join(lines) + "\n"
 
     def test_traces_positive(self) -> None:
-        logs = f"ResourceSpans #0\nSpan #0\n     -> agenticrun.uid: Str({self.RUN_UID})"
-        assert logs_contain_traces_for_run(logs, self.RUN_UID)
+        logs = self._span_block(span_uid=self.RUN_UID)
+        assert logs_contain_traces_for_run(
+            logs,
+            self.RUN_UID,
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
 
     def test_traces_negative_without_span_markers(self) -> None:
         logs = f"agenticrun.uid={self.RUN_UID}"
-        assert not logs_contain_traces_for_run(logs, self.RUN_UID)
+        assert not logs_contain_traces_for_run(
+            logs,
+            self.RUN_UID,
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_traces_require_run_uid_on_span_not_resource(self) -> None:
+        logs = self._span_block(span_uid=None, resource_uid=self.RUN_UID)
+        assert not logs_contain_traces_for_run(
+            logs,
+            self.RUN_UID,
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    @pytest.mark.parametrize(
+        ("trace_id", "span_id"),
+        [("0" * 32, "2" * 16), ("1" * 32, "0" * 16)],
+    )
+    def test_traces_require_nonzero_ids(self, trace_id: str, span_id: str) -> None:
+        logs = self._span_block(
+            span_uid=self.RUN_UID,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        assert not logs_contain_traces_for_run(
+            logs,
+            self.RUN_UID,
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    @pytest.mark.parametrize(
+        ("operation", "provider"),
+        [("generate_content", "openai"), ("chat", "gcp.vertex_ai")],
+    )
+    def test_traces_require_expected_source_operation_and_provider(
+        self,
+        operation: str,
+        provider: str,
+    ) -> None:
+        logs = self._span_block(
+            span_uid=self.RUN_UID,
+            operation=operation,
+            provider=provider,
+        ) + self._log_block(uid=self.RUN_UID)
+        assert not logs_contain_traces_for_run(
+            logs,
+            self.RUN_UID,
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
 
     def test_audit_logs_positive(self) -> None:
-        logs = (
-            "LogsExporter\nLogRecord #0\n"
-            f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
-            "     -> agenticrun.phase: Str(analysis)\n"
-            "     -> event: Str(gen_ai.choice)"
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(uid=self.RUN_UID)
+        assert logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
         )
-        assert logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
 
     def test_audit_logs_negative_wrong_phase(self) -> None:
-        logs = (
-            "LogsExporter\nLogRecord #0\n"
-            f"     -> agenticrun.uid: Str({self.RUN_UID})\n"
-            "     -> agenticrun.phase: Str(execution)\n"
-            "     -> event: Str(gen_ai.choice)"
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            phase="execution",
         )
-        assert not logs_contain_audit_logs_for_run(logs, self.RUN_UID, phase="analysis")
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_require_matching_span_context(self) -> None:
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            trace_id="3" * 32,
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_require_matching_source_span(self) -> None:
+        logs = self._log_block(uid=self.RUN_UID)
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_reject_different_run_span_with_matching_ids(self) -> None:
+        logs = self._span_block(span_uid="b" * 32) + self._log_block(uid=self.RUN_UID)
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_reject_event_body_mismatch(self) -> None:
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            event="invoke_agent",
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_reject_wrong_body_provider(self) -> None:
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            body=('{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai"}'),
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    @pytest.mark.parametrize(
+        ("trace_id", "span_id"),
+        [("malformed", "2" * 16), ("1" * 32, "0" * 16)],
+    )
+    def test_audit_logs_reject_invalid_log_ids(self, trace_id: str, span_id: str) -> None:
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_reject_malformed_json_body(self) -> None:
+        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
+            uid=self.RUN_UID,
+            body='{"gen_ai.operation.name":',
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    def test_audit_logs_require_run_uid_record_attribute(self) -> None:
+        body = (
+            '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
+            f'"agenticrun.uid":"{self.RUN_UID}"}}'
+        )
+        logs = self._span_block(span_uid=self.RUN_UID, resource_uid=self.RUN_UID) + self._log_block(
+            resource_uid=self.RUN_UID,
+            phase="analysis",
+            event="chat",
+            body=body,
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
+
+    @pytest.mark.parametrize(
+        ("phase", "event", "resource_phase", "body"),
+        [
+            (
+                None,
+                "chat",
+                "analysis",
+                '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
+                '"agenticrun.phase":"analysis"}',
+            ),
+            (
+                "analysis",
+                None,
+                None,
+                '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai"}',
+            ),
+        ],
+    )
+    def test_audit_logs_require_phase_and_event_record_attributes(
+        self,
+        phase: str | None,
+        event: str | None,
+        resource_phase: str | None,
+        body: str,
+    ) -> None:
+        logs = self._span_block(
+            span_uid=self.RUN_UID, resource_phase=resource_phase
+        ) + self._log_block(
+            uid=self.RUN_UID,
+            phase=phase,
+            event=event,
+            resource_phase=resource_phase,
+            body=body,
+        )
+        assert not logs_contain_audit_logs_for_run(
+            logs,
+            self.RUN_UID,
+            phase="analysis",
+            expected_operation=self.EXPECTED_OPERATION,
+            expected_provider=self.EXPECTED_PROVIDER,
+        )
 
 
 class TestBuildJobSpec:
