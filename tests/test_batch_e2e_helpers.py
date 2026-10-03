@@ -392,250 +392,113 @@ class TestOtelVerify:
         ]
         return "\n".join(lines) + "\n"
 
-    def test_traces_positive(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID)
-        assert logs_contain_traces_for_run(
-            logs,
-            self.RUN_UID,
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_traces_negative_without_span_markers(self) -> None:
-        logs = f"agenticrun.uid={self.RUN_UID}"
-        assert not logs_contain_traces_for_run(
-            logs,
-            self.RUN_UID,
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_traces_require_run_uid_on_span_not_resource(self) -> None:
-        logs = self._span_block(span_uid=None, resource_uid=self.RUN_UID)
-        assert not logs_contain_traces_for_run(
-            logs,
-            self.RUN_UID,
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
     @pytest.mark.parametrize(
-        ("trace_id", "span_id"),
-        [("0" * 32, "2" * 16), ("1" * 32, "0" * 16)],
-    )
-    def test_traces_require_nonzero_ids(self, trace_id: str, span_id: str) -> None:
-        logs = self._span_block(
-            span_uid=self.RUN_UID,
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-        assert not logs_contain_traces_for_run(
-            logs,
-            self.RUN_UID,
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    @pytest.mark.parametrize(
-        ("operation", "provider"),
-        [("generate_content", "openai"), ("chat", "gcp.vertex_ai")],
-    )
-    def test_traces_require_expected_source_operation_and_provider(
-        self,
-        operation: str,
-        provider: str,
-    ) -> None:
-        logs = self._span_block(
-            span_uid=self.RUN_UID,
-            operation=operation,
-            provider=provider,
-        ) + self._log_block(uid=self.RUN_UID)
-        assert not logs_contain_traces_for_run(
-            logs,
-            self.RUN_UID,
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_positive(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(uid=self.RUN_UID)
-        assert logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_negative_wrong_phase(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            phase="execution",
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_require_matching_span_context(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            trace_id="3" * 32,
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_require_matching_source_span(self) -> None:
-        logs = self._log_block(uid=self.RUN_UID)
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_reject_different_run_span_with_matching_ids(self) -> None:
-        logs = self._span_block(span_uid="b" * 32) + self._log_block(uid=self.RUN_UID)
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_reject_event_body_mismatch(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            event="invoke_agent",
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_reject_wrong_body_provider(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            body=('{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai"}'),
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    @pytest.mark.parametrize(
-        ("trace_id", "span_id"),
-        [("malformed", "2" * 16), ("1" * 32, "0" * 16)],
-    )
-    def test_audit_logs_reject_invalid_log_ids(self, trace_id: str, span_id: str) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_reject_malformed_json_body(self) -> None:
-        logs = self._span_block(span_uid=self.RUN_UID) + self._log_block(
-            uid=self.RUN_UID,
-            body='{"gen_ai.operation.name":',
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    def test_audit_logs_require_run_uid_record_attribute(self) -> None:
-        body = (
-            '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
-            f'"agenticrun.uid":"{self.RUN_UID}"}}'
-        )
-        logs = self._span_block(span_uid=self.RUN_UID, resource_uid=self.RUN_UID) + self._log_block(
-            resource_uid=self.RUN_UID,
-            phase="analysis",
-            event="chat",
-            body=body,
-        )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
-        )
-
-    @pytest.mark.parametrize(
-        ("phase", "event", "resource_phase", "body"),
+        ("span_options", "log_options", "expected_traces", "expected_audit"),
         [
-            (
-                None,
-                "chat",
-                "analysis",
-                '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
-                '"agenticrun.phase":"analysis"}',
+            pytest.param({}, None, True, False, id="trace-only"),
+            pytest.param({}, {}, True, True, id="correlated-trace-and-audit"),
+            pytest.param(None, None, False, False, id="no-span-markers"),
+            pytest.param(
+                {"span_uid": None, "resource_uid": RUN_UID},
+                {},
+                False,
+                False,
+                id="resource-uid-is-not-span-uid",
             ),
-            (
-                "analysis",
-                None,
-                None,
-                '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai"}',
+            pytest.param({"trace_id": "0" * 32}, {}, False, False, id="zero-trace-id"),
+            pytest.param({"span_id": "0" * 16}, {}, False, False, id="zero-span-id"),
+            pytest.param(
+                {"operation": "generate_content"},
+                {},
+                False,
+                False,
+                id="wrong-operation",
             ),
+            pytest.param(
+                {"provider": "gcp.vertex_ai"},
+                {},
+                False,
+                False,
+                id="wrong-provider",
+            ),
+            pytest.param({}, {"phase": "execution"}, True, False, id="wrong-phase"),
+            pytest.param({}, {"trace_id": "3" * 32}, True, False, id="unmatched-context"),
+            pytest.param(None, {}, False, False, id="audit-without-source-span"),
+            pytest.param({"span_uid": "b" * 32}, {}, False, False, id="different-run"),
+            pytest.param({}, {"event": "invoke_agent"}, True, False, id="event-body-mismatch"),
+            pytest.param(
+                {},
+                {"body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai"}'},
+                True,
+                False,
+                id="wrong-body-provider",
+            ),
+            pytest.param({}, {"trace_id": "malformed"}, True, False, id="invalid-log-trace-id"),
+            pytest.param({}, {"span_id": "0" * 16}, True, False, id="zero-log-span-id"),
+            pytest.param(
+                {},
+                {"body": '{"gen_ai.operation.name":'},
+                True,
+                False,
+                id="malformed-body",
+            ),
+            pytest.param(
+                {"resource_uid": RUN_UID},
+                {
+                    "uid": None,
+                    "resource_uid": RUN_UID,
+                    "body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
+                    f'"agenticrun.uid":"{RUN_UID}"}}',
+                },
+                True,
+                False,
+                id="uid-required-on-record",
+            ),
+            pytest.param(
+                {"resource_phase": "analysis"},
+                {
+                    "phase": None,
+                    "resource_phase": "analysis",
+                    "body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
+                    '"agenticrun.phase":"analysis"}',
+                },
+                True,
+                False,
+                id="phase-required-on-record",
+            ),
+            pytest.param({}, {"event": None}, True, False, id="event-required-on-record"),
         ],
     )
-    def test_audit_logs_require_phase_and_event_record_attributes(
+    def test_correlated_telemetry_verifier(
         self,
-        phase: str | None,
-        event: str | None,
-        resource_phase: str | None,
-        body: str,
+        span_options: dict[str, Any] | None,
+        log_options: dict[str, Any] | None,
+        expected_traces: bool,
+        expected_audit: bool,
     ) -> None:
-        logs = self._span_block(
-            span_uid=self.RUN_UID, resource_phase=resource_phase
-        ) + self._log_block(
-            uid=self.RUN_UID,
-            phase=phase,
-            event=event,
-            resource_phase=resource_phase,
-            body=body,
+        logs = f"agenticrun.uid={self.RUN_UID}\n"
+        if span_options is not None:
+            logs += self._span_block(**{"span_uid": self.RUN_UID, **span_options})
+        if log_options is not None:
+            logs += self._log_block(**{"uid": self.RUN_UID, **log_options})
+        assert (
+            logs_contain_traces_for_run(
+                logs,
+                self.RUN_UID,
+                expected_operation=self.EXPECTED_OPERATION,
+                expected_provider=self.EXPECTED_PROVIDER,
+            )
+            is expected_traces
         )
-        assert not logs_contain_audit_logs_for_run(
-            logs,
-            self.RUN_UID,
-            phase="analysis",
-            expected_operation=self.EXPECTED_OPERATION,
-            expected_provider=self.EXPECTED_PROVIDER,
+        assert (
+            logs_contain_audit_logs_for_run(
+                logs,
+                self.RUN_UID,
+                phase="analysis",
+                expected_operation=self.EXPECTED_OPERATION,
+                expected_provider=self.EXPECTED_PROVIDER,
+            )
+            is expected_audit
         )
 
 

@@ -8,11 +8,8 @@ no failure callback.
 from __future__ import annotations
 
 import inspect
-import json
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import suppress
-from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any
@@ -22,6 +19,7 @@ if TYPE_CHECKING:
     from agents.tool import FunctionTool
 
 from lightspeed_agentic.audit import AuditLogger
+from lightspeed_agentic.providers._telemetry_base import _field, _json_arguments, _mapping
 
 _MISSING = object()
 _UNKNOWN_FINISH_REASON = "unknown"
@@ -57,16 +55,12 @@ _TOOL_RESPONSE_TYPES = {
 
 @dataclass
 class _OpenToolSpan:
-    span: Any | None
+    span: Any
     tool: Any
     context_id: int
     call_id: str
-    name: str
-    tool_type: str
-    start_time: int
     arguments: Any
     raw_arguments: str | None
-    error: BaseException | str | None = None
 
 
 @dataclass
@@ -80,36 +74,6 @@ class _FunctionToolPatch:
     active_calls: int = 0
 
 
-@dataclass
-class _ExecutorPatch:
-    session: Any
-    methods: dict[str, tuple[Any, Any]]
-
-
-@dataclass
-class _MCPExtractorPatch:
-    server: Any
-    instance_value: Any
-    wrapped: Any
-
-
-def _field(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name, default)
-    return getattr(value, name, default)
-
-
-def _mapping(value: Any) -> Mapping[str, Any]:
-    if isinstance(value, Mapping):
-        return value
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump(exclude_none=True, by_alias=True)
-        if isinstance(dumped, Mapping):
-            return dumped
-    return {}
-
-
 def _sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
@@ -120,15 +84,6 @@ def _kind(value: Any) -> str | None:
         return kind
     enum_value = getattr(kind, "value", None)
     return enum_value if isinstance(enum_value, str) else None
-
-
-def _json_arguments(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
 
 
 def _tool_call_id(value: Any) -> str:
@@ -159,11 +114,11 @@ def _text_part(text: Any) -> dict[str, Any] | None:
 
 
 def _generic_part(value: Any) -> dict[str, Any] | None:
-    raw = _mapping(value)
+    raw = _mapping(value, exclude_none=True, by_alias=True)
     kind = _kind(value)
     if kind is None:
         return None
-    part = dict(raw)
+    part = dict(raw or {})
     part["type"] = kind
     return part
 
@@ -237,7 +192,7 @@ def _tool_call_part(item: Any, *, nested_function: bool = False) -> dict[str, An
     if arguments is _MISSING:
         arguments = {
             key: value
-            for key, value in _mapping(item).items()
+            for key, value in (_mapping(item, exclude_none=True, by_alias=True) or {}).items()
             if key not in {"type", "id", "call_id", "name", "status", "server_label"}
         }
         if not arguments:
@@ -260,7 +215,7 @@ def _tool_response_part(item: Any) -> dict[str, Any]:
     if response is _MISSING:
         fallback = {
             key: value
-            for key, value in _mapping(item).items()
+            for key, value in (_mapping(item, exclude_none=True, by_alias=True) or {}).items()
             if key not in {"type", "id", "call_id"}
         }
         response = fallback if fallback else _MISSING
@@ -350,7 +305,7 @@ def _tool_definition(tool: Any) -> dict[str, Any] | None:
 
     config = _field(tool, "tool_config")
     if config is not None:
-        definition = _mapping(config)
+        definition = _mapping(config, exclude_none=True, by_alias=True)
         if definition:
             return dict(definition)
 
@@ -866,20 +821,9 @@ def create_model_proxy(
     )
 
 
-def _is_native_view_image_tool(tool: Any) -> bool:
-    """Return whether this is the SDK filesystem tool that reports errors as text."""
-    try:
-        from agents.sandbox.capabilities.tools.view_image import ViewImageTool
-    except ImportError:
-        return False
-    return isinstance(tool, ViewImageTool)
-
-
 def create_tool_hooks(audit_logger: AuditLogger) -> Any:
     """Create native RunHooks only when the OpenAI extra is used."""
     from agents.lifecycle import RunHooks
-    from agents.sandbox import ExecTimeoutError
-    from agents.sandbox.errors import PtySessionNotFoundError
     from agents.tool import (
         FunctionTool,
         resolve_function_tool_failure_error_function,
@@ -887,169 +831,12 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
     )
 
     class OpenAIToolRunHooks(RunHooks[Any]):
-        """Record SDK-native local tool starts/ends and exceptions hidden by tool wrappers."""
+        """Record native tool callbacks and FunctionTool exceptions."""
 
         def __init__(self, audit_logger: AuditLogger) -> None:
             self._audit_logger = audit_logger
             self._pending: list[_OpenToolSpan] = []
             self._function_tool_patches: dict[int, _FunctionToolPatch] = {}
-            self._executor_patches: dict[int, _ExecutorPatch] = {}
-            self._mcp_extractor_patches: dict[int, _MCPExtractorPatch] = {}
-            self._active_tool_span: ContextVar[_OpenToolSpan | None] = ContextVar(
-                f"openai_tool_span_{id(self)}", default=None
-            )
-            self._deferred_apply_patch_tools: set[int] = set()
-
-        def configure_shell_tools(self, toolset: Any) -> None:
-            """Observe native shell/PTY failures before tools format them as text."""
-            tool = _field(toolset, "exec_command")
-            session = _field(tool, "session")
-            if tool is None or session is None or id(session) in self._executor_patches:
-                return
-
-            patch = _ExecutorPatch(session=session, methods={})
-            self._executor_patches[id(session)] = patch
-            instance_attributes = getattr(session, "__dict__", {})
-            try:
-                for method_name in ("exec", "pty_exec_start", "pty_write_stdin"):
-                    original = getattr(session, method_name, None)
-                    if not callable(original):
-                        continue
-
-                    @wraps(original)
-                    async def instrumented(
-                        *args: Any,
-                        _original: Any = original,
-                        _method_name: str = method_name,
-                        **kwargs: Any,
-                    ) -> Any:
-                        try:
-                            result = _original(*args, **kwargs)
-                            if inspect.isawaitable(result):
-                                result = await result
-                            return result
-                        except (
-                            ExecTimeoutError,
-                            TimeoutError,
-                            PtySessionNotFoundError,
-                            RuntimeError,
-                        ) as error:
-                            pending = self._active_tool_span.get()
-                            if pending is not None and (
-                                (
-                                    pending.name == "exec_command"
-                                    and _method_name in {"exec", "pty_exec_start"}
-                                    and isinstance(error, (ExecTimeoutError, TimeoutError))
-                                )
-                                or (
-                                    pending.name == "write_stdin"
-                                    and _method_name == "pty_write_stdin"
-                                    and isinstance(error, (PtySessionNotFoundError, RuntimeError))
-                                )
-                            ):
-                                pending.error = error
-                            raise
-
-                    instance_value = instance_attributes.get(method_name, _MISSING)
-                    try:
-                        setattr(session, method_name, instrumented)
-                    except (AttributeError, TypeError):
-                        continue
-                    patch.methods[method_name] = (instance_value, instrumented)
-            except BaseException:
-                self._restore_executor_patch(patch)
-                self._executor_patches.pop(id(session), None)
-                raise
-
-            if not patch.methods:
-                self._executor_patches.pop(id(session), None)
-
-        def configure_mcp_servers(self, servers: Sequence[Any]) -> None:
-            """Observe MCP isError flags through the SDK's custom-data extension."""
-            for server in servers:
-                server_id = id(server)
-                if server_id in self._mcp_extractor_patches:
-                    continue
-
-                original = _field(server, "custom_data_extractor")
-
-                async def extract_custom_data(
-                    context: Any,
-                    _original: Any = original,
-                    _server: Any = server,
-                ) -> Any:
-                    custom_data = None
-                    if callable(_original):
-                        custom_data = _original(context)
-                        if inspect.isawaitable(custom_data):
-                            custom_data = await custom_data
-
-                    pending = self._active_tool_span.get()
-                    if (
-                        _field(context, "is_error") is True
-                        and pending is not None
-                        and pending.name == _field(context, "tool_display_name")
-                        and _field(context, "server_name") == _field(_server, "name")
-                    ):
-                        pending.error = "mcp_tool_error"
-                    return custom_data
-
-                instance_value = getattr(server, "__dict__", {}).get(
-                    "custom_data_extractor", _MISSING
-                )
-                try:
-                    server.custom_data_extractor = extract_custom_data
-                except (AttributeError, TypeError):
-                    continue
-                self._mcp_extractor_patches[server_id] = _MCPExtractorPatch(
-                    server=server,
-                    instance_value=instance_value,
-                    wrapped=extract_custom_data,
-                )
-
-        def configure_filesystem_tools(self, toolset: Any) -> None:
-            """Capture apply_patch editor operations absent from its RunHooks context."""
-            tool = _field(toolset, "apply_patch")
-            editor = _field(tool, "editor")
-            if tool is None or editor is None:
-                return
-
-            self._deferred_apply_patch_tools.add(id(tool))
-            for method_name in ("create_file", "update_file", "delete_file"):
-                original = getattr(editor, method_name, None)
-                if not callable(original):
-                    continue
-
-                @wraps(original)
-                async def instrumented(
-                    operation: Any,
-                    _original: Any = original,
-                    _tool: Any = tool,
-                ) -> Any:
-                    context = _field(operation, "ctx_wrapper")
-                    pending = self._find_pending(context, _tool)
-                    if pending is not None:
-                        if pending.arguments is None:
-                            pending.arguments = []
-                        pending.arguments.append(
-                            {
-                                field_name: _field(operation, field_name)
-                                for field_name in ("type", "path", "diff", "move_to")
-                            }
-                        )
-                    try:
-                        result = _original(operation)
-                        if inspect.isawaitable(result):
-                            result = await result
-                    except BaseException as error:
-                        if pending is not None:
-                            pending.error = error
-                        raise
-                    if pending is not None and _field(result, "status") == "failed":
-                        pending.error = "apply_patch_failed"
-                    return result
-
-                setattr(editor, method_name, instrumented)
 
         async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
             del agent
@@ -1063,27 +850,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             if not isinstance(tool_type, str) or not tool_type:
                 tool_type = "function"
             start_time = time.time_ns()
-            if (
-                id(tool) in self._deferred_apply_patch_tools
-                and _field(context, "tool_arguments", _MISSING) is _MISSING
-            ):
-                # ApplyPatchAction omits request data from RunHooks; retain its native start
-                # and collect parsed editor operations before writing span content.
-                self._pending.append(
-                    _OpenToolSpan(
-                        span=None,
-                        tool=tool,
-                        context_id=id(context),
-                        call_id=call_id,
-                        name=name,
-                        tool_type=tool_type,
-                        start_time=start_time,
-                        arguments=None,
-                        raw_arguments=raw_arguments,
-                    )
-                )
-                return
-
             patch: _FunctionToolPatch | None = None
             if isinstance(tool, FunctionTool):
                 patch = self._patch_function_tool(tool)
@@ -1108,9 +874,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
                     tool=tool,
                     context_id=id(context),
                     call_id=call_id,
-                    name=name,
-                    tool_type=tool_type,
-                    start_time=start_time,
                     arguments=arguments,
                     raw_arguments=raw_arguments,
                 )
@@ -1120,12 +883,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             del agent
             pending = self._take_pending(context, tool)
             if pending is not None:
-                if (
-                    pending.name == "view_image"
-                    and isinstance(result, str)
-                    and _is_native_view_image_tool(pending.tool)
-                ):
-                    pending.error = "view_image_failed"
                 self._finish_pending(pending, result=result)
 
         def close(self, error: BaseException | str = "operation_cancelled") -> None:
@@ -1136,23 +893,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             for patch in list(self._function_tool_patches.values()):
                 patch.active_calls = 0
                 self._restore_function_tool(patch)
-            for executor_patch in list(self._executor_patches.values()):
-                self._restore_executor_patch(executor_patch)
-            self._executor_patches.clear()
-
-            for extractor_patch in list(self._mcp_extractor_patches.values()):
-                if (
-                    getattr(extractor_patch.server, "custom_data_extractor", None)
-                    is extractor_patch.wrapped
-                ):
-                    if extractor_patch.instance_value is _MISSING:
-                        with suppress(AttributeError):
-                            delattr(extractor_patch.server, "custom_data_extractor")
-                    else:
-                        extractor_patch.server.custom_data_extractor = (
-                            extractor_patch.instance_value
-                        )
-            self._mcp_extractor_patches.clear()
 
         def _patch_function_tool(self, tool: FunctionTool) -> _FunctionToolPatch:
             existing = self._function_tool_patches.get(id(tool))
@@ -1165,7 +905,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             effective_failure = resolve_function_tool_failure_error_function(tool)
 
             async def wrapped_invoke(context: Any, raw_arguments: str) -> Any:
-                token = self._active_tool_span.set(self._find_pending(context, tool))
                 try:
                     result = original_invoke(context, raw_arguments)
                     if inspect.isawaitable(result):
@@ -1174,8 +913,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
                 except BaseException as error:
                     self._finish_error(tool, context, error, raw_arguments=raw_arguments)
                     raise
-                finally:
-                    self._active_tool_span.reset(token)
 
             wrapped_failure: Any = None
             if effective_failure is not None:
@@ -1204,17 +941,6 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
                 set_function_tool_failure_error_function(tool, wrapped_failure)
             return patch
 
-        def _restore_executor_patch(self, patch: _ExecutorPatch) -> None:
-            for method_name, (instance_value, wrapped) in patch.methods.items():
-                if getattr(patch.session, method_name, None) is not wrapped:
-                    continue
-                if instance_value is _MISSING:
-                    with suppress(AttributeError):
-                        delattr(patch.session, method_name)
-                else:
-                    setattr(patch.session, method_name, instance_value)
-            patch.methods.clear()
-
         def _finish_error(
             self,
             tool: FunctionTool,
@@ -1227,49 +953,36 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             if pending is not None:
                 self._finish_pending(pending, error=error)
 
-        def _find_pending(self, context: Any, tool: Any) -> _OpenToolSpan | None:
+        def _pending_index(
+            self, context: Any, tool: Any, raw_arguments: str | None = None
+        ) -> int | None:
             call_id = _tool_call_id(context)
-            if call_id:
+            criteria = (
+                [("call_id", call_id)]
+                if call_id
+                else [
+                    ("context_id", id(context)),
+                    (
+                        "raw_arguments",
+                        raw_arguments
+                        if raw_arguments is not None
+                        else _field(context, "tool_arguments", _MISSING),
+                    ),
+                    ("arguments", _field(context, "tool_input", _MISSING)),
+                    ("tool", tool),
+                ]
+            )
+            for field_name, value in criteria:
+                if value is _MISSING:
+                    continue
                 matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.call_id == call_id
+                    index
+                    for index, pending in enumerate(self._pending)
+                    if pending.tool is tool and getattr(pending, field_name) == value
                 ]
                 if len(matches) == 1:
                     return matches[0]
-                return None
-
-            context_id = id(context)
-            matches = [
-                pending
-                for pending in self._pending
-                if pending.tool is tool and pending.context_id == context_id
-            ]
-            if len(matches) == 1:
-                return matches[0]
-
-            raw_arguments = _field(context, "tool_arguments", _MISSING)
-            if raw_arguments is not _MISSING:
-                matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.raw_arguments == raw_arguments
-                ]
-                if len(matches) == 1:
-                    return matches[0]
-
-            tool_input = _field(context, "tool_input", _MISSING)
-            if tool_input is not _MISSING:
-                matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.arguments == tool_input
-                ]
-                if len(matches) == 1:
-                    return matches[0]
-
-            matches = [pending for pending in self._pending if pending.tool is tool]
-            return matches[0] if len(matches) == 1 else None
+            return None
 
         def _take_pending(
             self,
@@ -1278,48 +991,8 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             *,
             raw_arguments: str | None = None,
         ) -> _OpenToolSpan | None:
-            call_id = _tool_call_id(context)
-            if call_id:
-                matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.call_id == call_id
-                ]
-                if len(matches) == 1:
-                    self._pending.remove(matches[0])
-                    return matches[0]
-                return None
-
-            for index, pending in enumerate(self._pending):
-                if pending.tool is tool and pending.context_id == id(context):
-                    return self._pending.pop(index)
-
-            if raw_arguments is not None:
-                matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.raw_arguments == raw_arguments
-                ]
-                if len(matches) == 1:
-                    self._pending.remove(matches[0])
-                    return matches[0]
-
-            tool_input = _field(context, "tool_input", _MISSING)
-            if tool_input is not _MISSING:
-                matches = [
-                    pending
-                    for pending in self._pending
-                    if pending.tool is tool and pending.arguments == tool_input
-                ]
-                if len(matches) == 1:
-                    self._pending.remove(matches[0])
-                    return matches[0]
-
-            matches = [pending for pending in self._pending if pending.tool is tool]
-            if len(matches) == 1:
-                self._pending.remove(matches[0])
-                return matches[0]
-            return None
+            index = self._pending_index(context, tool, raw_arguments)
+            return self._pending.pop(index) if index is not None else None
 
         def _finish_pending(
             self,
@@ -1328,23 +1001,12 @@ def create_tool_hooks(audit_logger: AuditLogger) -> Any:
             result: Any = None,
             error: BaseException | str | None = None,
         ) -> None:
-            effective_error = pending.error if pending.error is not None else error
-            end_time = time.time_ns()
             try:
-                span = pending.span
-                if span is None:
-                    span = self._audit_logger.start_tool(
-                        name=pending.name,
-                        call_id=pending.call_id,
-                        arguments=pending.arguments,
-                        tool_type=pending.tool_type,
-                        start_time=pending.start_time,
-                    )
                 self._audit_logger.end_tool(
-                    span,
-                    result=result if effective_error is None else None,
-                    error=effective_error,
-                    end_time=end_time,
+                    pending.span,
+                    result=result if error is None else None,
+                    error=error,
+                    end_time=time.time_ns(),
                 )
             finally:
                 if isinstance(pending.tool, FunctionTool):

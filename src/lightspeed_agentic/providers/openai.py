@@ -305,23 +305,14 @@ class OpenAIProvider(AgentProvider):
             tool_hooks = create_tool_hooks(options.audit_logger)
             model_proxy_factory = create_model_proxy
 
-        capabilities.append(
-            Shell(configure_tools=tool_hooks.configure_shell_tools)
-            if tool_hooks is not None
-            else Shell()
-        )
+        capabilities.append(Shell())
 
         if is_native:
             from agents.models.openai_responses import OpenAIResponsesModel
 
             model: Any = OpenAIResponsesModel(model=options.model, openai_client=self._client)
             # Native OpenAI: use full Filesystem() capability
-            if tool_hooks is not None:
-                capabilities.append(
-                    Filesystem(configure_tools=tool_hooks.configure_filesystem_tools)
-                )
-            else:
-                capabilities.append(Filesystem())
+            capabilities.append(Filesystem())
         else:
             from agents.models.openai_chatcompletions import (
                 OpenAIChatCompletionsModel,
@@ -402,10 +393,6 @@ class OpenAIProvider(AgentProvider):
                 raise
 
         try:
-            if tool_hooks is not None and mcp_servers_for_agent:
-                # Instrument before either route builds MCP FunctionTools.
-                tool_hooks.configure_mcp_servers(mcp_servers_for_agent)
-
             if not is_native and mcp_servers_for_agent and function_tools_list is not None:
                 function_tools_list.extend(await _build_mcp_function_tools(mcp_servers_for_agent))
 

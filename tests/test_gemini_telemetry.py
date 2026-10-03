@@ -23,36 +23,12 @@ from lightspeed_agentic.providers.gemini_telemetry import (
 from lightspeed_agentic.types import MAX_TOOL_RETURN_CHARS, TOOL_RETURN_PREVIEW_CHARS
 
 
-class _Recorder:
-    def __init__(self) -> None:
-        self.inference_starts: list[tuple[Any, dict[str, Any]]] = []
-        self.inference_ends: list[tuple[Any, dict[str, Any]]] = []
-        self.tool_starts: list[tuple[Any, dict[str, Any]]] = []
-        self.tool_ends: list[tuple[Any, dict[str, Any]]] = []
-
-    def start_inference(self, **attributes: Any) -> object:
-        span = object()
-        self.inference_starts.append((span, attributes))
-        return span
-
-    def end_inference(self, span: Any, **attributes: Any) -> None:
-        self.inference_ends.append((span, attributes))
-
-    def start_tool(self, **attributes: Any) -> object:
-        span = object()
-        self.tool_starts.append((span, attributes))
-        return span
-
-    def end_tool(self, span: Any, **attributes: Any) -> None:
-        self.tool_ends.append((span, attributes))
-
-
 class _FinishReason(Enum):
     STOP = "STOP"
 
 
-def test_model_callbacks_record_standard_request_and_terminal_response() -> None:
-    recorder = _Recorder()
+def test_model_callbacks_record_standard_request_and_terminal_response(audit_recorder: Any) -> None:
+    recorder = audit_recorder
     telemetry = GeminiTelemetry(recorder, requested_model="configured-model")
     callback_context = object()
     request = SimpleNamespace(
@@ -62,9 +38,6 @@ def test_model_callbacks_record_standard_request_and_terminal_response() -> None
                 role="user",
                 parts=[
                     SimpleNamespace(text="question", thought=False),
-                    SimpleNamespace(
-                        inline_data=SimpleNamespace(mime_type="image/png", data=b"\x00")
-                    ),
                 ],
             ),
             SimpleNamespace(
@@ -138,12 +111,6 @@ def test_model_callbacks_record_standard_request_and_terminal_response() -> None
             "role": "user",
             "parts": [
                 {"type": "text", "content": "question"},
-                {
-                    "type": "blob",
-                    "modality": "image",
-                    "content": "AA==",
-                    "mime_type": "image/png",
-                },
             ],
         },
         {
@@ -241,8 +208,10 @@ def test_model_callbacks_record_standard_request_and_terminal_response() -> None
     assert isinstance(end["end_time"], int)
 
 
-def test_terminal_response_uses_buffered_parts_and_unknown_finish_reason() -> None:
-    recorder = _Recorder()
+def test_terminal_response_uses_buffered_parts_and_unknown_finish_reason(
+    audit_recorder: Any,
+) -> None:
+    recorder = audit_recorder
     telemetry = GeminiTelemetry(recorder, requested_model="requested-model")
     context = object()
 
@@ -322,8 +291,8 @@ def test_candidate_only_usage_records_output_without_inventing_reasoning(
     assert REGISTRY.get_sample_value("gen_ai_client_token_usage_sum", labels) == before + 5
 
 
-def test_model_error_records_only_observed_usage_and_partial_text() -> None:
-    recorder = _Recorder()
+def test_model_error_records_only_observed_usage_and_partial_text(audit_recorder: Any) -> None:
+    recorder = audit_recorder
     telemetry = GeminiTelemetry(recorder, requested_model="requested-model")
     context = object()
     request = SimpleNamespace(model="requested-model", contents=[], config=None)
@@ -358,8 +327,10 @@ def test_model_error_records_only_observed_usage_and_partial_text() -> None:
     assert end["reasoning_tokens"] == 0
 
 
-def test_tool_callbacks_record_raw_result_before_trim_and_omit_failed_result() -> None:
-    recorder = _Recorder()
+def test_tool_callbacks_record_raw_result_before_trim_and_omit_failed_result(
+    audit_recorder: Any,
+) -> None:
+    recorder = audit_recorder
     telemetry = GeminiTelemetry(recorder, requested_model="model")
     tool = SimpleNamespace(name="execute_bash")
     args = {"command": "printf output"}
@@ -419,8 +390,8 @@ def test_native_adk_tracing_suppression_is_module_scoped(monkeypatch: Any) -> No
     assert trace.get_tracer_provider() is provider
 
 
-def test_pending_response_ignores_partial_and_wrong_model_events() -> None:
-    recorder = _Recorder()
+def test_pending_response_ignores_partial_and_wrong_model_events(audit_recorder: Any) -> None:
+    recorder = audit_recorder
     telemetry = GeminiTelemetry(recorder, requested_model="requested-model")
     context = SimpleNamespace(agent_name="lightspeed", invocation_id="run-1")
     request = SimpleNamespace(model="requested-model", contents=[], config=SimpleNamespace())

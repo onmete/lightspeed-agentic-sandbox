@@ -8,31 +8,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from lightspeed_agentic.providers._telemetry_base import _field, _json_arguments, _mapping
+
 if TYPE_CHECKING:
     from lightspeed_agentic.audit import AuditLogger
 
 _UNSET = object()
-
-
-def _mapping(value: Any) -> Mapping[str, Any] | None:
-    if isinstance(value, Mapping):
-        return value
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump()
-        if isinstance(dumped, Mapping):
-            return dumped
-    return None
-
-
-def _get(value: Any, key: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(key, default)
-    attribute = getattr(value, key, _UNSET)
-    if attribute is not _UNSET:
-        return attribute
-    mapped = _mapping(value)
-    return mapped.get(key, default) if mapped is not None else default
 
 
 def _as_string(value: Any) -> str | None:
@@ -51,27 +32,18 @@ def _json_text(value: Any) -> str:
         return str(value)
 
 
-def _normalise_arguments(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return value
-    return value
-
-
 def _block_type(block: Any) -> str:
-    return _as_string(_get(block, "type")) or ""
+    return _as_string(_field(block, "type")) or ""
 
 
 def _part_from_block(block: Any) -> dict[str, Any] | None:
     kind = _block_type(block)
     if kind in {"text", "reasoning"}:
-        content = _get(block, "content")
+        content = _field(block, "content")
         if content is None:
-            content = _get(block, "text")
+            content = _field(block, "text")
         if content is None and kind == "reasoning":
-            content = _get(block, "reasoning")
+            content = _field(block, "reasoning")
         if content is None:
             return None
         return {
@@ -79,29 +51,29 @@ def _part_from_block(block: Any) -> dict[str, Any] | None:
             "content": content if isinstance(content, str) else _json_text(content),
         }
     if kind in {"tool_call", "tool_use"}:
-        name = _as_string(_get(block, "name"))
+        name = _as_string(_field(block, "name"))
         if name is None:
             return None
         part: dict[str, Any] = {"type": "tool_call", "name": name}
-        call_id = _as_string(_get(block, "id"))
+        call_id = _as_string(_field(block, "id"))
         if call_id:
             part["id"] = call_id
-        arguments = _get(block, "arguments", _UNSET)
+        arguments = _field(block, "arguments", _UNSET)
         if arguments is _UNSET:
-            arguments = _get(block, "args", _UNSET)
+            arguments = _field(block, "args", _UNSET)
         if arguments is _UNSET:
-            arguments = _get(block, "input", _UNSET)
+            arguments = _field(block, "input", _UNSET)
         if arguments is not _UNSET:
-            part["arguments"] = _normalise_arguments(arguments)
+            part["arguments"] = _json_arguments(arguments)
         return part
     if kind == "tool_call_response":
-        response = _get(block, "response", _UNSET)
+        response = _field(block, "response", _UNSET)
         if response is _UNSET:
-            response = _get(block, "result", _UNSET)
+            response = _field(block, "result", _UNSET)
         if response is _UNSET:
             return None
         part = {"type": kind, "response": response}
-        call_id = _as_string(_get(block, "id"))
+        call_id = _as_string(_field(block, "id"))
         if call_id:
             part["id"] = call_id
         return part
@@ -134,7 +106,7 @@ def _content_parts(content: Any) -> list[dict[str, Any]]:
 
 
 def _message_role(message: Any) -> str:
-    role = _as_string(_get(message, "type")) or _as_string(_get(message, "role")) or ""
+    role = _as_string(_field(message, "type")) or _as_string(_field(message, "role")) or ""
     return {
         "ai": "assistant",
         "assistant": "assistant",
@@ -149,23 +121,23 @@ def _message_role(message: Any) -> str:
 
 def _message_calls(message: Any) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
-    for call in _get(message, "tool_calls", ()) or ():
-        name = _as_string(_get(call, "name"))
+    for call in _field(message, "tool_calls", ()) or ():
+        name = _as_string(_field(call, "name"))
         if name is None:
             continue
-        call_id = _as_string(_get(call, "id")) or _as_string(_get(call, "tool_call_id")) or ""
-        arguments = _get(call, "args", _UNSET)
+        call_id = _as_string(_field(call, "id")) or _as_string(_field(call, "tool_call_id")) or ""
+        arguments = _field(call, "args", _UNSET)
         if arguments is _UNSET:
-            arguments = _get(call, "arguments", _UNSET)
+            arguments = _field(call, "arguments", _UNSET)
         calls.append(
             {
                 "name": name,
                 "call_id": call_id,
-                "arguments": None if arguments is _UNSET else _normalise_arguments(arguments),
+                "arguments": None if arguments is _UNSET else _json_arguments(arguments),
             }
         )
 
-    blocks = _get(message, "content_blocks")
+    blocks = _field(message, "content_blocks")
     if isinstance(blocks, (list, tuple)):
         for block in blocks:
             part = _part_from_block(block)
@@ -183,14 +155,14 @@ def _message_calls(message: Any) -> list[dict[str, Any]]:
             )
             if not duplicate:
                 calls.append({"name": name, "call_id": call_id, "arguments": arguments})
-    additional = _mapping(_get(message, "additional_kwargs")) or {}
+    additional = _mapping(_field(message, "additional_kwargs")) or {}
     for call in additional.get("tool_calls", ()) or ():
-        function = _mapping(_get(call, "function")) or {}
-        name = _as_string(function.get("name")) or _as_string(_get(call, "name"))
+        function = _mapping(_field(call, "function")) or {}
+        name = _as_string(function.get("name")) or _as_string(_field(call, "name"))
         if name is None:
             continue
-        call_id = _as_string(_get(call, "id")) or ""
-        arguments = _normalise_arguments(function.get("arguments", _get(call, "arguments")))
+        call_id = _as_string(_field(call, "id")) or ""
+        arguments = _json_arguments(function.get("arguments", _field(call, "arguments")))
         duplicate = any(
             (call_id and existing["call_id"] == call_id)
             or (not call_id and existing["name"] == name and existing["arguments"] == arguments)
@@ -203,13 +175,16 @@ def _message_calls(message: Any) -> list[dict[str, Any]]:
 
 def _message_parts(message: Any) -> list[dict[str, Any]]:
     if _message_role(message) == "tool":
-        part: dict[str, Any] = {"type": "tool_call_response", "response": _get(message, "content")}
-        call_id = _as_string(_get(message, "tool_call_id"))
+        part: dict[str, Any] = {
+            "type": "tool_call_response",
+            "response": _field(message, "content"),
+        }
+        call_id = _as_string(_field(message, "tool_call_id"))
         if call_id:
             part["id"] = call_id
         return [part]
 
-    blocks = _get(message, "content_blocks")
+    blocks = _field(message, "content_blocks")
     if isinstance(blocks, (list, tuple)) and blocks:
         parts: list[dict[str, Any]] = []
         for block in blocks:
@@ -217,7 +192,7 @@ def _message_parts(message: Any) -> list[dict[str, Any]]:
             if content_part is not None:
                 parts.append(content_part)
     else:
-        parts = _content_parts(_get(message, "content"))
+        parts = _content_parts(_field(message, "content"))
 
     for call in _message_calls(message):
         existing = next(
@@ -268,7 +243,7 @@ def _input_payload(messages: Any) -> tuple[list[dict[str, Any]], list[dict[str, 
             instructions.extend(parts)
             continue
         item: dict[str, Any] = {"role": role or "unknown", "parts": parts}
-        name = _as_string(_get(message, "name"))
+        name = _as_string(_field(message, "name"))
         if name:
             item["name"] = name
         input_messages.append(item)
@@ -276,7 +251,7 @@ def _input_payload(messages: Any) -> tuple[list[dict[str, Any]], list[dict[str, 
 
 
 def _generation_groups(response: Any) -> list[Any]:
-    generations = _get(response, "generations")
+    generations = _field(response, "generations")
     if not isinstance(generations, (list, tuple)):
         return []
     flattened: list[Any] = []
@@ -289,11 +264,11 @@ def _generation_groups(response: Any) -> list[Any]:
 
 
 def _finish_reason(generation: Any) -> str:
-    message = _get(generation, "message")
+    message = _field(generation, "message")
     for source in (
-        _mapping(_get(generation, "generation_info")) or {},
-        _mapping(_get(message, "response_metadata")) or {},
-        _mapping(_get(message, "additional_kwargs")) or {},
+        _mapping(_field(generation, "generation_info")) or {},
+        _mapping(_field(message, "response_metadata")) or {},
+        _mapping(_field(message, "additional_kwargs")) or {},
     ):
         for key in ("finish_reason", "stop_reason", "finishReason", "stopReason"):
             value = source.get(key)
@@ -309,9 +284,9 @@ def _output_messages(response: Any) -> tuple[list[dict[str, Any]] | None, list[s
     messages: list[dict[str, Any]] = []
     finish_reasons: list[str] = []
     for generation in generations:
-        message = _get(generation, "message")
+        message = _field(generation, "message")
         if message is None:
-            parts = _content_parts(_get(generation, "text"))
+            parts = _content_parts(_field(generation, "text"))
             role = "assistant"
         else:
             parts = _message_parts(message)
@@ -324,7 +299,7 @@ def _output_messages(response: Any) -> tuple[list[dict[str, Any]] | None, list[s
 
 def _metadata_sources(response: Any) -> list[Mapping[str, Any]]:
     sources: list[Mapping[str, Any]] = []
-    llm_output = _mapping(_get(response, "llm_output")) or {}
+    llm_output = _mapping(_field(response, "llm_output")) or {}
     for key in ("token_usage", "usage", "usage_metadata"):
         nested = _mapping(llm_output.get(key))
         if nested is not None:
@@ -332,19 +307,19 @@ def _metadata_sources(response: Any) -> list[Mapping[str, Any]]:
     if llm_output:
         sources.append(llm_output)
     for value in (
-        _get(response, "token_usage"),
-        _get(response, "usage"),
-        _get(response, "usage_metadata"),
+        _field(response, "token_usage"),
+        _field(response, "usage"),
+        _field(response, "usage_metadata"),
     ):
         nested = _mapping(value)
         if nested is not None:
             sources.append(nested)
     for generation in _generation_groups(response):
-        message = _get(generation, "message")
+        message = _field(generation, "message")
         for value in (
-            _get(message, "usage_metadata"),
-            _get(message, "response_metadata"),
-            _get(generation, "generation_info"),
+            _field(message, "usage_metadata"),
+            _field(message, "response_metadata"),
+            _field(generation, "generation_info"),
         ):
             nested = _mapping(value)
             if nested is not None:
@@ -379,11 +354,11 @@ def _reasoning_token_count(sources: list[Mapping[str, Any]]) -> int | None:
 
 
 def _response_model(response: Any) -> str | None:
-    llm_output = _mapping(_get(response, "llm_output")) or {}
-    response_metadata = _mapping(_get(response, "response_metadata")) or {}
+    llm_output = _mapping(_field(response, "llm_output")) or {}
+    response_metadata = _mapping(_field(response, "response_metadata")) or {}
     sources = [llm_output, response_metadata]
     sources.extend(
-        _mapping(_get(_get(generation, "message"), "response_metadata")) or {}
+        _mapping(_field(_field(generation, "message"), "response_metadata")) or {}
         for generation in _generation_groups(response)
     )
     for source in sources:
@@ -452,7 +427,7 @@ def _tool_input(inputs: Any, input_str: Any) -> Any:
     if inputs is not None:
         return inputs
     if isinstance(input_str, str) and input_str:
-        return _normalise_arguments(input_str)
+        return _json_arguments(input_str)
     return None
 
 
@@ -497,7 +472,7 @@ def create_callback_handler(
             **kwargs: Any,
         ) -> None:
             del parent_run_id
-            sources = (invocation_params, options, kwargs, _get(serialized, "kwargs"), serialized)
+            sources = (invocation_params, options, kwargs, _field(serialized, "kwargs"), serialized)
             request_model = _request_model(sources, model)
             if self._capture_content:
                 input_messages, system_instructions = _input_payload(messages)
@@ -573,7 +548,7 @@ def create_callback_handler(
             del parent_run_id
             if not self._capture_content:
                 return
-            name = _as_string(kwargs.get("name")) or _as_string(_get(serialized, "name"))
+            name = _as_string(kwargs.get("name")) or _as_string(_field(serialized, "name"))
             if name is None:
                 return
             arguments = _tool_input(inputs, input_str)

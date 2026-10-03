@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from lightspeed_agentic.providers._telemetry_base import _field
+
 if TYPE_CHECKING:
     from lightspeed_agentic.audit import AuditLogger
 
@@ -414,52 +416,6 @@ def _message_parts(content: Any) -> list[dict[str, Any]]:
                 response_part["response"] = _json_value(response)
             normalized.append(response_part)
 
-        inline_data = _field(part, "inline_data")
-        if inline_data is not None:
-            data = _field(inline_data, "data", _MISSING)
-            if data is not _MISSING and data is not None:
-                mime_type = _field(inline_data, "mime_type")
-                blob: dict[str, Any] = {
-                    "type": "blob",
-                    "modality": _modality(mime_type),
-                    "content": _json_value(data),
-                }
-                if mime_type is not None:
-                    blob["mime_type"] = mime_type
-                normalized.append(blob)
-
-        file_data = _field(part, "file_data")
-        if file_data is not None:
-            uri = _field(file_data, "file_uri")
-            file_id = _field(file_data, "file_id")
-            mime_type = _field(file_data, "mime_type")
-            if uri:
-                file_part: dict[str, Any] = {
-                    "type": "uri",
-                    "modality": _modality(mime_type),
-                    "uri": uri,
-                }
-            elif file_id:
-                file_part = {
-                    "type": "file",
-                    "modality": _modality(mime_type),
-                    "file_id": file_id,
-                }
-            else:
-                file_part = {"type": "file", **_json_value(file_data)}
-            if mime_type is not None:
-                file_part["mime_type"] = mime_type
-            normalized.append(file_part)
-
-        for field_name in ("executable_code", "code_execution_result"):
-            value = _field(part, field_name)
-            if value is not None:
-                normalized.append(_generic_part(field_name, value))
-
-        video_metadata = _field(part, "video_metadata")
-        if video_metadata is not None:
-            normalized.append(_generic_part("video_metadata", video_metadata))
-
     return normalized
 
 
@@ -537,21 +493,6 @@ def _finish_reason(value: Any) -> str:
     return reason.lower() if reason else "unknown"
 
 
-def _modality(mime_type: Any) -> str:
-    if mime_type:
-        modality = str(mime_type).partition("/")[0].lower()
-        if modality in {"audio", "image", "video"}:
-            return modality
-    return "unknown"
-
-
-def _generic_part(part_type: str, value: Any) -> dict[str, Any]:
-    serialized = _json_value(value)
-    if isinstance(serialized, Mapping):
-        return {"type": part_type, **serialized}
-    return {"type": part_type, "content": serialized}
-
-
 def _object_fields(value: Any) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
@@ -585,9 +526,3 @@ def _json_value(value: Any) -> Any:
             dumped = model_dump(exclude_none=True)
         return _json_value(dumped)
     return value
-
-
-def _field(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name, default)
-    return getattr(value, name, default)
