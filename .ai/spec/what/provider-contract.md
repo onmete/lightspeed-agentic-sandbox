@@ -106,6 +106,8 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 42. The Gemini adapter MUST support the declared optional dependency floor `google-adk>=2.5.0`; provider SDK imports MUST remain lazy so absent extras do not break base-package imports. ADK's process-wide native-telemetry alias suppression is applied once within the sandbox's one-shot batch process; this does not define a reusable per-invocation toggle or a long-lived, multi-run process contract.
 43. Gemini telemetry MUST observe the finalized ADK model Event after call-ID population. Record SDK-assigned IDs unchanged on model-output tool-call parts and actual tool spans, but leave them absent from subsequent effective request history when ADK intentionally strips them. Supplied provider IDs remain unchanged; missing IDs MUST NOT be fabricated, and an exact join requires a common ID exposed at both boundaries.
 
+44. OpenAI telemetry MUST remain importable without the optional OpenAI extra. SDK model-proxy and tool-hook subclasses are created inside lazy factories invoked by the adapter, not at module import time.
+
 ### Tool-Result Prompt-Injection Inspection
 
  1. **Normative source.** The sandbox MUST conform to `openshift/ols/.ai/spec/what/tool-result-inspection.md`.

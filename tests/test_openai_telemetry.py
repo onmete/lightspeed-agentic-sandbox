@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -91,7 +92,7 @@ def _message(text: str) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 async def test_model_proxy_records_actual_request_and_response() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     input_items = [
@@ -125,7 +126,7 @@ async def test_model_proxy_records_actual_request_and_response() -> None:
         ),
     )
     delegate: Any = _FakeModel(response=response)
-    proxy = OpenAIModelProxy(delegate, audit, request_model="gpt-4.1-mini", native_responses=True)
+    proxy = create_model_proxy(delegate, audit, request_model="gpt-4.1-mini", native_responses=True)
 
     await proxy.get_response(
         "system prompt",
@@ -190,7 +191,7 @@ async def test_model_proxy_records_actual_request_and_response() -> None:
 
 @pytest.mark.asyncio
 async def test_chat_proxy_uses_normalized_response_without_fabricated_metadata() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     response = SimpleNamespace(
@@ -202,7 +203,7 @@ async def test_chat_proxy_uses_normalized_response_without_fabricated_metadata()
             output_tokens_details=SimpleNamespace(reasoning_tokens=0),
         ),
     )
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(response=response),
         audit,
         request_model="offline-model",
@@ -232,14 +233,14 @@ async def test_chat_proxy_uses_normalized_response_without_fabricated_metadata()
 async def test_chat_stream_omits_unavailable_model_and_default_usage() -> None:
     from agents.usage import Usage
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     completed = SimpleNamespace(
         type="response.completed",
         response=SimpleNamespace(output=[_message("done")], usage=Usage()),
     )
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[completed]),
         audit,
         request_model="offline-model",
@@ -258,7 +259,7 @@ async def test_chat_stream_omits_unavailable_model_and_default_usage() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_proxy_records_native_response_metadata_and_zero_usage() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     delta = SimpleNamespace(type="response.output_text.delta", delta="done")
@@ -272,7 +273,7 @@ async def test_stream_proxy_records_native_response_metadata_and_zero_usage() ->
         ),
     )
     completed = SimpleNamespace(type="response.completed", response=response)
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[delta, completed]),
         audit,
         request_model="gpt-4.1",
@@ -298,7 +299,7 @@ async def test_non_streaming_native_response_preserves_observed_zero_reasoning_t
     from prometheus_client import REGISTRY
 
     from lightspeed_agentic.audit import AuditLogger
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     model = "openai-nonstream-zero"
     usage = Usage(
@@ -319,7 +320,7 @@ async def test_non_streaming_native_response_preserves_observed_zero_reasoning_t
     output_count = REGISTRY.get_sample_value("gen_ai_client_token_usage_count", output_labels) or 0
 
     audit = AuditLogger(phase="analysis", model=model, provider="openai")
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(response=SimpleNamespace(output=[_message("done")], usage=usage)),
         audit,
         request_model=model,
@@ -350,7 +351,7 @@ async def test_non_streaming_native_response_omits_default_usage_and_token_metri
     from prometheus_client import REGISTRY
 
     from lightspeed_agentic.audit import AuditLogger
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     model = "openai-nonstream-missing-usage"
     usage = Usage()
@@ -365,7 +366,7 @@ async def test_non_streaming_native_response_omits_default_usage_and_token_metri
     output_count = REGISTRY.get_sample_value("gen_ai_client_token_usage_count", output_labels)
 
     audit = AuditLogger(phase="analysis", model=model, provider="openai")
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(response=SimpleNamespace(output=[_message("done")], usage=usage)),
         audit,
         request_model=model,
@@ -389,12 +390,12 @@ async def test_non_streaming_native_response_omits_default_usage_and_token_metri
 
 @pytest.mark.asyncio
 async def test_model_proxy_records_non_streaming_error_without_response_data() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     error = RuntimeError("request failed")
     delegate: Any = _FakeModel(error=error)
-    proxy = OpenAIModelProxy(delegate, audit, request_model="gpt-4.1", native_responses=False)
+    proxy = create_model_proxy(delegate, audit, request_model="gpt-4.1", native_responses=False)
 
     with pytest.raises(RuntimeError):
         await proxy.get_response(None, "hello", object(), [], None, [], object())
@@ -406,13 +407,13 @@ async def test_model_proxy_records_non_streaming_error_without_response_data() -
 
 @pytest.mark.asyncio
 async def test_model_proxy_records_streaming_error_without_partial_output() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     partial = SimpleNamespace(type="response.output_text.delta", delta="partial")
     error = RuntimeError("stream failed")
     delegate: Any = _FakeModel(stream_events=[partial, error])
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         delegate,
         audit,
         request_model="gpt-4.1",
@@ -432,12 +433,12 @@ async def test_model_proxy_records_streaming_error_without_partial_output() -> N
 
 @pytest.mark.asyncio
 async def test_stream_proxy_finishes_success_before_completed_event_is_yielded() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     response = SimpleNamespace(output=[_message("done")], usage=None)
     completed = SimpleNamespace(type="response.completed", response=response)
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[completed]),
         audit,
         request_model="gpt-4.1",
@@ -458,12 +459,12 @@ async def test_stream_proxy_records_terminal_provider_failure_before_yield(span_
     from opentelemetry.trace import StatusCode
 
     from lightspeed_agentic.audit import AuditLogger
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     request_model = "openai-stream-failed-no-response"
     audit = AuditLogger(phase="analysis", model=request_model, provider="openai")
     failed = SimpleNamespace(type="response.failed")
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[failed]),
         audit,
         request_model=request_model,
@@ -553,7 +554,7 @@ async def test_stream_proxy_records_terminal_response_observations_with_error_st
     from prometheus_client import REGISTRY
 
     from lightspeed_agentic.audit import AuditLogger
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     response_model = "gpt-4.1-2025-04-14"
     response = SimpleNamespace(model=response_model, usage=usage)
@@ -569,7 +570,7 @@ async def test_stream_proxy_records_terminal_response_observations_with_error_st
     output_count = REGISTRY.get_sample_value("gen_ai_client_token_usage_count", output_labels) or 0
 
     audit = AuditLogger(phase="analysis", model=request_model, provider="openai")
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[event]),
         audit,
         request_model=request_model,
@@ -608,11 +609,11 @@ async def test_stream_proxy_records_terminal_response_observations_with_error_st
 
 @pytest.mark.asyncio
 async def test_stream_proxy_marks_missing_completion_as_error() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIModelProxy
+    from lightspeed_agentic.providers.openai_telemetry import create_model_proxy
 
     audit = _AuditRecorder()
     partial = SimpleNamespace(type="response.output_text.delta", delta="partial")
-    proxy = OpenAIModelProxy(
+    proxy = create_model_proxy(
         _FakeModel(stream_events=[partial]),
         audit,
         request_model="gpt-4.1",
@@ -626,10 +627,10 @@ async def test_stream_proxy_marks_missing_completion_as_error() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_hooks_record_actual_arguments_result_and_failures_once() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     raw_arguments = '{"cmd":"pwd"}'
     context = SimpleNamespace(
         tool_name="exec_command",
@@ -679,10 +680,96 @@ async def test_tool_hooks_record_actual_arguments_result_and_failures_once() -> 
 
 
 @pytest.mark.asyncio
+async def test_overlapping_tool_failure_cannot_finish_its_sibling() -> None:
+    from agents import function_tool
+
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
+
+    audit = _AuditRecorder()
+    hooks = create_tool_hooks(audit)
+    sibling_started = asyncio.Event()
+    release_sibling = asyncio.Event()
+    calls = 0
+
+    @function_tool(
+        name_override="exec_command",
+        failure_error_function=lambda _context, _error: "handled failure",
+    )
+    async def execute(cmd: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await sibling_started.wait()
+            raise RuntimeError("native execution failed")
+        sibling_started.set()
+        await release_sibling.wait()
+        return f"completed {cmd}"
+
+    raw_arguments = '{"cmd":"pwd"}'
+    first = SimpleNamespace(
+        tool_name="exec_command", tool_call_id="A", tool_arguments=raw_arguments, run_config=None
+    )
+    sibling = SimpleNamespace(
+        tool_name="exec_command", tool_call_id="B", tool_arguments=raw_arguments, run_config=None
+    )
+    await hooks.on_tool_start(first, object(), execute)
+    await hooks.on_tool_start(sibling, object(), execute)
+    first_task = asyncio.create_task(execute.on_invoke_tool(first, raw_arguments))
+    sibling_task = asyncio.create_task(execute.on_invoke_tool(sibling, raw_arguments))
+    try:
+        first_result = await asyncio.wait_for(first_task, timeout=5)
+        assert first_result == "handled failure"
+        first_span, first_end = audit.tool_ends[0]
+        assert first_span is audit.tool_starts[0][0]
+        assert isinstance(first_end["error"], RuntimeError)
+        assert first_end["result"] is None
+
+        await hooks.on_tool_end(first, object(), execute, first_result)
+        assert len(audit.tool_ends) == 1
+        assert hooks._find_pending(first, execute) is None
+
+        release_sibling.set()
+        sibling_result = await asyncio.wait_for(sibling_task, timeout=5)
+        await hooks.on_tool_end(sibling, object(), execute, sibling_result)
+        sibling_span, sibling_end = audit.tool_ends[1]
+        assert sibling_span is audit.tool_starts[1][0]
+        assert sibling_end["result"] == "completed pwd"
+        assert sibling_end["error"] is None
+        assert sibling_end["end_time"] >= first_end["end_time"]
+    finally:
+        release_sibling.set()
+        for task in (first_task, sibling_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(first_task, sibling_task, return_exceptions=True)
+        hooks.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_call_ids_do_not_select_an_arbitrary_pending_span() -> None:
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
+
+    audit = _AuditRecorder()
+    hooks = create_tool_hooks(audit)
+    tool = SimpleNamespace(name="exec_command")
+    contexts = [
+        SimpleNamespace(tool_call_id="duplicate", tool_arguments='{"cmd":"pwd"}') for _ in range(2)
+    ]
+    for context in contexts:
+        await hooks.on_tool_start(context, object(), tool)
+    try:
+        assert hooks._find_pending(contexts[0], tool) is None
+        await hooks.on_tool_end(contexts[0], object(), tool, "ambiguous result")
+        assert audit.tool_ends == []
+    finally:
+        hooks.close()
+
+
+@pytest.mark.asyncio
 async def test_custom_function_tool_named_view_image_can_return_text_successfully() -> None:
     from agents.tool import FunctionTool
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     async def succeed(_context: Any, _arguments: str) -> str:
         return "valid custom tool result"
@@ -705,7 +792,7 @@ async def test_custom_function_tool_named_view_image_can_return_text_successfull
         tool_arguments=raw_arguments,
     )
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
 
     await hooks.on_tool_start(context, object(), tool)
     result = await tool.on_invoke_tool(context, raw_arguments)
@@ -727,7 +814,7 @@ async def test_registered_skill_load_uses_native_tool_hooks() -> None:
     )
     from agents.sandbox.entries import LocalDir
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     class _Skills(Skills):
         async def load_skill(self, skill_name: str) -> dict[str, str]:
@@ -744,7 +831,7 @@ async def test_registered_skill_load_uses_native_tool_hooks() -> None:
     )
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     await hooks.on_tool_start(context, object(), tool)
     result = await tool.on_invoke_tool(context, raw_arguments)
     await hooks.on_tool_end(context, object(), tool, result)
@@ -767,7 +854,7 @@ async def test_exec_command_typed_timeout_is_error_before_sdk_formats_result(
     from agents.sandbox import ExecTimeoutError
     from agents.sandbox.capabilities.tools.shell_tool import ExecCommandTool
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     class _TimedOutSession:
         def supports_pty(self) -> bool:
@@ -783,7 +870,7 @@ async def test_exec_command_typed_timeout_is_error_before_sdk_formats_result(
             )
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     session = _TimedOutSession()
     tool = ExecCommandTool(session=session)
     hooks.configure_shell_tools(SimpleNamespace(exec_command=tool))
@@ -822,7 +909,7 @@ async def test_write_stdin_sdk_handled_failures_record_error_without_result(
     )
     from agents.sandbox.errors import PtySessionNotFoundError
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     failure: BaseException
     if error_kind == "session_missing":
@@ -847,7 +934,7 @@ async def test_write_stdin_sdk_handled_failures_record_error_without_result(
             raise self.error
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     session = _Session(failure)
     exec_tool = ExecCommandTool(session=session)
     tool = WriteStdinTool(session=session)
@@ -881,7 +968,7 @@ async def test_view_image_error_result_type_records_error_without_result() -> No
 
     from agents.sandbox.capabilities.tools.view_image import ViewImageTool
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     class _PathPolicy:
         def absolute_workspace_path(self, path: Any) -> Any:
@@ -898,7 +985,7 @@ async def test_view_image_error_result_type_records_error_without_result() -> No
             return io.BytesIO(b"not an image")
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     tool = ViewImageTool(session=_Session())
     raw_arguments = '{"path":"unsupported.bin"}'
     context = SimpleNamespace(
@@ -925,7 +1012,7 @@ async def test_view_image_typed_success_records_successful_result() -> None:
     from agents.sandbox.capabilities.tools.view_image import ViewImageTool
     from agents.tool import ToolOutputImage
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     class _PathPolicy:
         def absolute_workspace_path(self, path: Any) -> Any:
@@ -946,7 +1033,7 @@ async def test_view_image_typed_success_records_successful_result() -> None:
             return io.BytesIO(payload)
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     tool = ViewImageTool(session=_Session())
     raw_arguments = '{"path":"valid.png"}'
     context = SimpleNamespace(
@@ -972,7 +1059,7 @@ async def test_mcp_is_error_result_records_error_without_result() -> None:
     from mcp.types import CallToolResult, TextContent
     from mcp.types import Tool as MCPTool
 
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     tool_definition = MCPTool(
         name="fail_tool",
@@ -1023,7 +1110,7 @@ async def test_mcp_is_error_result_records_error_without_result() -> None:
             raise NotImplementedError
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     server = _Server()
     hooks.configure_mcp_servers([server])
     tool = MCPUtil.to_function_tool(
@@ -1051,7 +1138,7 @@ async def test_mcp_is_error_result_records_error_without_result() -> None:
 
 @pytest.mark.asyncio
 async def test_filesystem_apply_patch_hooks_capture_editor_arguments_and_errors() -> None:
-    from lightspeed_agentic.providers.openai_telemetry import OpenAIToolRunHooks
+    from lightspeed_agentic.providers.openai_telemetry import create_tool_hooks
 
     class _Editor:
         async def create_file(self, _operation: Any) -> SimpleNamespace:
@@ -1067,7 +1154,7 @@ async def test_filesystem_apply_patch_hooks_capture_editor_arguments_and_errors(
         pass
 
     audit = _AuditRecorder()
-    hooks = OpenAIToolRunHooks(audit)
+    hooks = create_tool_hooks(audit)
     tool = SimpleNamespace(name="apply_patch", type="custom", editor=_Editor())
     hooks.configure_filesystem_tools(SimpleNamespace(apply_patch=tool))
 

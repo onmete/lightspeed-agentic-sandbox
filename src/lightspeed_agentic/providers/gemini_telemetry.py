@@ -284,8 +284,8 @@ class GeminiTelemetry:
             reasoning_tokens = _field(usage, "thoughts_token_count")
             if reasoning_tokens is not None:
                 call.reasoning_tokens = reasoning_tokens
-            if call.candidate_tokens is not None and call.reasoning_tokens is not None:
-                call.output_tokens = call.candidate_tokens + call.reasoning_tokens
+            if call.candidate_tokens is not None:
+                call.output_tokens = call.candidate_tokens + (call.reasoning_tokens or 0)
 
         finish_reason = _field(response, "finish_reason")
         if finish_reason is not None:

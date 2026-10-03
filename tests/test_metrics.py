@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from prometheus_client import REGISTRY
 
@@ -197,3 +199,50 @@ def test_tool_duration_uses_actual_tool_lifecycle() -> None:
     assert (
         _sample("gen_ai_execute_tool_duration_seconds_sum", labels) - before_sum
     ) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("finish", ["end_inference", "close"])
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RuntimeError("private diagnostic"), "_OTHER"),
+        ("arbitrary private error text", "_OTHER"),
+        (TimeoutError(), "TimeoutError"),
+        ("response.failed", "response.failed"),
+        ("operation_cancelled", "operation_cancelled"),
+    ],
+)
+def test_inference_error_metrics_use_bounded_categories(
+    finish: str, error: BaseException | str, expected: str, span_exporter: Any
+) -> None:
+    model = f"bounded-errors-{finish}"
+    labels = {
+        "gen_ai_request_model": model,
+        "gen_ai_provider_name": "metrics-provider",
+        "gen_ai_operation_name": "chat",
+        "error_type": expected,
+    }
+    before = _sample("gen_ai_client_operation_duration_seconds_count", labels)
+    recorder = _recorder(model)
+    span = recorder.start_inference(model=model, operation="chat", input_messages=None)
+    if finish == "end_inference":
+        recorder.end_inference(span, error=error)
+    else:
+        recorder.close(error)
+
+    assert _sample("gen_ai_client_operation_duration_seconds_count", labels) == before + 1
+    raw_type = error if isinstance(error, str) else type(error).__name__
+    exported = next(
+        exported
+        for exported in span_exporter.get_finished_spans()
+        if exported.context == span.get_span_context()
+    )
+    assert exported.attributes["error.type"] == raw_type
+    if raw_type != expected:
+        assert (
+            REGISTRY.get_sample_value(
+                "gen_ai_client_operation_duration_seconds_count",
+                {**labels, "error_type": raw_type},
+            )
+            is None
+        )

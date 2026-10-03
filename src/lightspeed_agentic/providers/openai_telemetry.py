@@ -15,17 +15,11 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agents.lifecycle import RunHooks
-from agents.models.interface import Model
-from agents.sandbox import ExecTimeoutError
-from agents.sandbox.errors import PtySessionNotFoundError
-from agents.tool import (
-    FunctionTool,
-    resolve_function_tool_failure_error_function,
-    set_function_tool_failure_error_function,
-)
+if TYPE_CHECKING:
+    from agents.models.interface import Model
+    from agents.tool import FunctionTool
 
 from lightspeed_agentic.audit import AuditLogger
 
@@ -349,6 +343,8 @@ def _function_tool_definition(tool: FunctionTool) -> dict[str, Any]:
 
 
 def _tool_definition(tool: Any) -> dict[str, Any] | None:
+    from agents.tool import FunctionTool
+
     if isinstance(tool, FunctionTool):
         return _function_tool_definition(tool)
 
@@ -627,69 +623,122 @@ def _stream_error(event: Any) -> str | None:
     return None
 
 
-class OpenAIModelProxy(Model):
-    """Delegate native Model methods while recording each real request and response."""
+def create_model_proxy(
+    model: Model,
+    audit_logger: AuditLogger,
+    *,
+    request_model: str,
+    native_responses: bool,
+) -> Model:
+    """Create a native Model proxy only when the OpenAI extra is used."""
+    from agents.models.interface import Model
 
-    def __init__(
-        self,
-        model: Model,
-        audit_logger: AuditLogger,
-        *,
-        request_model: str,
-        native_responses: bool,
-    ) -> None:
-        self._delegate = model
-        self._audit_logger = audit_logger
-        self._request_model = request_model
-        self._native_responses = native_responses
+    class OpenAIModelProxy(Model):
+        """Delegate native Model methods while recording each real request and response."""
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(object.__getattribute__(self, "_delegate"), name)
+        def __init__(
+            self,
+            model: Model,
+            audit_logger: AuditLogger,
+            *,
+            request_model: str,
+            native_responses: bool,
+        ) -> None:
+            self._delegate = model
+            self._audit_logger = audit_logger
+            self._request_model = request_model
+            self._native_responses = native_responses
 
-    async def _cleanup_on_run_end(self, owner: object) -> None:
-        await self._delegate._cleanup_on_run_end(owner)
+        def __getattr__(self, name: str) -> Any:
+            return getattr(object.__getattribute__(self, "_delegate"), name)
 
-    async def close(self) -> None:
-        await self._delegate.close()
+        async def _cleanup_on_run_end(self, owner: object) -> None:
+            await self._delegate._cleanup_on_run_end(owner)
 
-    def get_retry_advice(self, request: Any) -> Any:
-        return self._delegate.get_retry_advice(request)
+        async def close(self) -> None:
+            await self._delegate.close()
 
-    def _start_inference(
-        self,
-        system_instructions: Any,
-        model_input: Any,
-        tools: Any,
-        output_schema: Any,
-        handoffs: Any,
-    ) -> Any:
-        return self._audit_logger.start_inference(
-            model=self._request_model,
-            operation="chat",
-            input_messages=_input_messages(model_input),
-            system_instructions=_system_instruction_parts(system_instructions),
-            tool_definitions=_tool_definitions(tools, handoffs),
-            output_type=_output_type(output_schema),
-            start_time=time.time_ns(),
-        )
+        def get_retry_advice(self, request: Any) -> Any:
+            return self._delegate.get_retry_advice(request)
 
-    async def get_response(
-        self,
-        system_instructions: str | None,
-        input: str | list[Any],  # noqa: A002 - OpenAI Agents Model API keyword.
-        model_settings: Any,
-        tools: list[Any],
-        output_schema: Any,
-        handoffs: list[Any],
-        tracing: Any,
-        *,
-        previous_response_id: str | None = None,
-        conversation_id: str | None = None,
-        prompt: Any = None,
-    ) -> Any:
-        span = self._start_inference(system_instructions, input, tools, output_schema, handoffs)
-        try:
-            response = await self._delegate.get_response(
+        def _start_inference(
+            self,
+            system_instructions: Any,
+            model_input: Any,
+            tools: Any,
+            output_schema: Any,
+            handoffs: Any,
+        ) -> Any:
+            return self._audit_logger.start_inference(
+                model=self._request_model,
+                operation="chat",
+                input_messages=_input_messages(model_input),
+                system_instructions=_system_instruction_parts(system_instructions),
+                tool_definitions=_tool_definitions(tools, handoffs),
+                output_type=_output_type(output_schema),
+                start_time=time.time_ns(),
+            )
+
+        async def get_response(
+            self,
+            system_instructions: str | None,
+            input: str | list[Any],  # noqa: A002 - OpenAI Agents Model API keyword.
+            model_settings: Any,
+            tools: list[Any],
+            output_schema: Any,
+            handoffs: list[Any],
+            tracing: Any,
+            *,
+            previous_response_id: str | None = None,
+            conversation_id: str | None = None,
+            prompt: Any = None,
+        ) -> Any:
+            span = self._start_inference(system_instructions, input, tools, output_schema, handoffs)
+            try:
+                response = await self._delegate.get_response(
+                    system_instructions,
+                    input,
+                    model_settings,
+                    tools,
+                    output_schema,
+                    handoffs,
+                    tracing,
+                    previous_response_id=previous_response_id,
+                    conversation_id=conversation_id,
+                    prompt=prompt,
+                )
+            except BaseException as error:
+                self._audit_logger.end_inference(
+                    span,
+                    error=error,
+                    end_time=time.time_ns(),
+                )
+                raise
+
+            end_time = time.time_ns()
+            observations = _response_observations(
+                response,
+                native_responses=self._native_responses,
+                normalized=True,
+            )
+            self._audit_logger.end_inference(span, end_time=end_time, **observations)
+            return response
+
+        def stream_response(
+            self,
+            system_instructions: str | None,
+            input: str | list[Any],  # noqa: A002 - OpenAI Agents Model API keyword.
+            model_settings: Any,
+            tools: list[Any],
+            output_schema: Any,
+            handoffs: list[Any],
+            tracing: Any,
+            *,
+            previous_response_id: str | None = None,
+            conversation_id: str | None = None,
+            prompt: Any = None,
+        ) -> AsyncIterator[Any]:
+            return self._stream_response(
                 system_instructions,
                 input,
                 model_settings,
@@ -701,157 +750,120 @@ class OpenAIModelProxy(Model):
                 conversation_id=conversation_id,
                 prompt=prompt,
             )
-        except BaseException as error:
-            self._audit_logger.end_inference(
-                span,
-                error=error,
-                end_time=time.time_ns(),
+
+        async def _stream_response(
+            self,
+            system_instructions: str | None,
+            model_input: str | list[Any],
+            model_settings: Any,
+            tools: list[Any],
+            output_schema: Any,
+            handoffs: list[Any],
+            tracing: Any,
+            *,
+            previous_response_id: str | None,
+            conversation_id: str | None,
+            prompt: Any,
+        ) -> AsyncIterator[Any]:
+            span = self._start_inference(
+                system_instructions, model_input, tools, output_schema, handoffs
             )
-            raise
-
-        end_time = time.time_ns()
-        observations = _response_observations(
-            response,
-            native_responses=self._native_responses,
-            normalized=True,
-        )
-        self._audit_logger.end_inference(span, end_time=end_time, **observations)
-        return response
-
-    def stream_response(
-        self,
-        system_instructions: str | None,
-        input: str | list[Any],  # noqa: A002 - OpenAI Agents Model API keyword.
-        model_settings: Any,
-        tools: list[Any],
-        output_schema: Any,
-        handoffs: list[Any],
-        tracing: Any,
-        *,
-        previous_response_id: str | None = None,
-        conversation_id: str | None = None,
-        prompt: Any = None,
-    ) -> AsyncIterator[Any]:
-        return self._stream_response(
-            system_instructions,
-            input,
-            model_settings,
-            tools,
-            output_schema,
-            handoffs,
-            tracing,
-            previous_response_id=previous_response_id,
-            conversation_id=conversation_id,
-            prompt=prompt,
-        )
-
-    async def _stream_response(
-        self,
-        system_instructions: str | None,
-        model_input: str | list[Any],
-        model_settings: Any,
-        tools: list[Any],
-        output_schema: Any,
-        handoffs: list[Any],
-        tracing: Any,
-        *,
-        previous_response_id: str | None,
-        conversation_id: str | None,
-        prompt: Any,
-    ) -> AsyncIterator[Any]:
-        span = self._start_inference(
-            system_instructions, model_input, tools, output_schema, handoffs
-        )
-        stream: Any = None
-        exhausted = False
-        ended = False
-        request_error: BaseException | None = None
-        try:
-            stream = self._delegate.stream_response(
-                system_instructions,
-                model_input,
-                model_settings,
-                tools,
-                output_schema,
-                handoffs,
-                tracing,
-                previous_response_id=previous_response_id,
-                conversation_id=conversation_id,
-                prompt=prompt,
-            )
-            async for event in stream:
-                if not ended and _kind(event) == "response.completed":
-                    response = _completed_response(event)
-                    observations = (
-                        _response_observations(
-                            response,
-                            native_responses=self._native_responses,
-                            normalized=not self._native_responses,
-                        )
-                        if response is not None
-                        else {}
-                    )
-                    self._audit_logger.end_inference(span, end_time=time.time_ns(), **observations)
-                    ended = True
-                elif not ended:
-                    error_type = _stream_error(event)
-                    if error_type is not None:
-                        terminal_response = (
-                            _field(event, "response")
-                            if error_type in {"response.incomplete", "response.failed"}
-                            else None
-                        )
+            stream: Any = None
+            exhausted = False
+            ended = False
+            request_error: BaseException | None = None
+            try:
+                stream = self._delegate.stream_response(
+                    system_instructions,
+                    model_input,
+                    model_settings,
+                    tools,
+                    output_schema,
+                    handoffs,
+                    tracing,
+                    previous_response_id=previous_response_id,
+                    conversation_id=conversation_id,
+                    prompt=prompt,
+                )
+                async for event in stream:
+                    if not ended and _kind(event) == "response.completed":
+                        response = _completed_response(event)
                         observations = (
                             _response_observations(
-                                terminal_response,
+                                response,
                                 native_responses=self._native_responses,
                                 normalized=not self._native_responses,
                             )
-                            if terminal_response is not None
+                            if response is not None
                             else {}
                         )
                         self._audit_logger.end_inference(
-                            span,
-                            error=error_type,
-                            end_time=time.time_ns(),
-                            **observations,
+                            span, end_time=time.time_ns(), **observations
                         )
                         ended = True
-                yield event
-            exhausted = True
-            if not ended:
-                self._audit_logger.end_inference(
-                    span,
-                    error="response_incomplete",
-                    end_time=time.time_ns(),
-                )
-                ended = True
-        except BaseException as error:
-            request_error = error
-            if not ended:
-                self._audit_logger.end_inference(
-                    span,
-                    error=error,
-                    end_time=time.time_ns(),
-                )
-                ended = True
-            raise
-        finally:
-            if not exhausted and stream is not None:
-                close = getattr(stream, "aclose", None)
-                if callable(close):
-                    try:
-                        await close()
-                    except BaseException as close_error:
-                        if not ended:
+                    elif not ended:
+                        error_type = _stream_error(event)
+                        if error_type is not None:
+                            terminal_response = (
+                                _field(event, "response")
+                                if error_type in {"response.incomplete", "response.failed"}
+                                else None
+                            )
+                            observations = (
+                                _response_observations(
+                                    terminal_response,
+                                    native_responses=self._native_responses,
+                                    normalized=not self._native_responses,
+                                )
+                                if terminal_response is not None
+                                else {}
+                            )
                             self._audit_logger.end_inference(
                                 span,
-                                error=close_error,
+                                error=error_type,
                                 end_time=time.time_ns(),
+                                **observations,
                             )
                             ended = True
-                        if request_error is None:
-                            raise
+                    yield event
+                exhausted = True
+                if not ended:
+                    self._audit_logger.end_inference(
+                        span,
+                        error="response_incomplete",
+                        end_time=time.time_ns(),
+                    )
+                    ended = True
+            except BaseException as error:
+                request_error = error
+                if not ended:
+                    self._audit_logger.end_inference(
+                        span,
+                        error=error,
+                        end_time=time.time_ns(),
+                    )
+                    ended = True
+                raise
+            finally:
+                if not exhausted and stream is not None:
+                    close = getattr(stream, "aclose", None)
+                    if callable(close):
+                        try:
+                            await close()
+                        except BaseException as close_error:
+                            if not ended:
+                                self._audit_logger.end_inference(
+                                    span,
+                                    error=close_error,
+                                    end_time=time.time_ns(),
+                                )
+                                ended = True
+                            if request_error is None:
+                                raise
+
+    return OpenAIModelProxy(
+        model, audit_logger, request_model=request_model, native_responses=native_responses
+    )
 
 
 def _is_native_view_image_tool(tool: Any) -> bool:
@@ -863,477 +875,501 @@ def _is_native_view_image_tool(tool: Any) -> bool:
     return isinstance(tool, ViewImageTool)
 
 
-class OpenAIToolRunHooks(RunHooks[Any]):
-    """Record SDK-native local tool starts/ends and exceptions hidden by tool wrappers."""
+def create_tool_hooks(audit_logger: AuditLogger) -> Any:
+    """Create native RunHooks only when the OpenAI extra is used."""
+    from agents.lifecycle import RunHooks
+    from agents.sandbox import ExecTimeoutError
+    from agents.sandbox.errors import PtySessionNotFoundError
+    from agents.tool import (
+        FunctionTool,
+        resolve_function_tool_failure_error_function,
+        set_function_tool_failure_error_function,
+    )
 
-    def __init__(self, audit_logger: AuditLogger) -> None:
-        self._audit_logger = audit_logger
-        self._pending: list[_OpenToolSpan] = []
-        self._function_tool_patches: dict[int, _FunctionToolPatch] = {}
-        self._executor_patches: dict[int, _ExecutorPatch] = {}
-        self._mcp_extractor_patches: dict[int, _MCPExtractorPatch] = {}
-        self._active_tool_span: ContextVar[_OpenToolSpan | None] = ContextVar(
-            f"openai_tool_span_{id(self)}", default=None
-        )
-        self._deferred_apply_patch_tools: set[int] = set()
+    class OpenAIToolRunHooks(RunHooks[Any]):
+        """Record SDK-native local tool starts/ends and exceptions hidden by tool wrappers."""
 
-    def configure_shell_tools(self, toolset: Any) -> None:
-        """Observe native shell/PTY failures before tools format them as text."""
-        tool = _field(toolset, "exec_command")
-        session = _field(tool, "session")
-        if tool is None or session is None or id(session) in self._executor_patches:
-            return
+        def __init__(self, audit_logger: AuditLogger) -> None:
+            self._audit_logger = audit_logger
+            self._pending: list[_OpenToolSpan] = []
+            self._function_tool_patches: dict[int, _FunctionToolPatch] = {}
+            self._executor_patches: dict[int, _ExecutorPatch] = {}
+            self._mcp_extractor_patches: dict[int, _MCPExtractorPatch] = {}
+            self._active_tool_span: ContextVar[_OpenToolSpan | None] = ContextVar(
+                f"openai_tool_span_{id(self)}", default=None
+            )
+            self._deferred_apply_patch_tools: set[int] = set()
 
-        patch = _ExecutorPatch(session=session, methods={})
-        self._executor_patches[id(session)] = patch
-        instance_attributes = getattr(session, "__dict__", {})
-        try:
-            for method_name in ("exec", "pty_exec_start", "pty_write_stdin"):
-                original = getattr(session, method_name, None)
+        def configure_shell_tools(self, toolset: Any) -> None:
+            """Observe native shell/PTY failures before tools format them as text."""
+            tool = _field(toolset, "exec_command")
+            session = _field(tool, "session")
+            if tool is None or session is None or id(session) in self._executor_patches:
+                return
+
+            patch = _ExecutorPatch(session=session, methods={})
+            self._executor_patches[id(session)] = patch
+            instance_attributes = getattr(session, "__dict__", {})
+            try:
+                for method_name in ("exec", "pty_exec_start", "pty_write_stdin"):
+                    original = getattr(session, method_name, None)
+                    if not callable(original):
+                        continue
+
+                    @wraps(original)
+                    async def instrumented(
+                        *args: Any,
+                        _original: Any = original,
+                        _method_name: str = method_name,
+                        **kwargs: Any,
+                    ) -> Any:
+                        try:
+                            result = _original(*args, **kwargs)
+                            if inspect.isawaitable(result):
+                                result = await result
+                            return result
+                        except (
+                            ExecTimeoutError,
+                            TimeoutError,
+                            PtySessionNotFoundError,
+                            RuntimeError,
+                        ) as error:
+                            pending = self._active_tool_span.get()
+                            if pending is not None and (
+                                (
+                                    pending.name == "exec_command"
+                                    and _method_name in {"exec", "pty_exec_start"}
+                                    and isinstance(error, (ExecTimeoutError, TimeoutError))
+                                )
+                                or (
+                                    pending.name == "write_stdin"
+                                    and _method_name == "pty_write_stdin"
+                                    and isinstance(error, (PtySessionNotFoundError, RuntimeError))
+                                )
+                            ):
+                                pending.error = error
+                            raise
+
+                    instance_value = instance_attributes.get(method_name, _MISSING)
+                    try:
+                        setattr(session, method_name, instrumented)
+                    except (AttributeError, TypeError):
+                        continue
+                    patch.methods[method_name] = (instance_value, instrumented)
+            except BaseException:
+                self._restore_executor_patch(patch)
+                self._executor_patches.pop(id(session), None)
+                raise
+
+            if not patch.methods:
+                self._executor_patches.pop(id(session), None)
+
+        def configure_mcp_servers(self, servers: Sequence[Any]) -> None:
+            """Observe MCP isError flags through the SDK's custom-data extension."""
+            for server in servers:
+                server_id = id(server)
+                if server_id in self._mcp_extractor_patches:
+                    continue
+
+                original = _field(server, "custom_data_extractor")
+
+                async def extract_custom_data(
+                    context: Any,
+                    _original: Any = original,
+                    _server: Any = server,
+                ) -> Any:
+                    custom_data = None
+                    if callable(_original):
+                        custom_data = _original(context)
+                        if inspect.isawaitable(custom_data):
+                            custom_data = await custom_data
+
+                    pending = self._active_tool_span.get()
+                    if (
+                        _field(context, "is_error") is True
+                        and pending is not None
+                        and pending.name == _field(context, "tool_display_name")
+                        and _field(context, "server_name") == _field(_server, "name")
+                    ):
+                        pending.error = "mcp_tool_error"
+                    return custom_data
+
+                instance_value = getattr(server, "__dict__", {}).get(
+                    "custom_data_extractor", _MISSING
+                )
+                try:
+                    server.custom_data_extractor = extract_custom_data
+                except (AttributeError, TypeError):
+                    continue
+                self._mcp_extractor_patches[server_id] = _MCPExtractorPatch(
+                    server=server,
+                    instance_value=instance_value,
+                    wrapped=extract_custom_data,
+                )
+
+        def configure_filesystem_tools(self, toolset: Any) -> None:
+            """Capture apply_patch editor operations absent from its RunHooks context."""
+            tool = _field(toolset, "apply_patch")
+            editor = _field(tool, "editor")
+            if tool is None or editor is None:
+                return
+
+            self._deferred_apply_patch_tools.add(id(tool))
+            for method_name in ("create_file", "update_file", "delete_file"):
+                original = getattr(editor, method_name, None)
                 if not callable(original):
                     continue
 
                 @wraps(original)
                 async def instrumented(
-                    *args: Any,
+                    operation: Any,
                     _original: Any = original,
-                    _method_name: str = method_name,
-                    **kwargs: Any,
+                    _tool: Any = tool,
                 ) -> Any:
+                    context = _field(operation, "ctx_wrapper")
+                    pending = self._find_pending(context, _tool)
+                    if pending is not None:
+                        if pending.arguments is None:
+                            pending.arguments = []
+                        pending.arguments.append(
+                            {
+                                field_name: _field(operation, field_name)
+                                for field_name in ("type", "path", "diff", "move_to")
+                            }
+                        )
                     try:
-                        result = _original(*args, **kwargs)
+                        result = _original(operation)
                         if inspect.isawaitable(result):
                             result = await result
-                        return result
-                    except (
-                        ExecTimeoutError,
-                        TimeoutError,
-                        PtySessionNotFoundError,
-                        RuntimeError,
-                    ) as error:
-                        pending = self._active_tool_span.get()
-                        if pending is not None and (
-                            (
-                                pending.name == "exec_command"
-                                and _method_name in {"exec", "pty_exec_start"}
-                                and isinstance(error, (ExecTimeoutError, TimeoutError))
-                            )
-                            or (
-                                pending.name == "write_stdin"
-                                and _method_name == "pty_write_stdin"
-                                and isinstance(error, (PtySessionNotFoundError, RuntimeError))
-                            )
-                        ):
+                    except BaseException as error:
+                        if pending is not None:
                             pending.error = error
                         raise
+                    if pending is not None and _field(result, "status") == "failed":
+                        pending.error = "apply_patch_failed"
+                    return result
 
-                instance_value = instance_attributes.get(method_name, _MISSING)
-                try:
-                    setattr(session, method_name, instrumented)
-                except (AttributeError, TypeError):
-                    continue
-                patch.methods[method_name] = (instance_value, instrumented)
-        except BaseException:
-            self._restore_executor_patch(patch)
-            self._executor_patches.pop(id(session), None)
-            raise
+                setattr(editor, method_name, instrumented)
 
-        if not patch.methods:
-            self._executor_patches.pop(id(session), None)
+        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+            del agent
+            name = _tool_name(tool, context)
+            if name is None:
+                return
 
-    def configure_mcp_servers(self, servers: Sequence[Any]) -> None:
-        """Observe MCP isError flags through the SDK's custom-data extension."""
-        for server in servers:
-            server_id = id(server)
-            if server_id in self._mcp_extractor_patches:
-                continue
-
-            original = _field(server, "custom_data_extractor")
-
-            async def extract_custom_data(
-                context: Any,
-                _original: Any = original,
-                _server: Any = server,
-            ) -> Any:
-                custom_data = None
-                if callable(_original):
-                    custom_data = _original(context)
-                    if inspect.isawaitable(custom_data):
-                        custom_data = await custom_data
-
-                pending = self._active_tool_span.get()
-                if (
-                    _field(context, "is_error") is True
-                    and pending is not None
-                    and pending.name == _field(context, "tool_display_name")
-                    and _field(context, "server_name") == _field(_server, "name")
-                ):
-                    pending.error = "mcp_tool_error"
-                return custom_data
-
-            instance_value = getattr(server, "__dict__", {}).get("custom_data_extractor", _MISSING)
-            try:
-                server.custom_data_extractor = extract_custom_data
-            except (AttributeError, TypeError):
-                continue
-            self._mcp_extractor_patches[server_id] = _MCPExtractorPatch(
-                server=server,
-                instance_value=instance_value,
-                wrapped=extract_custom_data,
-            )
-
-    def configure_filesystem_tools(self, toolset: Any) -> None:
-        """Capture apply_patch editor operations absent from its RunHooks context."""
-        tool = _field(toolset, "apply_patch")
-        editor = _field(tool, "editor")
-        if tool is None or editor is None:
-            return
-
-        self._deferred_apply_patch_tools.add(id(tool))
-        for method_name in ("create_file", "update_file", "delete_file"):
-            original = getattr(editor, method_name, None)
-            if not callable(original):
-                continue
-
-            @wraps(original)
-            async def instrumented(
-                operation: Any,
-                _original: Any = original,
-                _tool: Any = tool,
-            ) -> Any:
-                context = _field(operation, "ctx_wrapper")
-                pending = self._find_pending(context, _tool)
-                if pending is not None:
-                    if pending.arguments is None:
-                        pending.arguments = []
-                    pending.arguments.append(
-                        {
-                            field_name: _field(operation, field_name)
-                            for field_name in ("type", "path", "diff", "move_to")
-                        }
+            arguments, raw_arguments = _tool_arguments(context)
+            call_id = _tool_call_id(context)
+            tool_type = _field(tool, "type")
+            if not isinstance(tool_type, str) or not tool_type:
+                tool_type = "function"
+            start_time = time.time_ns()
+            if (
+                id(tool) in self._deferred_apply_patch_tools
+                and _field(context, "tool_arguments", _MISSING) is _MISSING
+            ):
+                # ApplyPatchAction omits request data from RunHooks; retain its native start
+                # and collect parsed editor operations before writing span content.
+                self._pending.append(
+                    _OpenToolSpan(
+                        span=None,
+                        tool=tool,
+                        context_id=id(context),
+                        call_id=call_id,
+                        name=name,
+                        tool_type=tool_type,
+                        start_time=start_time,
+                        arguments=None,
+                        raw_arguments=raw_arguments,
                     )
-                try:
-                    result = _original(operation)
-                    if inspect.isawaitable(result):
-                        result = await result
-                except BaseException as error:
-                    if pending is not None:
-                        pending.error = error
-                    raise
-                if pending is not None and _field(result, "status") == "failed":
-                    pending.error = "apply_patch_failed"
-                return result
+                )
+                return
 
-            setattr(editor, method_name, instrumented)
+            patch: _FunctionToolPatch | None = None
+            if isinstance(tool, FunctionTool):
+                patch = self._patch_function_tool(tool)
+                patch.active_calls += 1
 
-    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
-        del agent
-        name = _tool_name(tool, context)
-        if name is None:
-            return
+            try:
+                span = self._audit_logger.start_tool(
+                    name=name,
+                    call_id=call_id,
+                    arguments=arguments,
+                    tool_type=tool_type,
+                    start_time=start_time,
+                )
+            except BaseException:
+                if patch is not None:
+                    self._release_function_tool(tool)
+                raise
 
-        arguments, raw_arguments = _tool_arguments(context)
-        call_id = _tool_call_id(context)
-        tool_type = _field(tool, "type")
-        if not isinstance(tool_type, str) or not tool_type:
-            tool_type = "function"
-        start_time = time.time_ns()
-        if (
-            id(tool) in self._deferred_apply_patch_tools
-            and _field(context, "tool_arguments", _MISSING) is _MISSING
-        ):
-            # ApplyPatchAction omits its request data from RunHooks; retain the native start time
-            # and collect parsed operations from the editor calls before writing span content.
             self._pending.append(
                 _OpenToolSpan(
-                    span=None,
+                    span=span,
                     tool=tool,
                     context_id=id(context),
                     call_id=call_id,
                     name=name,
                     tool_type=tool_type,
                     start_time=start_time,
-                    arguments=None,
+                    arguments=arguments,
                     raw_arguments=raw_arguments,
                 )
             )
-            return
 
-        patch: _FunctionToolPatch | None = None
-        if isinstance(tool, FunctionTool):
-            patch = self._patch_function_tool(tool)
-            patch.active_calls += 1
+        async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+            del agent
+            pending = self._take_pending(context, tool)
+            if pending is not None:
+                if (
+                    pending.name == "view_image"
+                    and isinstance(result, str)
+                    and _is_native_view_image_tool(pending.tool)
+                ):
+                    pending.error = "view_image_failed"
+                self._finish_pending(pending, result=result)
 
-        try:
-            span = self._audit_logger.start_tool(
-                name=name,
-                call_id=call_id,
-                arguments=arguments,
-                tool_type=tool_type,
-                start_time=start_time,
-            )
-        except BaseException:
-            if patch is not None:
-                self._release_function_tool(tool)
-            raise
+        def close(self, error: BaseException | str = "operation_cancelled") -> None:
+            """Close only still-open local tool spans; completed spans are left untouched."""
+            pending_spans, self._pending = self._pending, []
+            for pending in pending_spans:
+                self._finish_pending(pending, error=error)
+            for patch in list(self._function_tool_patches.values()):
+                patch.active_calls = 0
+                self._restore_function_tool(patch)
+            for executor_patch in list(self._executor_patches.values()):
+                self._restore_executor_patch(executor_patch)
+            self._executor_patches.clear()
 
-        self._pending.append(
-            _OpenToolSpan(
-                span=span,
+            for extractor_patch in list(self._mcp_extractor_patches.values()):
+                if (
+                    getattr(extractor_patch.server, "custom_data_extractor", None)
+                    is extractor_patch.wrapped
+                ):
+                    if extractor_patch.instance_value is _MISSING:
+                        with suppress(AttributeError):
+                            delattr(extractor_patch.server, "custom_data_extractor")
+                    else:
+                        extractor_patch.server.custom_data_extractor = (
+                            extractor_patch.instance_value
+                        )
+            self._mcp_extractor_patches.clear()
+
+        def _patch_function_tool(self, tool: FunctionTool) -> _FunctionToolPatch:
+            existing = self._function_tool_patches.get(id(tool))
+            if existing is not None:
+                return existing
+
+            original_invoke = tool.on_invoke_tool
+            uses_default_failure = bool(getattr(tool, "_use_default_failure_error_function", False))
+            original_failure = getattr(tool, "_failure_error_function", None)
+            effective_failure = resolve_function_tool_failure_error_function(tool)
+
+            async def wrapped_invoke(context: Any, raw_arguments: str) -> Any:
+                token = self._active_tool_span.set(self._find_pending(context, tool))
+                try:
+                    result = original_invoke(context, raw_arguments)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                except BaseException as error:
+                    self._finish_error(tool, context, error, raw_arguments=raw_arguments)
+                    raise
+                finally:
+                    self._active_tool_span.reset(token)
+
+            wrapped_failure: Any = None
+            if effective_failure is not None:
+
+                @wraps(effective_failure)
+                async def handle_failure(context: Any, error: Exception) -> Any:
+                    self._finish_error(tool, context, error)
+                    result = effective_failure(context, error)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+
+                wrapped_failure = handle_failure
+
+            patch = _FunctionToolPatch(
                 tool=tool,
-                context_id=id(context),
-                call_id=call_id,
-                name=name,
-                tool_type=tool_type,
-                start_time=start_time,
-                arguments=arguments,
-                raw_arguments=raw_arguments,
+                original_invoke=original_invoke,
+                wrapped_invoke=wrapped_invoke,
+                original_failure=original_failure,
+                wrapped_failure=wrapped_failure,
+                uses_default_failure=uses_default_failure,
             )
-        )
+            self._function_tool_patches[id(tool)] = patch
+            tool.on_invoke_tool = wrapped_invoke
+            if wrapped_failure is not None:
+                set_function_tool_failure_error_function(tool, wrapped_failure)
+            return patch
 
-    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
-        del agent
-        pending = self._take_pending(context, tool)
-        if pending is not None:
-            if (
-                pending.name == "view_image"
-                and isinstance(result, str)
-                and _is_native_view_image_tool(pending.tool)
-            ):
-                pending.error = "view_image_failed"
-            self._finish_pending(pending, result=result)
-
-    def close(self, error: BaseException | str = "operation_cancelled") -> None:
-        """Close only still-open local tool spans; completed spans are left untouched."""
-        pending_spans, self._pending = self._pending, []
-        for pending in pending_spans:
-            self._finish_pending(pending, error=error)
-        for patch in list(self._function_tool_patches.values()):
-            patch.active_calls = 0
-            self._restore_function_tool(patch)
-        for executor_patch in list(self._executor_patches.values()):
-            self._restore_executor_patch(executor_patch)
-        self._executor_patches.clear()
-
-        for extractor_patch in list(self._mcp_extractor_patches.values()):
-            if (
-                getattr(extractor_patch.server, "custom_data_extractor", None)
-                is extractor_patch.wrapped
-            ):
-                if extractor_patch.instance_value is _MISSING:
+        def _restore_executor_patch(self, patch: _ExecutorPatch) -> None:
+            for method_name, (instance_value, wrapped) in patch.methods.items():
+                if getattr(patch.session, method_name, None) is not wrapped:
+                    continue
+                if instance_value is _MISSING:
                     with suppress(AttributeError):
-                        delattr(extractor_patch.server, "custom_data_extractor")
+                        delattr(patch.session, method_name)
                 else:
-                    extractor_patch.server.custom_data_extractor = extractor_patch.instance_value
-        self._mcp_extractor_patches.clear()
+                    setattr(patch.session, method_name, instance_value)
+            patch.methods.clear()
 
-    def _patch_function_tool(self, tool: FunctionTool) -> _FunctionToolPatch:
-        existing = self._function_tool_patches.get(id(tool))
-        if existing is not None:
-            return existing
+        def _finish_error(
+            self,
+            tool: FunctionTool,
+            context: Any,
+            error: BaseException,
+            *,
+            raw_arguments: str | None = None,
+        ) -> None:
+            pending = self._take_pending(context, tool, raw_arguments=raw_arguments)
+            if pending is not None:
+                self._finish_pending(pending, error=error)
 
-        original_invoke = tool.on_invoke_tool
-        uses_default_failure = bool(getattr(tool, "_use_default_failure_error_function", False))
-        original_failure = getattr(tool, "_failure_error_function", None)
-        effective_failure = resolve_function_tool_failure_error_function(tool)
+        def _find_pending(self, context: Any, tool: Any) -> _OpenToolSpan | None:
+            call_id = _tool_call_id(context)
+            if call_id:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.call_id == call_id
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+                return None
 
-        async def wrapped_invoke(context: Any, raw_arguments: str) -> Any:
-            token = self._active_tool_span.set(self._find_pending(context, tool))
-            try:
-                result = original_invoke(context, raw_arguments)
-                if inspect.isawaitable(result):
-                    return await result
-                return result
-            except BaseException as error:
-                self._finish_error(tool, context, error, raw_arguments=raw_arguments)
-                raise
-            finally:
-                self._active_tool_span.reset(token)
-
-        wrapped_failure: Any = None
-        if effective_failure is not None:
-
-            @wraps(effective_failure)
-            async def handle_failure(context: Any, error: Exception) -> Any:
-                self._finish_error(tool, context, error)
-                result = effective_failure(context, error)
-                if inspect.isawaitable(result):
-                    return await result
-                return result
-
-            wrapped_failure = handle_failure
-
-        patch = _FunctionToolPatch(
-            tool=tool,
-            original_invoke=original_invoke,
-            wrapped_invoke=wrapped_invoke,
-            original_failure=original_failure,
-            wrapped_failure=wrapped_failure,
-            uses_default_failure=uses_default_failure,
-        )
-        self._function_tool_patches[id(tool)] = patch
-        tool.on_invoke_tool = wrapped_invoke
-        if wrapped_failure is not None:
-            set_function_tool_failure_error_function(tool, wrapped_failure)
-        return patch
-
-    def _restore_executor_patch(self, patch: _ExecutorPatch) -> None:
-        for method_name, (instance_value, wrapped) in patch.methods.items():
-            if getattr(patch.session, method_name, None) is not wrapped:
-                continue
-            if instance_value is _MISSING:
-                with suppress(AttributeError):
-                    delattr(patch.session, method_name)
-            else:
-                setattr(patch.session, method_name, instance_value)
-        patch.methods.clear()
-
-    def _finish_error(
-        self,
-        tool: FunctionTool,
-        context: Any,
-        error: BaseException,
-        *,
-        raw_arguments: str | None = None,
-    ) -> None:
-        pending = self._take_pending(context, tool, raw_arguments=raw_arguments)
-        if pending is not None:
-            self._finish_pending(pending, error=error)
-
-    def _find_pending(self, context: Any, tool: Any) -> _OpenToolSpan | None:
-        call_id = _tool_call_id(context)
-        if call_id:
+            context_id = id(context)
             matches = [
                 pending
                 for pending in self._pending
-                if pending.tool is tool and pending.call_id == call_id
+                if pending.tool is tool and pending.context_id == context_id
             ]
             if len(matches) == 1:
                 return matches[0]
 
-        context_id = id(context)
-        matches = [
-            pending
-            for pending in self._pending
-            if pending.tool is tool and pending.context_id == context_id
-        ]
-        if len(matches) == 1:
-            return matches[0]
+            raw_arguments = _field(context, "tool_arguments", _MISSING)
+            if raw_arguments is not _MISSING:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.raw_arguments == raw_arguments
+                ]
+                if len(matches) == 1:
+                    return matches[0]
 
-        raw_arguments = _field(context, "tool_arguments", _MISSING)
-        if raw_arguments is not _MISSING:
-            matches = [
-                pending
-                for pending in self._pending
-                if pending.tool is tool and pending.raw_arguments == raw_arguments
-            ]
-            if len(matches) == 1:
-                return matches[0]
+            tool_input = _field(context, "tool_input", _MISSING)
+            if tool_input is not _MISSING:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.arguments == tool_input
+                ]
+                if len(matches) == 1:
+                    return matches[0]
 
-        tool_input = _field(context, "tool_input", _MISSING)
-        if tool_input is not _MISSING:
-            matches = [
-                pending
-                for pending in self._pending
-                if pending.tool is tool and pending.arguments == tool_input
-            ]
-            if len(matches) == 1:
-                return matches[0]
+            matches = [pending for pending in self._pending if pending.tool is tool]
+            return matches[0] if len(matches) == 1 else None
 
-        matches = [pending for pending in self._pending if pending.tool is tool]
-        return matches[0] if len(matches) == 1 else None
+        def _take_pending(
+            self,
+            context: Any,
+            tool: Any,
+            *,
+            raw_arguments: str | None = None,
+        ) -> _OpenToolSpan | None:
+            call_id = _tool_call_id(context)
+            if call_id:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.call_id == call_id
+                ]
+                if len(matches) == 1:
+                    self._pending.remove(matches[0])
+                    return matches[0]
+                return None
 
-    def _take_pending(
-        self,
-        context: Any,
-        tool: Any,
-        *,
-        raw_arguments: str | None = None,
-    ) -> _OpenToolSpan | None:
-        call_id = _tool_call_id(context)
-        if call_id:
             for index, pending in enumerate(self._pending):
-                if pending.tool is tool and pending.call_id == call_id:
+                if pending.tool is tool and pending.context_id == id(context):
                     return self._pending.pop(index)
 
-        for index, pending in enumerate(self._pending):
-            if pending.tool is tool and pending.context_id == id(context):
-                return self._pending.pop(index)
+            if raw_arguments is not None:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.raw_arguments == raw_arguments
+                ]
+                if len(matches) == 1:
+                    self._pending.remove(matches[0])
+                    return matches[0]
 
-        if raw_arguments is not None:
-            matches = [
-                pending
-                for pending in self._pending
-                if pending.tool is tool and pending.raw_arguments == raw_arguments
-            ]
+            tool_input = _field(context, "tool_input", _MISSING)
+            if tool_input is not _MISSING:
+                matches = [
+                    pending
+                    for pending in self._pending
+                    if pending.tool is tool and pending.arguments == tool_input
+                ]
+                if len(matches) == 1:
+                    self._pending.remove(matches[0])
+                    return matches[0]
+
+            matches = [pending for pending in self._pending if pending.tool is tool]
             if len(matches) == 1:
                 self._pending.remove(matches[0])
                 return matches[0]
+            return None
 
-        tool_input = _field(context, "tool_input", _MISSING)
-        if tool_input is not _MISSING:
-            matches = [
-                pending
-                for pending in self._pending
-                if pending.tool is tool and pending.arguments == tool_input
-            ]
-            if len(matches) == 1:
-                self._pending.remove(matches[0])
-                return matches[0]
-
-        matches = [pending for pending in self._pending if pending.tool is tool]
-        if len(matches) == 1:
-            self._pending.remove(matches[0])
-            return matches[0]
-        return None
-
-    def _finish_pending(
-        self,
-        pending: _OpenToolSpan,
-        *,
-        result: Any = None,
-        error: BaseException | str | None = None,
-    ) -> None:
-        effective_error = pending.error if pending.error is not None else error
-        end_time = time.time_ns()
-        try:
-            span = pending.span
-            if span is None:
-                span = self._audit_logger.start_tool(
-                    name=pending.name,
-                    call_id=pending.call_id,
-                    arguments=pending.arguments,
-                    tool_type=pending.tool_type,
-                    start_time=pending.start_time,
+        def _finish_pending(
+            self,
+            pending: _OpenToolSpan,
+            *,
+            result: Any = None,
+            error: BaseException | str | None = None,
+        ) -> None:
+            effective_error = pending.error if pending.error is not None else error
+            end_time = time.time_ns()
+            try:
+                span = pending.span
+                if span is None:
+                    span = self._audit_logger.start_tool(
+                        name=pending.name,
+                        call_id=pending.call_id,
+                        arguments=pending.arguments,
+                        tool_type=pending.tool_type,
+                        start_time=pending.start_time,
+                    )
+                self._audit_logger.end_tool(
+                    span,
+                    result=result if effective_error is None else None,
+                    error=effective_error,
+                    end_time=end_time,
                 )
-            self._audit_logger.end_tool(
-                span,
-                result=result if effective_error is None else None,
-                error=effective_error,
-                end_time=end_time,
-            )
-        finally:
-            if isinstance(pending.tool, FunctionTool):
-                self._release_function_tool(pending.tool)
+            finally:
+                if isinstance(pending.tool, FunctionTool):
+                    self._release_function_tool(pending.tool)
 
-    def _release_function_tool(self, tool: FunctionTool) -> None:
-        patch = self._function_tool_patches.get(id(tool))
-        if patch is None:
-            return
-        patch.active_calls = max(0, patch.active_calls - 1)
-        if patch.active_calls == 0:
-            self._restore_function_tool(patch)
+        def _release_function_tool(self, tool: FunctionTool) -> None:
+            patch = self._function_tool_patches.get(id(tool))
+            if patch is None:
+                return
+            patch.active_calls = max(0, patch.active_calls - 1)
+            if patch.active_calls == 0:
+                self._restore_function_tool(patch)
 
-    def _restore_function_tool(self, patch: _FunctionToolPatch) -> None:
-        tool = patch.tool
-        if tool.on_invoke_tool is patch.wrapped_invoke:
-            tool.on_invoke_tool = patch.original_invoke
-        if (
-            patch.wrapped_failure is not None
-            and getattr(tool, "_failure_error_function", None) is patch.wrapped_failure
-        ):
-            if patch.uses_default_failure:
-                set_function_tool_failure_error_function(tool)
-            else:
-                set_function_tool_failure_error_function(tool, patch.original_failure)
-        self._function_tool_patches.pop(id(tool), None)
+        def _restore_function_tool(self, patch: _FunctionToolPatch) -> None:
+            tool = patch.tool
+            if tool.on_invoke_tool is patch.wrapped_invoke:
+                tool.on_invoke_tool = patch.original_invoke
+            if (
+                patch.wrapped_failure is not None
+                and getattr(tool, "_failure_error_function", None) is patch.wrapped_failure
+            ):
+                if patch.uses_default_failure:
+                    set_function_tool_failure_error_function(tool)
+                else:
+                    set_function_tool_failure_error_function(tool, patch.original_failure)
+            self._function_tool_patches.pop(id(tool), None)
+
+    return OpenAIToolRunHooks(audit_logger)

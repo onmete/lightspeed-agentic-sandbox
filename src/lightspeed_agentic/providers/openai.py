@@ -295,15 +295,15 @@ class OpenAIProvider(AgentProvider):
         capabilities: list[Any] = []
         function_tools_list: list[Any] | None = None
         tool_hooks = None
-        model_proxy_class: Any = None
+        model_proxy_factory: Any = None
         if options.audit_logger is not None:
             from lightspeed_agentic.providers.openai_telemetry import (
-                OpenAIModelProxy,
-                OpenAIToolRunHooks,
+                create_model_proxy,
+                create_tool_hooks,
             )
 
-            tool_hooks = OpenAIToolRunHooks(options.audit_logger)
-            model_proxy_class = OpenAIModelProxy
+            tool_hooks = create_tool_hooks(options.audit_logger)
+            model_proxy_factory = create_model_proxy
 
         capabilities.append(
             Shell(configure_tools=tool_hooks.configure_shell_tools)
@@ -347,8 +347,8 @@ class OpenAIProvider(AgentProvider):
                 for tool in (read_file, write_file, list_directory, apply_patch)
             ]
 
-        if model_proxy_class is not None:
-            model = model_proxy_class(
+        if model_proxy_factory is not None:
+            model = model_proxy_factory(
                 model,
                 options.audit_logger,
                 request_model=options.model,

@@ -16,6 +16,20 @@ from opentelemetry.trace import NonRecordingSpan, Span, SpanKind, StatusCode
 from lightspeed_agentic.metrics import operation_duration, token_usage, tool_duration
 from lightspeed_agentic.tracing import get_tracer
 
+_METRIC_ERROR_TYPES = frozenset(
+    {
+        "TimeoutError",
+        "CancelledError",
+        "operation_cancelled",
+        "empty_response",
+        "error",
+        "response.error",
+        "response.failed",
+        "response.incomplete",
+        "response_incomplete",
+    }
+)
+
 
 @dataclass
 class _OpenSpan:
@@ -70,6 +84,11 @@ def _json_attribute(value: Any) -> str:
 
 def _error_type(error: BaseException | str) -> str:
     return error if isinstance(error, str) else type(error).__name__
+
+
+def _metric_error_type(error: BaseException | str) -> str:
+    error_type = _error_type(error)
+    return error_type if error_type in _METRIC_ERROR_TYPES else "_OTHER"
 
 
 def _unique_span_handle(span: Span) -> Span:
@@ -203,7 +222,7 @@ class AuditLogger:
                 gen_ai_request_model=state.model,
                 gen_ai_provider_name=self._provider,
                 gen_ai_operation_name=state.operation,
-                error_type=_error_type(error) if error is not None else "",
+                error_type=_metric_error_type(error) if error is not None else "",
             ).observe(duration)
         span.end(end_time=end_time)
 
@@ -279,7 +298,7 @@ class AuditLogger:
                     gen_ai_request_model=state.model,
                     gen_ai_provider_name=self._provider,
                     gen_ai_operation_name=state.operation,
-                    error_type=_error_type(error),
+                    error_type=_metric_error_type(error),
                 ).observe(self._duration_seconds(state, None, end_monotonic_ns))
             else:
                 tool_duration.labels(gen_ai_tool_name=state.tool_name).observe(

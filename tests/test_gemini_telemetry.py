@@ -285,6 +285,43 @@ def test_terminal_response_uses_buffered_parts_and_unknown_finish_reason() -> No
     assert end["finish_reasons"] == ["unknown"]
 
 
+def test_candidate_only_usage_records_output_without_inventing_reasoning(
+    span_exporter: Any,
+) -> None:
+    model = "gemini-candidate-only"
+    labels = {
+        "gen_ai_token_type": "output",
+        "gen_ai_request_model": model,
+        "gen_ai_provider_name": "gcp.gemini",
+        "gen_ai_operation_name": "generate_content",
+    }
+    before = REGISTRY.get_sample_value("gen_ai_client_token_usage_sum", labels) or 0
+    audit = AuditLogger(phase="analysis", model=model, provider="gcp.gemini")
+    telemetry = GeminiTelemetry(audit, requested_model=model)
+    context = object()
+    telemetry.before_model_callback(context, SimpleNamespace(model=model, contents=[], config=None))
+    telemetry.after_model_callback(
+        context,
+        SimpleNamespace(
+            partial=False,
+            usage_metadata=SimpleNamespace(candidates_token_count=5, thoughts_token_count=None),
+            content=SimpleNamespace(
+                role="model", parts=[SimpleNamespace(text="done", thought=False)]
+            ),
+        ),
+    )
+    telemetry.close()
+
+    span = next(
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == f"generate_content {model}"
+    )
+    assert span.attributes["gen_ai.usage.output_tokens"] == 5
+    assert "gen_ai.usage.reasoning.output_tokens" not in span.attributes
+    assert REGISTRY.get_sample_value("gen_ai_client_token_usage_sum", labels) == before + 5
+
+
 def test_model_error_records_only_observed_usage_and_partial_text() -> None:
     recorder = _Recorder()
     telemetry = GeminiTelemetry(recorder, requested_model="requested-model")
