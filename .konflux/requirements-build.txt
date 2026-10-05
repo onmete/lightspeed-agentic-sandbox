@@ -35,6 +35,7 @@ hatchling==1.32.4
     #   langchain-google-vertexai
     #   langchain-protocol
     #   langgraph
+    #   langgraph-sdk
     #   langsmith
     #   openai-agents
     #   wcmatch

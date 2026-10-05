@@ -53,6 +53,7 @@ constraint-dependencies = [
     "PyJWT>=2.14.0",
     "Authlib>=1.8.0",
     "anyio>=4.14.2",
+    "langgraph-sdk>=0.4.4",
 ]
 
 [tool.hatch.build.targets.wheel]

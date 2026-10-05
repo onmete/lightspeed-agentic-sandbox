@@ -92,6 +92,9 @@ langchain-protocol==0.0.18 \
 langgraph==1.2.12 \
     --hash=sha256:5fae9fa4ce771e90f10ff19ce0d5aaef4b41d7632c713d769e89cbce1241a4b9 \
     --hash=sha256:95403af7b510de8d79164742f71daaf866c69ca804a8cb72bef2cc1fa1ab9813
+langgraph-sdk==0.4.5 \
+    --hash=sha256:d49a98a2ee8e0c494b101a7caf8061c8b4b94d3ee5ada0ea2dbe50903a5487b1 \
+    --hash=sha256:e03ef033a20d21288af496e9b6c08ae3afcc1b58dc5abcd37575bfd1a93045de
 langsmith==0.14.0 \
     --hash=sha256:1a89e52c24edd6f4c24d8cfb32857814ceb5b9bec344a2850e86ab38475de362 \
     --hash=sha256:294a02addc2358fab390156b74fa942e2dd40b711f6507c5f26b5c208cc89e15
