@@ -35,3 +35,4 @@ authlib==1.8.0
 pyjwt==2.15.1
 anyio==4.15.1
 typing-extensions==4.16.0
+langgraph-sdk==0.4.5

@@ -113,8 +113,6 @@ langgraph-checkpoint==4.1.1 \
     --hash=sha256:c59ab7dc429c58ccf9450be8fd926555c07db254ced7f71207bdcd1bf23b7f90
 langgraph-prebuilt==1.1.0 \
     --hash=sha256:fcb28c370e02029e5cbbad115b082be4ee99cb85af75e3e461fe81e28182a663
-langgraph-sdk==0.4.2 \
-    --hash=sha256:6d39ae3da3be110ff182d8c58dd7d600c79e7b083ed747188ac44d5f0dbc089e
 mcp==1.28.1 \
     --hash=sha256:174c5665bf0f1155654bb74a9bd917db660ad66fee32b0e8606d35149e6476c2
 multidict==6.7.1 \
