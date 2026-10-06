@@ -10,7 +10,8 @@ The sandbox no longer exposes HTTP (`app.py`, `/health`, `/ready`, `/v1/agent/ru
 removed). Live BDD runs **batch Jobs** on an OpenShift cluster using the published
 sandbox image (`SANDBOX_IMAGE`, default Konflux `:main` tag). Pytest on the host
 creates input ConfigMaps + Jobs per scenario; step definitions assert on Result CR
-status and, when needed, pod log enrichment (see [Response bodies](#response-bodies)).
+status and, when needed, correlated source-span extraction from batch pod OTLP JSON stdout
+(see [Response bodies](#response-bodies)).
 
 ## Spike findings (OLS-3220)
 
@@ -22,7 +23,7 @@ output, and OTEL without flaky free-text LLM assertions.
 | Area | Approach | Artifact |
 |------|----------|----------|
 | Context reaches the model | **Structured echo**: prepared `context` (`targetNamespaces`, `previousAttempts`, `approvedOption`) + `outputSchema`; model echoes back as response fields | [sandbox_e2e.feature](../../../tests/e2e/features/sandbox_e2e.feature) |
-| OTEL traces and audit logs | Batch Job with audit enabled; poll in-cluster collector debug exporter | [sandbox_e2e.feature](../../../tests/e2e/features/sandbox_e2e.feature) |
+| OTEL traces and compliance logs | Batch Job with audit enabled; poll the collector for correlated traces and completed GenAI span-derived log records | [sandbox_e2e.feature](../../../tests/e2e/features/sandbox_e2e.feature) |
 | Structured output / skills | Batch Job per scenario | [structured_output.feature](../../../tests/e2e/features/structured_output.feature), [skills.feature](../../../tests/e2e/features/skills.feature) |
 | MCP connectivity | In-cluster mock MCP (`scripts/e2e-install-fixtures.sh`); `LIGHTSPEED_MCP_SERVERS` on Jobs | [mcp.feature](../../../tests/e2e/features/mcp.feature) |
 | Reasoning config | `LIGHTSPEED_REASONING_CONFIG` on Jobs (defaults per provider in `e2e-containers.sh`) | [reasoning_config.feature](../../../tests/e2e/features/reasoning_config.feature) |
@@ -99,8 +100,7 @@ relevant `what/` spec Verification table first, then the feature file.
 tests/e2e/
 ├── features/              # Gherkin scenarios
 ├── steps/                 # given / when / then step definitions
-├── batch_runner.py        # batch Job lifecycle + response mapping
-├── batch_log_contract.py  # pod log prefix contract (EventLogger)
+├── batch_runner.py        # Job lifecycle + Result CR/OTLP source-span response mapping
 ├── suite_setup.py         # session config + cluster preflight
 ├── run_result.py          # batch run result envelope for BDD steps
 ├── skills_fixtures.py     # skills ConfigMap helpers
@@ -180,15 +180,50 @@ suite default remains `false`.
 | `E2E_ARGS` | user / `--` passthrough | Extra pytest args (e.g. `-v`, `-k`, single file) |
 | `E2E_SKIP_FIXTURES` | user | Skip `e2e-install-fixtures.sh` when fixtures already present |
 | `ARTIFACT_DIR` | CI | Pytest tee to `e2e-<provider>-pytest.log` and summary file |
+| `LIGHTSPEED_AUDIT_ENABLED` | `batch_runner.py` | Always `true` on batch Jobs to emit source-span OTLP JSON to stdout |
+| `LIGHTSPEED_CAPTURE_CONTENT` | `batch_runner.py` | Always `true` so response and successful tool-result content remains in those compliance copies |
 
 ### Response bodies
 
+Batch and collector log bodies are raw HTTP response bytes: the harness MUST
+fetch them with `_preload_content=False` and decode `response.data` as UTF-8
+before parsing. Kubernetes `ApiClient` string deserialization otherwise turns
+multi-line bytes into an escaped `b'...'` representation, hiding span evidence.
+
 BDD steps assert a response envelope (`run_result.py`) built from:
 
-1. **Result CR status** — primary source (`batch_runner._body_from_result_cr`).
-2. **Pod log enrichment** — when CR status is generic (e.g. `summary: Step completed`),
-   merge agent output from the `[provider:run] output:` log line emitted by
-   `EventLogger` in `lightspeed_agentic.logging` (see `batch_log_contract.py`).
+1. **Result CR status** — primary and authoritative source (`batch_runner._body_from_result_cr`).
+2. **Agent source-span enrichment** — only when CR status is generic (e.g. `summary: Step completed`),
+   read the completed `invoke_agent` span from batch pod OTLP JSON stdout, correlated by
+   `agenticrun.uid` and `agenticrun.phase`. Decode the assistant text part of
+   `gen_ai.output.messages` and merge the exact post-shaped `AgentResult.output` JSON.
+   Typed CR fields and failed CR status are never overwritten.
+3. **Echo-token evidence** — use only `gen_ai.tool.call.result` from a correlated,
+   successful `execute_tool` span. Developer logs and the agent's final response do not
+   prove script execution. Missing or content-filtered spans do not fabricate output.
+   Successful OpenAI `exec_command` stdout can be a JSON object or contain
+   complete JSON lines among other text; token-like prose does not count.
+
+OLS-4371 offline verification replayed the failed Bedrock run's recorded pod logs:
+all 18 normally completed invocation outputs were recovered exactly, including
+the structured/context fields, and the successful tool span supplied the skills
+token. A real `run_agent_query()`/stdout-exporter smoke also passed. Native OpenAI
+`ExecCommandTool` execution in a local sandbox accepted token evidence for exit 0
+and rejected exit 7, including the SDK's retry-safe PTY-to-one-shot fallback.
+`make verify` and all 672 offline unit tests passed (15 warnings); the failed
+cluster suite was not rerun for this verification.
+
+The subsequent failed OpenAI run was replayed through a real `CoreV1Api` against
+a local HTTP server serving the recorded log bytes. Explicit UTF-8 decoding
+recovered all 17 normally completed OpenAI outputs and the successful skills
+token; correlated collector trace and audit-log predicates also passed. The same
+HTTP replay recovered 18 Bedrock outputs and its skills token. That Bedrock run's
+collector log artifact was not published, so no collector replay is claimed for
+it. OpenAI command stdout can contain skill instructions before the token JSON;
+the token parser also accepts complete JSON lines within a successful command
+result. These offline replays do not establish a live cluster E2E pass.
+After rebasing on main `8c36b8e`, `make verify` and all 677 offline unit tests
+passed, including the real HTTP fetch regressions and failed-exit token checks.
 
 Then steps use batch-oriented wording:
 

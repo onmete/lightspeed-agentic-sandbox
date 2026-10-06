@@ -42,7 +42,7 @@ It keeps original messages unchanged for state and history offload.
 
 Existing output limits and artifact offload occur first.
 When enabled, SAFE-01 inspects the effective content before SAFE-02 adds its markers.
-A rejected result retains the existing fail-closed path and does not reach model context or audit content events.
+A rejected result remains excluded from model context and normalized result events, but does not suppress its completed native source span: the span retains the raw callback result from execution completion, before inspection. Content-enabled compliance copies may retain a result later rejected; content-disabled copies filter the six standard content fields only, without mutating source spans or trace export.
 
 ### Fixed delimiters
 
@@ -88,9 +88,9 @@ Repeated model calls receive exactly one sandbox-owned wrapper per result repres
 Tool names, call IDs, result status, and message ordering remain unchanged.
 
 Inspection-pass correlation continues to use the original effective content.
-Normalized result events and approved audit/content records retain that complete content without sandbox-added markers.
-The adapter releases pending result events only after the model-boundary middleware accepts the associated results. If inspection rejects a result, the adapter releases no pending result events from that model boundary.
-Existing payload-free developer logging and rejected-result suppression rules remain active.
+After inspection passes, normalized result events retain the complete effective content without sandbox-added markers. If inspection rejects any result at a model boundary, the adapter releases no pending normalized result events from that boundary, including sibling results; this gates model and application-event delivery, not source telemetry.
+Independently, each successfully completed native tool span records the complete raw callback result at execution completion, before inspection, and remains UNSET even if the result is later rejected. Content-enabled compliance copies derived from the span may retain that raw result; content-disabled filtering affects compliance copies only and does not mutate source spans or OTLP trace export.
+Payload-free developer logging and inspection telemetry remain active, and SAFE-02 wrapping does not alter inspection-pass correlation.
 
 ### Token usage
 
@@ -109,7 +109,7 @@ The sandbox does not add Classic service budget enforcement or assume a fixed wr
 ## Verification
 
 Offline tests cover the requirements in `provider-contract.md`.
-They exercise actual main-agent/subagent model requests, summary-model inputs, raw history offload, original normalized events, enabled/disabled inspection, repeated calls, and rejected results.
+They exercise actual main-agent/subagent model requests, summary-model inputs, raw history offload, unwrapped normalized result events for accepted outputs, enabled/disabled inspection, repeated calls, and rejected results.
 They also cover control-message exclusions, preserved operator instructions, wrapper token usage, and unchanged Gemini/OpenAI behavior.
 The implementation adds no dependency, CRD, or operator change.
 
@@ -117,7 +117,7 @@ The implementation adds no dependency, CRD, or operator change.
 
 The model receives a consistent signal that external tool output is reference data, not an instruction source.
 The middleware must preserve separate model-facing and event-facing representations.
-This separation prevents wrapping from breaking existing inspection-pass correlation or content-event fidelity.
+This separation prevents wrapping from breaking existing inspection-pass correlation, application events, or full-content span-attribute fidelity.
 
 Delimiters and instructions mitigate prompt injection. They do not enforce a security boundary or guarantee compliant model behavior.
 The formatter escapes external closing-marker text and does not treat marker text as proof of prior sandbox-owned wrapping.

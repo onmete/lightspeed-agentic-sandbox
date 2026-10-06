@@ -2,23 +2,35 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from kubernetes.client import ApiException  # type: ignore[import-untyped]
+from kubernetes.client import (
+    ApiClient,
+    ApiException,
+    Configuration,
+    CoreV1Api,
+)  # type: ignore[import-untyped]
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
-from tests.e2e.batch_log_contract import PROVIDER_OUTPUT_LOG_PREFIX
+from lightspeed_agentic.tracing import OTLPJsonStdoutExporter
 from tests.e2e.batch_runner import (
     _body_from_result_cr,
     _build_job_spec,
     _delete_config_map_ignore_not_found,
-    _enrich_body_from_pod_logs,
-    _needs_pod_log_enrichment,
-    _parse_echo_token_from_pod_logs,
-    _parse_provider_output_json,
+    _enrich_body_from_otlp_stdout,
+    _fetch_job_pod_logs,
+    _needs_agent_result_enrichment,
+    _parse_echo_token_from_otlp_stdout,
     _set_config_map_job_owner,
     build_result_template,
     run_batch_query,
@@ -37,6 +49,95 @@ from tests.e2e.suite_setup import (
     resolve_llm_secret,
     resolve_model,
 )
+
+
+def _agent_span(
+    output: dict[str, Any] | None,
+    *,
+    run_uid: str,
+    phase: str,
+    status_code: StatusCode | None = None,
+) -> tuple[str, dict[str, Any], StatusCode | None]:
+    attributes: dict[str, Any] = {
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.agent.name": "lightspeed",
+        "agenticrun.uid": run_uid,
+        "agenticrun.phase": phase,
+    }
+    if output is not None:
+        attributes["gen_ai.output.messages"] = json.dumps(
+            [
+                {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "type": "text",
+                            "content": json.dumps(output, ensure_ascii=False),
+                        }
+                    ],
+                    "finish_reason": "unknown",
+                }
+            ]
+        )
+    return "invoke_agent lightspeed", attributes, status_code
+
+
+def _tool_span(
+    result: Any,
+    *,
+    run_uid: str,
+    phase: str,
+    tool_name: str = "shell",
+    status_code: StatusCode | None = None,
+) -> tuple[str, dict[str, Any], StatusCode | None]:
+    attributes: dict[str, Any] = {
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": tool_name,
+        "agenticrun.uid": run_uid,
+        "agenticrun.phase": phase,
+    }
+    if result is not None:
+        attributes["gen_ai.tool.call.result"] = json.dumps(result)
+    return f"execute_tool {tool_name}", attributes, status_code
+
+
+def _openai_exec_result(output: str, *, exit_code: int) -> str:
+    """Format a sanitized `ExecCommandTool._format_response` result."""
+    return (
+        "Chunk ID: a1b2c3\n"
+        "Wall time: 0.0123 seconds\n"
+        f"Process exited with code {exit_code}\n"
+        "Output:\n"
+        f"{output}"
+    )
+
+
+def _export_otlp_stdout(
+    capsys: pytest.CaptureFixture[str],
+    spans: list[tuple[str, dict[str, Any], StatusCode | None]],
+    *,
+    capture_content: bool = True,
+) -> str:
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": "lightspeed-agentic-sandbox"})
+    )
+    provider.add_span_processor(
+        SimpleSpanProcessor(OTLPJsonStdoutExporter(capture_content=capture_content))
+    )
+    tracer = provider.get_tracer(
+        "lightspeed_agentic",
+        schema_url="https://opentelemetry.io/schemas/1.41.0",
+    )
+    for name, attributes, status_code in spans:
+        with tracer.start_as_current_span(
+            name,
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            if status_code is not None:
+                span.set_status(Status(status_code))
+    provider.shutdown()
+    return capsys.readouterr().out
 
 
 class TestBuildResultTemplate:
@@ -166,83 +267,648 @@ class TestSkillConfigMapKeys:
             _cm_key_from_rel("docs/a__b.md")
 
 
-class TestParseEchoTokenFromPodLogs:
-    def test_extracts_script_stdout_json(self) -> None:
-        token = "a" * 32
-        logs = f'tool output: {{"token": "{token}", "status": "ok"}}\n'
-        assert _parse_echo_token_from_pod_logs(logs) == token
-
-    def test_uses_last_match_when_script_ran_multiple_times(self) -> None:
-        first = "b" * 32
-        second = "c" * 32
-        logs = (
-            f'shell: {{"token": "{first}", "status": "ok"}}\n'
-            f'shell: {{"token": "{second}", "status": "ok"}}\n'
-        )
-        assert _parse_echo_token_from_pod_logs(logs) == second
-
-    def test_returns_empty_when_script_output_missing(self) -> None:
-        logs = '[provider:run] output: {"success": true, "token": "deadbeef", "summary": "ok"}'
-        assert _parse_echo_token_from_pod_logs(logs) == ""
-
-    def test_falls_back_to_provider_output_json(self) -> None:
-        token = "d" * 32
-        logs = (
-            "INFO lightspeed_agentic: [provider:run] output: "
-            f'{{"success": true, "summary": "token ok", "token": "{token}", "status": "ok"}}'
-        )
-        assert _parse_echo_token_from_pod_logs(logs) == token
-
-
-class TestEnrichBodyFromPodLogs:
-    def test_log_prefix_matches_sandbox_event_logger(self) -> None:
-        assert PROVIDER_OUTPUT_LOG_PREFIX == "[provider:run] output: "
-
-    def test_merges_provider_output_line(self) -> None:
-        body = {"success": True, "summary": "Step completed"}
-        logs = (
-            "INFO lightspeed_agentic: [provider:run] output: "
-            '{"success": true, "summary": "e2e-flat-ok", "ticketId": "E2E-STRUCT-001"}'
-        )
-        enriched = _enrich_body_from_pod_logs(body, logs)
-        assert enriched["ticketId"] == "E2E-STRUCT-001"
-        assert enriched["summary"] == "e2e-flat-ok"
-
-    def test_merges_plain_text_reasoning_output(self) -> None:
-        body = {"success": True, "summary": "Step completed"}
-        logs = "INFO lightspeed_agentic: [provider:run] output: 391\n"
-        enriched = _enrich_body_from_pod_logs(body, logs)
-        assert enriched["summary"] == "391"
-        assert enriched["content"] == "391"
-
-    def test_skips_enrichment_when_cr_already_has_echo_fields(self) -> None:
-        body = {
+class TestEnrichBodyFromOtlpStdout:
+    def test_merges_exact_agent_result_into_generic_cr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        output = {
             "success": True,
-            "summary": "context-echo-ok",
-            "namespaces": "ns-a, ns-b",
+            "summary": "e2e-flat-ok",
+            "ticketId": "E2E-STRUCT-001",
+            "items": [{"name": "alpha", "metadata": {"region": "east"}}],
         }
-        assert _needs_pod_log_enrichment(body) is False
-
-    def test_enriches_when_cr_summary_is_generic(self) -> None:
-        body = {"success": True, "summary": "Step completed"}
-        assert _needs_pod_log_enrichment(body) is True
-
-    def test_skips_enrichment_when_cr_has_failure_reason(self) -> None:
-        body = {"success": False, "summary": "agent error", "failureReason": "load_skill failed"}
-        assert _needs_pod_log_enrichment(body) is False
-
-    def test_parses_escaped_newline_logs(self) -> None:
-        body = {"success": True, "summary": "Step completed"}
-        logs = (
-            "INFO lightspeed_agentic: [provider:run] output: "
-            '{"success": true, "summary": "e2e-flat-ok", "ticketId": "E2E-STRUCT-001"}'
-            "\\nINFO lightspeed_agentic: [agent] query complete"
+        body = _body_from_result_cr(
+            {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Completed",
+                            "status": "True",
+                            "reason": "Succeeded",
+                            "message": "Step completed",
+                        }
+                    ]
+                }
+            }
         )
-        parsed = _parse_provider_output_json(logs)
-        assert parsed is not None
-        assert parsed["ticketId"] == "E2E-STRUCT-001"
-        enriched = _enrich_body_from_pod_logs(body, logs)
-        assert enriched["ticketId"] == "E2E-STRUCT-001"
+        stdout = _export_otlp_stdout(
+            capsys,
+            [_agent_span(output, run_uid=run_uid, phase=phase)],
+        )
+
+        assert body == {"success": True, "summary": "Step completed"}
+        assert _enrich_body_from_otlp_stdout(
+            body,
+            stdout,
+            run_uid=run_uid,
+            phase=phase,
+        ) == {**body, **output}
+
+    def test_preserves_domain_false_agent_result(self, capsys: pytest.CaptureFixture[str]) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        output = {
+            "success": False,
+            "summary": "domain validation failed",
+            "invalidFields": ["ticketId"],
+        }
+        body = _body_from_result_cr(
+            {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Completed",
+                            "status": "True",
+                            "reason": "Succeeded",
+                            "message": "Step completed",
+                        }
+                    ]
+                }
+            }
+        )
+        stdout = _export_otlp_stdout(
+            capsys,
+            [_agent_span(output, run_uid=run_uid, phase=phase)],
+        )
+
+        enriched = _enrich_body_from_otlp_stdout(
+            body,
+            stdout,
+            run_uid=run_uid,
+            phase=phase,
+        )
+        assert enriched["success"] is False
+        assert enriched["summary"] == "domain validation failed"
+        assert enriched["invalidFields"] == ["ticketId"]
+
+    def test_ignores_wrong_run_phase_agent_and_non_agent_content(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        output = {"success": True, "summary": "unrelated", "ticketId": "not-current"}
+        inference_attributes = _agent_span(output, run_uid=run_uid, phase=phase)[1]
+        inference_attributes["gen_ai.operation.name"] = "chat"
+        wrong_agent = _agent_span(output, run_uid=run_uid, phase=phase)
+        wrong_agent[1]["gen_ai.agent.name"] = "other-agent"
+        wrong_span_name = _agent_span(output, run_uid=run_uid, phase=phase)
+        wrong_span_name = (
+            "invoke_agent other-agent",
+            wrong_span_name[1],
+            wrong_span_name[2],
+        )
+        stdout = _export_otlp_stdout(
+            capsys,
+            [
+                _agent_span(output, run_uid="other-run", phase=phase),
+                _agent_span(output, run_uid=run_uid, phase="execution"),
+                wrong_agent,
+                wrong_span_name,
+                ("chat model", inference_attributes, None),
+                _tool_span(
+                    {"success": True, "summary": "tool result", "ticketId": "tool-only"},
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+            ],
+        )
+        logs = f"INFO lightspeed_agentic: response={json.dumps(output)}\n{stdout}"
+        body = {"success": True, "summary": "Step completed"}
+
+        assert (
+            _enrich_body_from_otlp_stdout(
+                body,
+                logs,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == body
+        )
+
+    def test_filtered_missing_or_failed_terminal_output_does_not_invent_result(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        body = {"success": True, "summary": "Step completed"}
+        output = {"success": True, "summary": "must not be recovered"}
+        filtered = _export_otlp_stdout(
+            capsys,
+            [_agent_span(output, run_uid=run_uid, phase=phase)],
+            capture_content=False,
+        )
+        no_terminal = _export_otlp_stdout(
+            capsys,
+            [_agent_span(None, run_uid=run_uid, phase=phase)],
+        )
+
+        failed_terminal = _export_otlp_stdout(
+            capsys,
+            [
+                _agent_span(
+                    output,
+                    run_uid=run_uid,
+                    phase=phase,
+                    status_code=StatusCode.ERROR,
+                )
+            ],
+        )
+        assert (
+            _enrich_body_from_otlp_stdout(
+                body,
+                filtered,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == body
+        )
+        assert (
+            _enrich_body_from_otlp_stdout(
+                body,
+                no_terminal,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == body
+        )
+        assert (
+            _enrich_body_from_otlp_stdout(
+                body,
+                failed_terminal,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == body
+        )
+        assert (
+            _enrich_body_from_otlp_stdout(
+                body,
+                f"INFO lightspeed_agentic: response={json.dumps(output)}",
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == body
+        )
+
+    def test_typed_and_failed_cr_status_remain_authoritative(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        output = {
+            "success": False,
+            "summary": "agent output",
+            "diagnosis": {"summary": "agent diagnosis"},
+            "ticketId": "must-not-override",
+        }
+        stdout = _export_otlp_stdout(
+            capsys,
+            [_agent_span(output, run_uid=run_uid, phase=phase)],
+        )
+        typed_body = _body_from_result_cr(
+            {
+                "status": {
+                    "actionRequired": "False",
+                    "diagnosis": {"summary": "CR diagnosis", "rootCause": "CR root cause"},
+                    "conditions": [
+                        {
+                            "type": "Completed",
+                            "status": "True",
+                            "reason": "Succeeded",
+                            "message": "Step completed",
+                        }
+                    ],
+                }
+            }
+        )
+        failed_body = _body_from_result_cr(
+            {
+                "status": {
+                    "failureReason": "CR failure",
+                    "conditions": [
+                        {
+                            "type": "Completed",
+                            "status": "True",
+                            "reason": "Failed",
+                            "message": "Step failed",
+                        }
+                    ],
+                }
+            }
+        )
+        non_generic_body = {"success": True, "summary": "CR summary"}
+        assert _needs_agent_result_enrichment(non_generic_body) is False
+        assert (
+            _enrich_body_from_otlp_stdout(
+                non_generic_body,
+                stdout,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == non_generic_body
+        )
+
+        assert _needs_agent_result_enrichment(typed_body) is False
+        assert (
+            _enrich_body_from_otlp_stdout(
+                typed_body,
+                stdout,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == typed_body
+        )
+        assert (
+            _enrich_body_from_otlp_stdout(
+                failed_body,
+                stdout,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == failed_body
+        )
+
+
+class TestParseEchoTokenFromToolSpans:
+    def test_extracts_latest_token_from_successful_structured_tool_result(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        echoed_token = "a" * 32
+        first_token = "b" * 32
+        token = "c" * 32
+        returncode_token = "f" * 32
+        stdout = _export_otlp_stdout(
+            capsys,
+            [
+                _agent_span(
+                    {"success": True, "summary": "echoed", "token": echoed_token},
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+                _tool_span(
+                    {
+                        "exit_code": 0,
+                        "stderr": "",
+                        "stdout": json.dumps({"token": first_token, "status": "ok"}) + "\n",
+                    },
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+                _tool_span(
+                    {
+                        "exit_code": 0,
+                        "stderr": "",
+                        "stdout": json.dumps({"token": token, "status": "ok"}) + "\n",
+                    },
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+                _tool_span(
+                    {
+                        "returncode": 0,
+                        "stderr": "",
+                        "stdout": json.dumps({"token": returncode_token, "status": "ok"}) + "\n",
+                    },
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+            ],
+        )
+
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                stdout,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == returncode_token
+        )
+
+    def test_openai_exec_result_requires_success_exit_code(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        token = "f" * 32
+        token_json = json.dumps({"token": token, "status": "ok"})
+        output = f"Contents of SKILL.md\n{token_json}\n"
+        successful = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    _openai_exec_result(output, exit_code=0),
+                    run_uid=run_uid,
+                    phase=phase,
+                    tool_name="exec_command",
+                )
+            ],
+        )
+        fallback_output = (
+            "PTY transport failed before the interactive session opened; "
+            "fell back to one-shot exec.\n" + output
+        )
+        fallback = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    _openai_exec_result(fallback_output, exit_code=0),
+                    run_uid=run_uid,
+                    phase=phase,
+                    tool_name="exec_command",
+                )
+            ],
+        )
+        failed = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    _openai_exec_result(output, exit_code=7),
+                    run_uid=run_uid,
+                    phase=phase,
+                    tool_name="exec_command",
+                )
+            ],
+        )
+        embedded = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    _openai_exec_result(
+                        f"Skill prose mentions {token_json} inline.\n",
+                        exit_code=0,
+                    ),
+                    run_uid=run_uid,
+                    phase=phase,
+                    tool_name="exec_command",
+                )
+            ],
+        )
+
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                successful,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == token
+        )
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                fallback,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == token
+        )
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                failed,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == ""
+        )
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                embedded,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == ""
+        )
+
+    def test_deepagents_success_trailer_is_required(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        token = "e" * 32
+        script_json = json.dumps({"token": token, "status": "ok"})
+        # Sanitized captured DeepAgents result: stdout followed by its command status.
+        successful = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    script_json + "\n\n[Command succeeded with exit code 0]",
+                    run_uid=run_uid,
+                    phase=phase,
+                )
+            ],
+        )
+        failed = _export_otlp_stdout(
+            capsys,
+            [
+                _tool_span(
+                    script_json + "\n\n[Command failed with exit code 1]",
+                    run_uid=run_uid,
+                    phase=phase,
+                )
+            ],
+        )
+
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                successful,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == token
+        )
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                failed,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == ""
+        )
+
+    def test_rejects_unrelated_failed_filtered_and_echoed_tokens(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "run-uid"
+        phase = "analysis"
+        token = "d" * 32
+        tool_result = {
+            "returncode": 0,
+            "stderr": "",
+            "stdout": json.dumps({"token": token, "status": "ok"}),
+        }
+        nonzero_result = {
+            "exit_code": 127,
+            "stderr": "",
+            "stdout": json.dumps({"token": token, "status": "ok"}),
+        }
+        nonzero_returncode_result = {
+            "returncode": 127,
+            "stderr": "",
+            "stdout": json.dumps({"token": token, "status": "ok"}),
+        }
+        error_result = {
+            "error": "Execution failed: sanitized command failure",
+            "stderr": "",
+            "stdout": json.dumps({"token": token, "status": "ok"}),
+        }
+        stdout = _export_otlp_stdout(
+            capsys,
+            [
+                _agent_span(
+                    {"success": True, "summary": "echo", "token": token},
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+                _tool_span(tool_result, run_uid="other-run", phase=phase),
+                _tool_span(tool_result, run_uid=run_uid, phase="execution"),
+                _tool_span(
+                    tool_result,
+                    run_uid=run_uid,
+                    phase=phase,
+                    status_code=StatusCode.ERROR,
+                ),
+                _tool_span(nonzero_result, run_uid=run_uid, phase=phase),
+                _tool_span(
+                    nonzero_returncode_result,
+                    run_uid=run_uid,
+                    phase=phase,
+                ),
+                _tool_span(error_result, run_uid=run_uid, phase=phase),
+                _tool_span(None, run_uid=run_uid, phase=phase),
+            ],
+        )
+        logs = f"INFO lightspeed_agentic: token={token}\n{stdout}"
+        filtered = _export_otlp_stdout(
+            capsys,
+            [_tool_span(tool_result, run_uid=run_uid, phase=phase)],
+            capture_content=False,
+        )
+
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                logs,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == ""
+        )
+        assert (
+            _parse_echo_token_from_otlp_stdout(
+                filtered,
+                run_uid=run_uid,
+                phase=phase,
+            )
+            == ""
+        )
+
+
+class TestFetchedPodLogs:
+    def test_multiline_utf8_logs_feed_result_and_echo_token_consumers(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run_uid = "raw-pod-log-run"
+        phase = "analysis"
+        echo_token = "a" * 32
+        output = {
+            "success": True,
+            "summary": "context-echo-ok — café 東京",
+            "namespaces": "ns-e2e-alpha, ns-e2e-bravo",
+            "ticketId": "E2E-STRUCT-001",
+            "items": [{"name": "café 東京", "count": 1}],
+        }
+        stdout = _export_otlp_stdout(
+            capsys,
+            [
+                _agent_span(output, run_uid=run_uid, phase=phase),
+                _tool_span(
+                    _openai_exec_result(
+                        "Echo-token skill instructions from SKILL.md\n"
+                        + json.dumps({"token": echo_token, "status": "ok"})
+                        + "\n",
+                        exit_code=0,
+                    ),
+                    run_uid=run_uid,
+                    phase=phase,
+                    tool_name="exec_command",
+                ),
+            ],
+        )
+        log_lines = [
+            json.dumps(json.loads(line), ensure_ascii=False) for line in stdout.splitlines()
+        ]
+        log_body = ("batch log: café 東京\n" + "\n".join(log_lines) + "\n").encode("utf-8")
+        pod_list_body = (
+            b'{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},'
+            b'"items":[{"metadata":{"name":"batch-pod","uid":"batch-pod-uid"}}]}'
+        )
+
+        class PodLogHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                if self.path.startswith("/api/v1/namespaces/e2e/pods?"):
+                    payload = pod_list_body
+                    content_type = "application/json"
+                elif self.path.startswith("/api/v1/namespaces/e2e/pods/batch-pod/log"):
+                    payload = log_body
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), PodLogHandler) as server:
+            configuration = Configuration()
+            configuration.host = f"http://127.0.0.1:{server.server_port}"
+            api_client = ApiClient(configuration=configuration)
+            core_api = CoreV1Api(api_client)
+            server_thread = Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            try:
+                pod_logs = _fetch_job_pod_logs(core_api, "e2e", "batch-job")
+                generic_body = {"success": True, "summary": "Step completed"}
+                enriched = _enrich_body_from_otlp_stdout(
+                    generic_body,
+                    pod_logs,
+                    run_uid=run_uid,
+                    phase=phase,
+                )
+
+                assert enriched == {**generic_body, **output}
+                assert (
+                    _parse_echo_token_from_otlp_stdout(
+                        pod_logs,
+                        run_uid=run_uid,
+                        phase=phase,
+                    )
+                    == echo_token
+                )
+                log_body = b"\xff"
+                with pytest.raises(UnicodeDecodeError):
+                    _fetch_job_pod_logs(core_api, "e2e", "batch-job")
+            finally:
+                try:
+                    api_client.close()
+                finally:
+                    server.shutdown()
+                    server_thread.join()
 
 
 class TestLoadBatchE2EConfig:

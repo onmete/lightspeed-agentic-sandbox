@@ -44,15 +44,6 @@ def provider_name() -> str:
     return name
 
 
-@pytest.fixture
-def e2e_output_dir() -> Path | None:
-    """Host-side output directory where skill tools write token files."""
-    raw = os.environ.get("E2E_OUTPUT_DIR", "").strip()
-    if not raw:
-        return None
-    return Path(raw)
-
-
 @pytest.fixture(scope="session")
 def _k8s_config_loaded() -> None:
     """Load kubeconfig once per session."""

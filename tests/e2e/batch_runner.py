@@ -1,8 +1,8 @@
 """Batch Job runner for E2E — cluster Job lifecycle (OLS-3926).
 
 Maps each scenario to a batch Job + Result CR, then builds a response envelope
-for BDD steps. When the Result CR status is generic, enriches from the batch
-pod log line documented in ``batch_log_contract`` (see ``lightspeed_agentic.logging``).
+for BDD steps. Generic Result CR status is enriched from the completed agent
+source span in the batch pod's OTLP JSON stdout.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 import re
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,10 +26,6 @@ from kubernetes.client import (  # type: ignore[import-untyped]
     V1OwnerReference,
 )
 
-from tests.e2e.batch_log_contract import (
-    PROVIDER_OUTPUT_LOG_PREFIX,
-    _GENERIC_CR_SUMMARIES,
-)
 from tests.e2e.k8s_constants import CRD_GROUP, CRD_VERSION
 from tests.e2e.skills_fixtures import (
     E2E_POD_OUTPUT_DIR,
@@ -64,6 +60,7 @@ _STEP_TO_KIND: dict[str, str] = {
 
 E2E_DEFAULT_AGENT_TIMEOUT_SECONDS = 600
 E2E_DEFAULT_AGENT_MAX_TURNS = "200"
+_GENERIC_CR_SUMMARIES = frozenset({"step completed", "step failed"})
 
 
 @dataclass
@@ -81,7 +78,7 @@ class RunBatchResult:
     run_uid: str = ""
     step: str = "analysis"
     body: dict[str, Any] = field(default_factory=dict)
-    token_file: str = ""
+    tool_token: str = ""
 
     @property
     def agent_succeeded(self) -> bool:
@@ -269,7 +266,9 @@ def run_batch_query(
     result.pod_logs = _fetch_job_pod_logs(core_api, config.namespace, job_name)
     result.termination_message = _fetch_termination_message(core_api, config.namespace, job_name)
     if mount_skills:
-        result.token_file = _parse_echo_token_from_pod_logs(result.pod_logs)
+        result.tool_token = _parse_echo_token_from_otlp_stdout(
+            result.pod_logs, run_uid=result.run_uid, phase=result.step
+        )
 
     if not job_ok:
         result.error = wait_err or "batch job did not succeed"
@@ -294,100 +293,245 @@ def run_batch_query(
         return result
 
     result.body = _body_from_result_cr(result.result_cr)  # pyright: ignore[reportArgumentType]
-    if _needs_pod_log_enrichment(result.body):
-        result.body = _enrich_body_from_pod_logs(result.body, result.pod_logs)
+    result.body = _enrich_body_from_otlp_stdout(
+        result.body,
+        result.pod_logs,
+        run_uid=result.run_uid,
+        phase=result.step,
+    )
     result.latency_seconds = time.monotonic() - start
     return result
 
 
-def _needs_pod_log_enrichment(body: dict[str, Any]) -> bool:
-    """Return True when Result CR status lacks agent echo fields BDD expects."""
-    if body.get("failureReason"):
+def _needs_agent_result_enrichment(body: dict[str, Any]) -> bool:
+    """Return True only when Result CR status has a generic response envelope."""
+    if body.get("failureReason") or body.get("success") is False:
+        return False
+    if any(
+        key in body
+        for key in ("options", "actionRequired", "diagnosis", "actionsTaken", "checks", "content")
+    ):
         return False
     summary = str(body.get("summary", "")).strip().lower()
-    if summary in _GENERIC_CR_SUMMARIES or not summary:
-        return True
-    echo_keys = (
-        "namespaces",
-        "firstFailureReason",
-        "approvedTitle",
-        "firstCommand",
-        "ticketId",
-        "token",
-        "items",
-        "onlyFieldAlpha",
+    return summary in _GENERIC_CR_SUMMARIES or not summary
+
+
+def _iter_otlp_spans(pod_logs: str) -> Iterator[dict[str, Any]]:
+    """Yield spans from the OTLP-JSON requests emitted on separate stdout lines."""
+    for line in pod_logs.splitlines():
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(request, dict):
+            continue
+        resource_spans = request.get("resource_spans")
+        if not isinstance(resource_spans, list):
+            continue
+        for resource_span in resource_spans:
+            if not isinstance(resource_span, dict):
+                continue
+            scope_spans = resource_span.get("scope_spans")
+            if not isinstance(scope_spans, list):
+                continue
+            for scope_span in scope_spans:
+                if not isinstance(scope_span, dict):
+                    continue
+                spans = scope_span.get("spans")
+                if isinstance(spans, list):
+                    yield from (span for span in spans if isinstance(span, dict))
+
+
+def _otel_string_attributes(span: dict[str, Any]) -> dict[str, str]:
+    """Read only string-typed attributes from an OTLP-JSON Span."""
+    attributes: dict[str, str] = {}
+    raw_attributes = span.get("attributes")
+    if not isinstance(raw_attributes, list):
+        return attributes
+    for attribute in raw_attributes:
+        if not isinstance(attribute, dict):
+            continue
+        key = attribute.get("key")
+        value = attribute.get("value")
+        if isinstance(key, str) and isinstance(value, dict):
+            string_value = value.get("string_value")
+            if isinstance(string_value, str):
+                attributes[key] = string_value
+    return attributes
+
+
+def _span_has_error(span: dict[str, Any]) -> bool:
+    status = span.get("status")
+    return isinstance(status, dict) and status.get("code") in (
+        "STATUS_CODE_ERROR",
+        "ERROR",
+        2,
     )
-    return not any(key in body for key in echo_keys)
 
 
-_PROVIDER_OUTPUT_LOG_PREFIX = PROVIDER_OUTPUT_LOG_PREFIX
+def _parse_agent_result_from_otlp_stdout(
+    pod_logs: str,
+    *,
+    run_uid: str,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Decode the correlated invoke-agent span's assistant text AgentResult JSON."""
+    for span in _iter_otlp_spans(pod_logs):
+        attributes = _otel_string_attributes(span)
+        if (
+            span.get("name") != "invoke_agent lightspeed"
+            or attributes.get("gen_ai.operation.name") != "invoke_agent"
+            or attributes.get("gen_ai.agent.name") != "lightspeed"
+            or attributes.get("agenticrun.uid") != run_uid
+            or attributes.get("agenticrun.phase") != phase
+            or _span_has_error(span)
+        ):
+            continue
+        messages_json = attributes.get("gen_ai.output.messages")
+        if messages_json is None:
+            continue
+        try:
+            messages = json.loads(messages_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            parts = message.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                content = part.get("content")
+                if not isinstance(content, str):
+                    continue
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(result, dict):
+                    return result
+    return None
 
 
-def _normalize_pod_logs(pod_logs: str) -> str:
-    """Decode escaped newlines returned by some Kubernetes log API responses."""
-    if pod_logs.count("\n") <= 1 and "\\n" in pod_logs:
-        return pod_logs.replace("\\n", "\n")
-    return pod_logs
+def _enrich_body_from_otlp_stdout(
+    body: dict[str, Any],
+    pod_logs: str,
+    *,
+    run_uid: str,
+    phase: str,
+) -> dict[str, Any]:
+    """Merge a correlated completed agent result only into a generic CR body."""
+    if not _needs_agent_result_enrichment(body):
+        return body
+    parsed = _parse_agent_result_from_otlp_stdout(
+        pod_logs,
+        run_uid=run_uid,
+        phase=phase,
+    )
+    if parsed is None:
+        return body
+    enriched = dict(body)
+    enriched.update(parsed)
+    return enriched
 
 
 # echo-token.sh stdout: {"token": "<32 hex>", "status": "ok"}
-_ECHO_TOKEN_SCRIPT_JSON_RE = re.compile(r'\{"token":\s*"([0-9a-f]{32})"\s*,\s*"status":\s*"ok"\}')
+_DEEPAGENTS_SUCCESS_TRAILER = "\n\n[Command succeeded with exit code 0]"
+_OPENAI_EXEC_SUCCESS_RESULT_RE = re.compile(
+    r"\AChunk ID: [0-9a-f]{6}\n"
+    r"Wall time: [0-9]+\.[0-9]{4} seconds\n"
+    r"Process exited with code 0\n"
+    r"(?:Original token count: [0-9]+\n)?"
+    r"Output:\n"
+    r"(?:PTY transport failed before the interactive session opened; "
+    r"fell back to one-shot exec\.\n)?"
+    r"(?P<output>.*)\Z",
+    re.DOTALL,
+)
 _ECHO_TOKEN_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _parse_echo_token_from_pod_logs(pod_logs: str) -> str:
-    """Return token from echo-token.sh stdout embedded in batch pod logs."""
-    normalized = _normalize_pod_logs(pod_logs)
-    matches = _ECHO_TOKEN_SCRIPT_JSON_RE.findall(normalized)
-    if matches:
-        return matches[-1]  # type: ignore[no-any-return]
-    # Some providers (e.g. Gemini ADK) omit raw tool stdout from pod logs but include
-    # the script token in the final structured agent output line.
-    parsed = _parse_provider_output_json(pod_logs)
-    if parsed:
-        token = str(parsed.get("token", "")).strip()
-        status = str(parsed.get("status", "")).strip()
-        if _ECHO_TOKEN_HEX_RE.match(token) and status == "ok":
-            return token
+def _parse_echo_token_from_otlp_stdout(
+    pod_logs: str,
+    *,
+    run_uid: str,
+    phase: str,
+) -> str:
+    """Return a token only from a correlated, successful tool-result span."""
+    matches = []
+    for span in _iter_otlp_spans(pod_logs):
+        attributes = _otel_string_attributes(span)
+        if (
+            attributes.get("gen_ai.operation.name") != "execute_tool"
+            or attributes.get("agenticrun.uid") != run_uid
+            or attributes.get("agenticrun.phase") != phase
+            or not attributes.get("gen_ai.tool.name")
+            or _span_has_error(span)
+        ):
+            continue
+        result_json = attributes.get("gen_ai.tool.call.result")
+        if result_json is None:
+            continue
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError:
+            continue
+        token = _echo_token_from_tool_result(result)
+        if token:
+            matches.append(token)
+    return matches[-1] if matches else ""
+
+
+def _echo_token_from_tool_result(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            openai_match = _OPENAI_EXEC_SUCCESS_RESULT_RE.fullmatch(value)
+            if openai_match is not None:
+                output = openai_match.group("output")
+                try:
+                    decoded = json.loads(output)
+                except json.JSONDecodeError:
+                    token = ""
+                    for line in output.splitlines():
+                        try:
+                            line_result = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(line_result, dict):
+                            token = _echo_token_from_tool_result(line_result) or token
+                    return token
+            else:
+                text = value.lstrip()
+                try:
+                    decoded, end = json.JSONDecoder().raw_decode(text)
+                except json.JSONDecodeError:
+                    return ""
+                if text[end:] != _DEEPAGENTS_SUCCESS_TRAILER:
+                    return ""
+        return _echo_token_from_tool_result(decoded)
+    if not isinstance(value, dict):
+        return ""
+    for key in ("exit_code", "returncode"):
+        if key in value and value[key] != 0:
+            return ""
+    if value.get("error"):
+        return ""
+    token = value.get("token")
+    if (
+        value.get("status") == "ok"
+        and isinstance(token, str)
+        and _ECHO_TOKEN_HEX_RE.fullmatch(token)
+    ):
+        return token
+    if "stdout" in value:
+        return _echo_token_from_tool_result(value["stdout"])
     return ""
-
-
-def _parse_provider_output_json(pod_logs: str) -> dict[str, Any] | None:
-    """Extract the agent JSON object logged after ``[provider:run] output:``."""
-    normalized = _normalize_pod_logs(pod_logs)
-    marker = _PROVIDER_OUTPUT_LOG_PREFIX
-    idx = normalized.find(marker)
-    if idx == -1:
-        return None
-    tail = normalized[idx + len(marker) :].lstrip()
-    try:
-        parsed, _end = json.JSONDecoder().raw_decode(tail)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _enrich_body_from_pod_logs(body: dict[str, Any], pod_logs: str) -> dict[str, Any]:
-    """Merge agent output from batch pod logs when Result CR status lacks echo fields."""
-    parsed = _parse_provider_output_json(pod_logs)
-    if parsed is not None:
-        merged = dict(body)
-        merged.update(parsed)
-        return merged
-
-    normalized = _normalize_pod_logs(pod_logs)
-    marker = _PROVIDER_OUTPUT_LOG_PREFIX
-    idx = normalized.find(marker)
-    if idx == -1:
-        return body
-    text = normalized[idx + len(marker) :].split("\n", 1)[0].strip()
-    if not text or not body.get("success"):
-        return body
-    merged = dict(body)
-    if not merged.get("summary") or merged.get("summary") == "Step completed":
-        merged["summary"] = text
-    merged.setdefault("content", text)
-    return merged
 
 
 def _body_from_result_cr(result_cr: dict[str, Any]) -> dict[str, Any]:
@@ -466,7 +610,6 @@ def _build_job_spec(
     env = [
         {"name": "LIGHTSPEED_PROVIDER", "value": config.lightspeed_provider},
         {"name": "LIGHTSPEED_MODEL", "value": config.model},
-        {"name": "LIGHTSPEED_AUDIT_ENABLED", "value": "true"},
         {"name": "LIGHTSPEED_AGENTICRUN_UID", "value": run_uid},
         {"name": "LIGHTSPEED_AGENTICRUN_STEP", "value": step},
     ]
@@ -475,6 +618,9 @@ def _build_job_spec(
     job_env = {**config.job_env, **(job_env_overrides or {})}
     for key, value in job_env.items():
         env.append({"name": key, "value": value})
+    for key in ("LIGHTSPEED_AUDIT_ENABLED", "LIGHTSPEED_CAPTURE_CONTENT"):
+        env = [item for item in env if item["name"] != key]
+        env.append({"name": key, "value": "true"})
 
     env_names = {item["name"] for item in env}
     if "LIGHTSPEED_AGENT_TIMEOUT_SECONDS" not in env_names:
@@ -623,10 +769,18 @@ def _fetch_job_pod_logs(core_api: CoreV1Api, namespace: str, job_name: str) -> s
         return ""
     pod_name = pods.items[0].metadata.name  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess, reportIndexIssue]
     try:
-        raw = core_api.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=200)  # pyright: ignore[reportArgumentType]
+        response = core_api.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=namespace,
+            tail_lines=200,
+            _preload_content=False,
+        )  # pyright: ignore[reportArgumentType]
     except ApiException:
         return ""
-    return _normalize_pod_logs(raw)  # pyright: ignore[reportArgumentType]
+    try:
+        return response.data.decode("utf-8")
+    finally:
+        response.release_conn()
 
 
 def _fetch_termination_message(core_api: CoreV1Api, namespace: str, job_name: str) -> str | None:

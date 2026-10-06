@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import jsonschema
@@ -11,6 +10,12 @@ from pytest_bdd import then
 
 from tests.e2e.analysis_schemas import ANALYSIS_WITH_COMPONENTS_SCHEMA
 from tests.e2e.analysis_tokens import assert_skill_tokens_in_response
+from tests.e2e.credentials import (
+    PROVIDER_ANTHROPIC_BEDROCK_DEEPAGENTS,
+    PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS,
+    PROVIDER_GEMINI_VERTEX_ADK,
+    PROVIDER_OPENAI_AGENTS,
+)
 from tests.e2e.mock_mcp_server import MCP_FAIL_SENTINEL
 from tests.e2e.otel_verify import (
     wait_for_otel_audit_logs,
@@ -18,8 +23,14 @@ from tests.e2e.otel_verify import (
     wait_for_otel_traces,
 )
 from tests.e2e.run_result import E2ERunResult
-from tests.e2e.skills_fixtures import E2E_TOKEN_REL_PATH
 from tests.e2e.suite_setup import BatchE2EConfig
+
+_OTEL_EXPECTED_IDENTITY = {
+    PROVIDER_OPENAI_AGENTS: ("chat", "openai"),
+    PROVIDER_GEMINI_VERTEX_ADK: ("generate_content", "gcp.vertex_ai"),
+    PROVIDER_ANTHROPIC_VERTEX_DEEPAGENTS: ("chat", "gcp.vertex_ai"),
+    PROVIDER_ANTHROPIC_BEDROCK_DEEPAGENTS: ("chat", "aws.bedrock"),
+}
 
 # SHA-256 of empty string — models sometimes fabricate this instead of running echo-token.sh
 _EMPTY_STRING_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -77,9 +88,16 @@ def assert_otel_traces_received(
     batch_e2e_config: BatchE2EConfig,
     k8s_core_client: CoreV1Api,
 ) -> None:
-    """Assert the e2e OTEL collector debug output includes spans for this batch run."""
+    """Assert the expected provider inference span is exported for this batch run."""
     run_uid = _require_run_uid(bdd_context)
-    wait_for_otel_traces(k8s_core_client, batch_e2e_config.namespace, run_uid)
+    expected_operation, expected_provider = _OTEL_EXPECTED_IDENTITY[batch_e2e_config.provider_name]
+    wait_for_otel_traces(
+        k8s_core_client,
+        batch_e2e_config.namespace,
+        run_uid,
+        expected_operation=expected_operation,
+        expected_provider=expected_provider,
+    )
 
 
 @then("the run fails closed with a tool-result safety inspection error")
@@ -129,14 +147,17 @@ def assert_otel_audit_logs_received(
     batch_e2e_config: BatchE2EConfig,
     k8s_core_client: CoreV1Api,
 ) -> None:
-    """Assert bridged audit OTLP logs include agenticrun uid/phase for this batch run."""
+    """Assert span-derived logs include correlated trace context and a standard body."""
     run_uid = _require_run_uid(bdd_context)
     phase = str(bdd_context.get("run_step", "analysis"))
+    expected_operation, expected_provider = _OTEL_EXPECTED_IDENTITY[batch_e2e_config.provider_name]
     wait_for_otel_audit_logs(
         k8s_core_client,
         batch_e2e_config.namespace,
         run_uid,
         phase=phase,
+        expected_operation=expected_operation,
+        expected_provider=expected_provider,
     )
 
 
@@ -249,40 +270,28 @@ def assert_approved_option_matches_context(bdd_context: dict[str, Any]) -> None:
     )
 
 
-@then("the skill script wrote a token file to disk")
-def assert_token_file(
+@then("the successful skill execution returned a token")
+def assert_successful_skill_execution_returned_token(
     bdd_context: dict[str, Any],
-    e2e_output_dir: Path | None,
 ) -> None:
-    """Assert echo-token.sh ran (token recovered from batch pod logs or host output dir)."""
-    token = str(bdd_context.get("token_file", "")).strip()
-    if not token:
-        if bdd_context.get("batch_job_name"):
-            msg = (
-                "echo-token script output not found in batch pod logs; "
-                "the agent must run bash scripts/echo-token.sh from the skill directory"
-            )
-            raise AssertionError(msg)
-        assert e2e_output_dir is not None, "E2E_OUTPUT_DIR not set"
-        host_path = e2e_output_dir / E2E_TOKEN_REL_PATH
-        assert host_path.exists(), (
-            f"token file not found at {host_path}; "
-            "the agent must run bash scripts/echo-token.sh from the skill directory"
-        )
-        token = host_path.read_text(encoding="utf-8").strip()
-    assert token, "token file is empty"
-    bdd_context["token"] = token
+    """Assert a correlated successful execute_tool result contains the echo token."""
+    tool_token = str(bdd_context.get("tool_token", "")).strip()
+    assert tool_token, (
+        "echo-token script output not found in a correlated successful execute_tool span; "
+        "the agent must run bash scripts/echo-token.sh from the skill directory"
+    )
 
 
-@then("the response contains the generated token")
-def assert_token_in_response(bdd_context: dict[str, Any]) -> None:
-    """Assert the response body or summary includes the token from disk."""
+@then("the response contains the tool-returned token")
+def assert_response_contains_tool_token(bdd_context: dict[str, Any]) -> None:
+    """Assert the response body or summary includes the successful tool token."""
     body = bdd_context["response_body"]
-    token = bdd_context["token"]
+    tool_token = bdd_context["tool_token"]
     response_token = body.get("token", "")
     summary = body.get("summary", "")
-    assert token in response_token or token in summary, (
-        f"token {token!r} not found in response token={response_token!r} or summary={summary!r}"
+    assert tool_token in response_token or tool_token in summary, (
+        f"tool-returned token {tool_token!r} not found in response token={response_token!r} "
+        f"or summary={summary!r}"
     )
 
 

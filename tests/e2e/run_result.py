@@ -36,5 +36,5 @@ def store_run_result(bdd_context: dict[str, Any], result: E2ERunResult) -> None:
         bdd_context["run_uid"] = result.batch.run_uid
         bdd_context["run_step"] = result.batch.step
         bdd_context["batch_job_name"] = result.batch.job_name
-        if result.batch.token_file:
-            bdd_context["token_file"] = result.batch.token_file
+        if result.batch.tool_token:
+            bdd_context["tool_token"] = result.batch.tool_token

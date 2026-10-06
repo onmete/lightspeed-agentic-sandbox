@@ -16,9 +16,9 @@ Feature: Skills
     And the echo-token skill query has been prepared
     When I run the agent with the prepared echo-token query
     Then the batch job completes
-    And the skill script wrote a token file to disk
+    And the successful skill execution returned a token
     And the response JSON validates against the output schema
-    And the response contains the generated token
+    And the response contains the tool-returned token
 
   Scenario: Non-skill query is unaffected by mounted skills
     Given the sandbox service is running with skills

@@ -12,8 +12,11 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from lightspeed_agentic.audit import AuditLogger
 
 from lightspeed_agentic.skills import has_skills
 from lightspeed_agentic.types import (
@@ -235,6 +238,7 @@ async def _shape_structured_output(
     system_prompt: str,
     prompt: str,
     agent_text: str,
+    audit_logger: AuditLogger | None = None,
 ) -> tuple[Any, int, int]:
     """Shape pass: tool-free structured binding on a model without thinking."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -258,9 +262,30 @@ async def _shape_structured_output(
             )
         ),
     ]
+    callback_handler = None
+    if audit_logger is not None:
+        from lightspeed_agentic.providers.deepagents_telemetry import create_callback_handler
+
+        callback_handler = create_callback_handler(
+            audit_logger,
+            model=model,
+            output_type="json",
+        )
+    request_error: BaseException | None = None
     try:
-        result = await structured.ainvoke(shape_messages)
+        if callback_handler is None:
+            result = await structured.ainvoke(shape_messages)
+        else:
+            result = await structured.ainvoke(
+                shape_messages,
+                config={"callbacks": [callback_handler], "tags": ["nostream"]},
+            )
+    except BaseException as exc:
+        request_error = exc
+        raise
     finally:
+        if callback_handler is not None:
+            callback_handler.close(error=request_error)
         await _close_model_clients(format_model)
     if isinstance(result, dict) and "parsed" in result:
         parsed = result["parsed"]
@@ -357,6 +382,14 @@ class DeepAgentsProvider(AgentProvider):
         )
 
         chat_model = _resolve_model(options.model, options.reasoning_config)
+        audit_callbacks = None
+        if options.audit_logger is not None:
+            from lightspeed_agentic.providers.deepagents_telemetry import create_callback_handler
+
+            audit_callbacks = create_callback_handler(
+                options.audit_logger,
+                model=options.model,
+            )
         backend = LocalShellBackend(
             root_dir=options.cwd,
             inherit_env=True,
@@ -384,12 +417,21 @@ class DeepAgentsProvider(AgentProvider):
                 )
 
                 classifier_model = _resolve_model(options.model, reasoning_config=None)
-                classifier_client = LangChainClassifierClient(classifier_model)
+                classifier_client = LangChainClassifierClient(
+                    classifier_model,
+                    audit_logger=options.audit_logger,
+                    requested_model=options.model,
+                )
                 model_profile = getattr(classifier_model, "profile", None) or {}
                 context_window_tokens = (
                     model_profile.get("max_input_tokens")
                     or model_profile.get("max_context_size")
                     or 100_000
+                )
+                inspection_correlation = (
+                    options.audit_logger.correlation_attributes()
+                    if options.audit_logger is not None
+                    else {}
                 )
 
                 async def inspect_tool_result_callback(
@@ -411,6 +453,7 @@ class DeepAgentsProvider(AgentProvider):
                         deadline=options.deadline,
                         provider="anthropic",
                         model=options.model,
+                        correlation_attributes=inspection_correlation,
                     )
 
                 inspector_callback = inspect_tool_result_callback
@@ -471,6 +514,8 @@ class DeepAgentsProvider(AgentProvider):
             "configurable": {"thread_id": thread_id},
             "recursion_limit": options.max_turns,
         }
+        if audit_callbacks is not None:
+            stream_config["callbacks"] = [audit_callbacks]
         result_text = ""
         pending_tool_results: list[tuple[str, str, str, Any, ToolResultEvent]] = []
         total_input_tokens = 0
@@ -486,6 +531,7 @@ class DeepAgentsProvider(AgentProvider):
             pending_tool_call_chunk = None
             return events
 
+        stream_error: BaseException | None = None
         try:
             async for msg, _stream_metadata in cast(Any, agent).astream(
                 input_state,
@@ -575,7 +621,12 @@ class DeepAgentsProvider(AgentProvider):
                         )
             for event in flush_pending_tool_calls():
                 yield event
+        except BaseException as exc:
+            stream_error = exc
+            raise
         finally:
+            if audit_callbacks is not None:
+                audit_callbacks.close(error=stream_error)
             await _close_model_clients(chat_model)
             if classifier_model is not None:
                 await _close_model_clients(classifier_model)
@@ -587,6 +638,7 @@ class DeepAgentsProvider(AgentProvider):
                 options.system_prompt,
                 options.prompt,
                 result_text,
+                audit_logger=options.audit_logger,
             )
             result_text = stringify(structured)
             total_input_tokens += in_tok

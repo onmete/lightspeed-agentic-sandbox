@@ -13,7 +13,6 @@ E2E_POD_OUTPUT_DIR = "/tmp/lightspeed-e2e-output"  # noqa: S108 — pod-local em
 E2E_POD_SKILLS_DIR = "/app/skills"
 E2E_POD_SKILLS_SRC_DIR = "/mnt/e2e-skills-src"
 E2E_POD_SKILLS_WORKDIR = "/app/skills/.agents"
-E2E_TOKEN_REL_PATH = ".e2e_token"  # noqa: S105 — relative output filename, not a credential
 
 
 def list_skill_dirs() -> list[Path]:
