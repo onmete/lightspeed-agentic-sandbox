@@ -331,8 +331,20 @@ class DeepAgentsProvider(AgentProvider):
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
 
+        from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
+
+        try:
+            from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+
+            from lightspeed_agentic.inspection.middleware import (
+                TOOL_DATA_TRUST_INSTRUCTION,
+                ToolResultInspectionMiddleware,
+            )
+        except Exception as exc:
+            raise ToolResultSafetyInspectionFailed() from exc
+
         classifier_model: Any | None = None
-        inspection_middleware: Any | None = None
+        inspector_callback: Any | None = None
 
         logger.debug(
             "Starting deepagents query model=%s cwd=%s max_turns=%s",
@@ -348,24 +360,25 @@ class DeepAgentsProvider(AgentProvider):
             max_output_bytes=MAX_TOOL_RETURN_CHARS,
         )
 
+        instruction = TOOL_DATA_TRUST_INSTRUCTION.strip()
+        subagent_spec = {**GENERAL_PURPOSE_SUBAGENT}
+        subagent_system_prompt = subagent_spec.get("system_prompt") or ""
+        subagent_spec["system_prompt"] = (
+            f"{subagent_system_prompt}\n{instruction}" if subagent_system_prompt else instruction
+        )
         agent_kwargs: dict[str, Any] = {
             "model": chat_model,
             "backend": backend,
-            "system_prompt": options.system_prompt,
+            "system_prompt": f"{options.system_prompt}\n{instruction}",
         }
 
         if options.tool_output_inspection_enabled:
-            from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
-
             try:
-                from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
-
                 from lightspeed_agentic.inspection.chunking import Utf8ByteCodec
                 from lightspeed_agentic.inspection.client import LangChainClassifierClient
                 from lightspeed_agentic.inspection.inspector import (
                     inspect_tool_result as run_inspection,
                 )
-                from lightspeed_agentic.inspection.middleware import ToolResultInspectionMiddleware
 
                 classifier_model = _resolve_model(options.model, reasoning_config=None)
                 classifier_client = LangChainClassifierClient(classifier_model)
@@ -397,18 +410,16 @@ class DeepAgentsProvider(AgentProvider):
                         model=options.model,
                     )
 
-                inspection_middleware = ToolResultInspectionMiddleware(inspect_tool_result_callback)
-                agent_kwargs["middleware"] = [inspection_middleware]
-                agent_kwargs["subagents"] = [
-                    {
-                        **GENERAL_PURPOSE_SUBAGENT,
-                        "middleware": [inspection_middleware],
-                    }
-                ]
+                inspector_callback = inspect_tool_result_callback
             except Exception as exc:
                 if classifier_model is not None:
                     await _close_model_clients(classifier_model)
                 raise ToolResultSafetyInspectionFailed() from exc
+
+        inspection_middleware = ToolResultInspectionMiddleware(inspector_callback)
+        agent_kwargs["middleware"] = [inspection_middleware]
+        subagent_spec["middleware"] = [inspection_middleware]
+        agent_kwargs["subagents"] = [subagent_spec]
 
         if has_skills(options.cwd):
             agent_kwargs["skills"] = [options.cwd]
@@ -478,7 +489,7 @@ class DeepAgentsProvider(AgentProvider):
                 stream_mode="messages",
             ):
                 if msg.type in ("ai", "AIMessageChunk"):
-                    if inspection_middleware is not None:
+                    if options.tool_output_inspection_enabled:
                         for (
                             tool_name,
                             result_type,
@@ -545,7 +556,14 @@ class DeepAgentsProvider(AgentProvider):
                         output=stringify(msg.content),
                         call_id=call_id,
                     )
-                    if inspection_middleware is None:
+                    if not options.tool_output_inspection_enabled:
+                        if not inspection_middleware.is_passed(
+                            tool_name,
+                            result_type,
+                            call_id,
+                            msg.content,
+                        ):
+                            raise ToolResultSafetyInspectionFailed()
                         yield tool_result_event
                     else:
                         pending_tool_results.append(
