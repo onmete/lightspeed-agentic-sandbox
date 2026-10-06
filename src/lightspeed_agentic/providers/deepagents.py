@@ -175,10 +175,11 @@ def _json_schema_to_pydantic(schema: dict[str, Any], name: str = "OutputModel") 
 
     for field_name, field_schema in props.items():
         field_type = _resolve_field_type(field_schema, field_name)
+        description = field_schema.get("description")
         if field_name in required:
-            fields[field_name] = (field_type, ...)
+            fields[field_name] = (field_type, pydantic.Field(..., description=description))
         else:
-            fields[field_name] = (field_type | None, None)
+            fields[field_name] = (field_type | None, pydantic.Field(None, description=description))
 
     return pydantic.create_model(name, **fields)
 
@@ -250,7 +251,10 @@ async def _shape_structured_output(
             content=(
                 f"Original user request:\n{prompt}\n\n"
                 f"Agent run output:\n{agent_text}\n\n"
-                "Produce the structured response matching the required schema."
+                "Call the structured response tool with every required field. "
+                "Use native JSON types: booleans for boolean fields, arrays for array fields, "
+                "and objects for object fields. Never serialize an array or object as a string. "
+                "Base the field values only on the agent run output."
             )
         ),
     ]

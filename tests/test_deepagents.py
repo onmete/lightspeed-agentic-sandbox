@@ -300,11 +300,115 @@ class TestJsonSchemaToPydantic:
         instance = model(status="ok")
         assert instance.status == "ok"
 
+    def test_preserves_field_descriptions_for_anthropic_tool_schema(self) -> None:
+        from langchain_anthropic.chat_models import convert_to_anthropic_tool
+
+        from lightspeed_agentic.providers.deepagents import _json_schema_to_pydantic
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "success": {"type": "boolean", "description": "Whether every action succeeded"},
+                "actionsTaken": {
+                    "type": "array",
+                    "description": "List of actions actually performed, in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "outcome": {
+                                "type": "string",
+                                "description": "Whether the action succeeded",
+                            }
+                        },
+                        "required": ["outcome"],
+                    },
+                },
+            },
+            "required": ["success", "actionsTaken"],
+        }
+        tool_schema = convert_to_anthropic_tool(_json_schema_to_pydantic(schema))["input_schema"]
+        assert tool_schema["properties"]["success"]["description"] == (
+            "Whether every action succeeded"
+        )
+        actions = tool_schema["properties"]["actionsTaken"]
+        assert actions["description"] == "List of actions actually performed, in order"
+        assert actions["items"]["properties"]["outcome"]["description"] == (
+            "Whether the action succeeded"
+        )
+
     def test_missing_properties_raises(self) -> None:
         from lightspeed_agentic.providers.deepagents import _json_schema_to_pydantic
 
         with pytest.raises(ValueError, match="missing 'properties'"):
             _json_schema_to_pydantic({"type": "object"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parsed", [None, {"success": False}])
+async def test_shaping_prompt_requests_native_json_types_once(parsed: Any) -> None:
+    """Shaping uses one call, even when the result cannot be parsed."""
+    from langchain_anthropic.chat_models import convert_to_anthropic_tool
+    from langchain_core.messages import AIMessage
+
+    from lightspeed_agentic.providers import deepagents as mod
+
+    execution_schema = {
+        "type": "object",
+        "properties": {
+            "success": {"type": "boolean", "description": "Whether all actions succeeded"},
+            "actionsTaken": {
+                "type": "array",
+                "description": "Actions performed, in order",
+                "items": {
+                    "type": "object",
+                    "properties": {"description": {"type": "string"}},
+                    "required": ["description"],
+                },
+            },
+        },
+        "required": ["success", "actionsTaken"],
+    }
+    schema_model = mod._json_schema_to_pydantic(execution_schema)
+
+    bound = MagicMock()
+    bound.ainvoke = AsyncMock(
+        return_value={
+            "parsed": parsed,
+            "raw": AIMessage(content=""),
+            "parsing_error": ValueError("invalid") if parsed is None else None,
+        }
+    )
+    model = MagicMock()
+    model.with_structured_output.return_value = bound
+    with (
+        patch.object(mod, "_resolve_model", return_value=model),
+        patch.object(mod, "_close_model_clients", new_callable=AsyncMock),
+    ):
+        result, _, _ = await mod._shape_structured_output(
+            "claude-sonnet-5", schema_model, "sys", "ask", "agent report"
+        )
+
+    assert result == parsed
+    bound.ainvoke.assert_awaited_once()
+    tool_schema = convert_to_anthropic_tool(model.with_structured_output.call_args.args[0])[
+        "input_schema"
+    ]
+    assert tool_schema["required"] == ["success", "actionsTaken"]
+    assert tool_schema["properties"]["success"]["description"] == "Whether all actions succeeded"
+    assert tool_schema["properties"]["actionsTaken"]["description"] == (
+        "Actions performed, in order"
+    )
+    assert (
+        tool_schema["properties"]["actionsTaken"]["items"]["properties"]["description"]["type"]
+        == "string"
+    )
+    messages = bound.ainvoke.await_args.args[0]
+    prompt = messages[1].content
+    assert "Agent run output:\nagent report" in prompt
+    assert "every required field" in prompt
+    assert "booleans for boolean fields" in prompt
+    assert "arrays for array fields" in prompt
+    assert "Never serialize an array or object as a string" in prompt
 
 
 class TestEventMapping:
