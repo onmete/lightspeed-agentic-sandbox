@@ -107,6 +107,8 @@ Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-
 
 18h. If inspection fails, `AuditLogger` MUST receive no content event for the rejected result.
 
+18i. The DeepAgents adapter MUST hold normalized `ToolResultEvent` records until the model-boundary middleware accepts the associated results. If inspection rejects any result, the adapter MUST release no pending result events from that boundary. Rejected output and pending sibling output MUST NOT enter audit content events.
+
 ### Metrics
 
 19. The sandbox MUST record the following `gen_ai.*` Prometheus histograms during agent execution (`metrics.py`). Histograms are **in-process only** (`prometheus_client`); the batch entrypoint MUST NOT expose a `/metrics` HTTP scrape endpoint and MUST NOT export histograms to OTLP or Pushgateway at shutdown. Short-lived one-shot pods are a poor fit for pull-based Prometheus scraping; **OTLP traces** (with `gen_ai.usage.*` on inference spans) are the operational signal when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Unit tests (`tests/test_metrics.py`) verify histogram recording.

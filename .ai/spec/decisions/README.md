@@ -6,4 +6,4 @@ Each file follows the naming convention `NNNN-slug.md` (e.g., `0001-mcp-transpor
 
 | Decision | Status |
 |---|---|
-| [0001-tool-output-boundary.md](0001-tool-output-boundary.md) | [PLANNED: OLS-3929] Accepted DeepAgents-only SAFE-02 design |
+| [0001-tool-output-boundary.md](0001-tool-output-boundary.md) | Accepted DeepAgents-only SAFE-02 design |
