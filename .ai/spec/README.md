@@ -34,7 +34,7 @@ These specs define the behavioral rules and codebase navigation for the lightspe
 
 | Decision | Description |
 |---|---|
-| [0001-tool-output-boundary.md](decisions/0001-tool-output-boundary.md) | [PLANNED: OLS-3929] DeepAgents-only SAFE-02 boundaries, trust instruction, and model/event separation |
+| [0001-tool-output-boundary.md](decisions/0001-tool-output-boundary.md) | DeepAgents-only SAFE-02 boundaries, trust instruction, and model/event separation |
 
 ## Scope
 

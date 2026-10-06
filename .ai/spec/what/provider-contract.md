@@ -130,7 +130,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
  7. **Disabled behavior.** When `LIGHTSPEED_TOOL_OUTPUT_INSPECTION_ENABLED` is false, the middleware MUST skip inspection calls and inspection-based termination. The main-system safety instruction remains active for every provider.
 
-### Tool-Output Content Boundary (SAFE-02) [PLANNED: OLS-3929]
+### Tool-Output Content Boundary (SAFE-02)
 
  1. **Runtime coverage.** Only DeepAgents MUST apply this boundary. Gemini ADK and OpenAI Agents behavior remains unchanged for this ticket.
 
@@ -144,7 +144,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
     </tool_data>
     ```
 
-    The markers are delimiters, not parseable XML. The `source` value contains the tool name for identification only. This contract requires no XML parsing or source-attribute escaping.
+    The markers are delimiters, not parseable XML. The `source` value contains the tool name for identification only. Before interpolation, the formatter MUST HTML-escape the source attribute. It MUST escape each case-insensitive `</tool_data` sequence in external content by inserting a backslash before `/`, producing `<\/tool_data`.
 
  4. **System instruction.** DeepAgents MUST append this instruction to its effective system prompt:
 
@@ -162,7 +162,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
  8. **Repeated calls.** Each result MUST receive exactly one sandbox-owned wrapper in each model-facing representation. The middleware MUST use internal message identity or state to track its own wrapper. It MUST NOT infer prior wrapping from markers in external content. Tool names, call IDs, status, and message ordering MUST remain unchanged.
 
- 9. **Event representation.** Sandbox-added markers MUST affect only model-facing content. Normalized `ToolResultEvent` output and approved audit/content records MUST retain the complete result without sandbox-added markers. Existing payload-free developer logging and rejected-result suppression rules remain active. Wrapping MUST NOT invalidate the inspection-pass correlation used to release accepted result events.
+ 9. **Event representation.** Sandbox-added markers MUST affect only model-facing content. Normalized `ToolResultEvent` output and approved audit/content records MUST retain the complete result without sandbox-added markers. Existing payload-free developer logging and rejected-result suppression rules remain active. The adapter MUST hold pending result events until the model-boundary middleware accepts the associated results. If inspection rejects any result, the adapter MUST release no pending result events from that model boundary. Wrapping MUST NOT invalidate inspection-pass correlation.
 
 10. **Token usage.** Model requests MUST include the complete wrapper. Provider-reported input usage MUST retain those tokens through existing usage accounting. The sandbox MUST NOT import Classic service tool-budget behavior or assume a fixed token cost per wrapper.
 
@@ -197,13 +197,13 @@ Decision record: [0001-tool-output-boundary.md](../decisions/0001-tool-output-bo
 - [PLANNED: OLS-3928] Fast mock tests verify contract conformance, offloaded read paths, disabled inspection, and controlled sandbox failure.
 - [PLANNED: OLS-3928] Integration tests verify inspection before `ToolResultEvent` emission. They verify payload-free `EventLogger` records and full-fidelity `AuditLogger` events after a pass. They also verify rejected-event suppression and controlled termination without a Result CR.
 - The cross-repository real-model corpus and reporting requirements are owned by `openshift/ols/.ai/spec/what/tool-result-inspection.md`.
-- [PLANNED: OLS-3929] Offline tests MUST cover success, tool-generated errors, MCP and built-in tools, empty content, and content that contains boundary markers.
-- [PLANNED: OLS-3929] Tests MUST cover offload previews/references, later artifact reads/searches, and main-agent/general-purpose-subagent model requests.
-- [PLANNED: OLS-3929] Tests MUST verify inspection-before-wrapping, rejected-result suppression, and active wrapping with inspection disabled.
-- [PLANNED: OLS-3929] Tests MUST verify exactly one sandbox-owned wrapper across repeated model calls and unchanged call IDs, names, status, and ordering.
-- [PLANNED: OLS-3929] Tests MUST verify trust-instruction inclusion, preserved operator instructions, unwrapped control messages/tool calls, and unchanged tool-free shaping.
-- [PLANNED: OLS-3929] Tests MUST verify complete unwrapped normalized/audit results, inspection-pass correlation, and wrapper inclusion in model requests and reported usage.
-- [PLANNED: OLS-3929] Tests MUST verify that Gemini ADK and OpenAI Agents receive no SAFE-02 wrapper or trust-instruction changes.
+- Offline tests cover success, tool-generated errors, MCP and built-in tools, empty content, and content that contains boundary markers.
+- Tests cover offload previews/references, later artifact reads/searches, and main-agent/general-purpose-subagent model requests.
+- Tests verify inspection-before-wrapping, rejected-result suppression, and active wrapping with inspection disabled.
+- Tests verify exactly one sandbox-owned wrapper across repeated model calls and unchanged call IDs, names, status, and ordering.
+- Tests verify trust-instruction inclusion, preserved operator instructions, unwrapped control messages/tool calls, and unchanged tool-free shaping.
+- Tests verify complete unwrapped normalized/audit results, inspection-pass correlation, and wrapper inclusion in model requests and reported usage.
+- Tests verify that Gemini ADK and OpenAI Agents receive no SAFE-02 wrapper or trust-instruction changes.
 - Live batch: [skills.feature](../../../tests/e2e/features/skills.feature), [structured_output.feature](../../../tests/e2e/features/structured_output.feature), [mcp.feature](../../../tests/e2e/features/mcp.feature), [reasoning_config.feature](../../../tests/e2e/features/reasoning_config.feature)
 - Harness helpers: [test_batch_e2e_helpers.py](../../../tests/test_batch_e2e_helpers.py) (no cluster)
 - [PLANNED: OLS-3472] Gemma 4 support assumes that the selected vLLM deployment exposes the OpenAI-compatible operations required by the existing adapter and product-e2e core scenarios.
@@ -216,4 +216,4 @@ Decision record: [0001-tool-output-boundary.md](../decisions/0001-tool-output-bo
 - Wire operator-resolved `Agent.spec.maxTurns` through `LIGHTSPEED_AGENT_MAX_TURNS` to each provider-native iteration limit. [PLANNED: OLS-3743]
 - DeepAgents: token-level streaming via `astream_events()` instead of batch `stream_mode="messages"`. [PLANNED: OLS-3500]
 - [PLANNED: OLS-3928] DeepAgents-only inspection of every model-visible tool result and error.
-- [PLANNED: OLS-3929] DeepAgents-only tool-output boundary and system-prompt trust instruction, independent of the inspection switch.
+- DeepAgents-only tool-output boundary and system-prompt trust instruction, independent of the inspection switch.

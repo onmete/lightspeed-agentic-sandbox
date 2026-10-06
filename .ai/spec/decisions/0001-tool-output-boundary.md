@@ -1,7 +1,7 @@
 # 0001 — DeepAgents Tool-Output Content Boundary (SAFE-02)
 
 - **Jira:** [OLS-3929](https://redhat.atlassian.net/browse/OLS-3929)
-- **Status:** Accepted design. Implementation planned.
+- **Status:** Accepted. The OLS-4356 branch implements the DeepAgents boundary.
 - **Date:** 2026-10-02
 - **Behavior:** [provider-contract.md](../what/provider-contract.md), Tool-Output Content Boundary
 - **Service baseline:** [lightspeed-service PR #3103](https://github.com/openshift/lightspeed-service/pull/3103)
@@ -12,8 +12,7 @@ OLS-3929 marks external tool output as untrusted reference data and supplies the
 This sandbox change covers DeepAgents only, including its main agent and general-purpose subagent.
 Gemini ADK and OpenAI Agents behavior remains unchanged.
 
-The session updates specifications only. All new sandbox behavior carries `[PLANNED: OLS-3929]` markers.
-Success means that the specifications define model-visible boundaries, inspection ordering, event preservation, and executable verification requirements.
+This decision records the SAFE-02 behavior for DeepAgents. The OLS-4356 branch implements this behavior. This decision defines model-visible boundaries, inspection ordering, event preservation, and verification requirements.
 
 ## Context
 
@@ -49,8 +48,10 @@ tool content
 ```
 
 These markers are delimiters, not parseable XML.
-The source value contains the tool name for identification only.
-The design requires no XML parsing or source-attribute escaping.
+The source value contains the tool name for identification only. Before
+interpolation, the formatter HTML-escapes the source attribute. It escapes each
+case-insensitive `</tool_data` sequence in external content by inserting a
+backslash before `/`, producing `<\/tool_data`.
 Tool calls and sandbox-generated control messages remain unwrapped.
 
 ### System-prompt contract
@@ -80,6 +81,7 @@ Tool names, call IDs, result status, and message ordering remain unchanged.
 
 Inspection-pass correlation continues to use the original effective content.
 Normalized result events and approved audit/content records retain that complete content without sandbox-added markers.
+The adapter releases pending result events only after the model-boundary middleware accepts the associated results. If inspection rejects a result, the adapter releases no pending result events from that model boundary.
 Existing payload-free developer logging and rejected-result suppression rules remain active.
 
 ### Token usage
@@ -101,7 +103,7 @@ The sandbox does not add Classic service budget enforcement or assume a fixed wr
 Offline tests cover the requirements in `provider-contract.md`.
 They exercise actual main-agent/subagent model requests, original normalized events, enabled/disabled inspection, repeated calls, and rejected results.
 They also cover control-message exclusions, preserved operator instructions, wrapper token usage, and unchanged Gemini/OpenAI behavior.
-No code, dependency, CRD, or operator change belongs to this spec-only update.
+The implementation adds no dependency, CRD, or operator change.
 
 ## Consequences and Limits
 
@@ -110,5 +112,5 @@ The middleware must preserve separate model-facing and event-facing representati
 This separation prevents wrapping from breaking existing inspection-pass correlation or content-event fidelity.
 
 Delimiters and instructions mitigate prompt injection. They do not enforce a security boundary or guarantee compliant model behavior.
-External content can contain marker text. The formatter does not treat that text as proof of prior sandbox-owned wrapping.
+The formatter escapes external closing-marker text and does not treat marker text as proof of prior sandbox-owned wrapping.
 Existing authorization, approval, RBAC, inspection, and sandbox controls remain necessary.
