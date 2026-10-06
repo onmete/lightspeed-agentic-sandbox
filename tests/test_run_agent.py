@@ -16,7 +16,13 @@ from opentelemetry.trace import SpanKind, StatusCode
 from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 from lightspeed_agentic.inspection.middleware import ToolResultInspectionMiddleware
 from lightspeed_agentic.run_agent import ContextFormatError, format_context_prefix, run_agent_query
-from lightspeed_agentic.types import ProviderEvent, ProviderQueryOptions, ResultEvent
+from lightspeed_agentic.types import (
+    ProviderEvent,
+    ProviderQueryOptions,
+    ResultEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 
 from .conftest import MockProvider
 
@@ -312,6 +318,92 @@ async def test_agent_and_native_spans_use_standard_shapes_and_sibling_parentage(
     assert all(
         span.attributes["agenticrun.phase"] == "analysis" for span in (agent_span, inference, tool)
     )
+
+
+@pytest.mark.parametrize(
+    ("sdk_name", "logs_tool_payload"),
+    [("deepagents", False), ("gemini", True), ("openai", True)],
+)
+@pytest.mark.asyncio
+async def test_run_agent_applies_deepagents_logging_guard_without_changing_source_tool_span(
+    span_exporter,
+    caplog: pytest.LogCaptureFixture,
+    sdk_name: str,
+    logs_tool_payload: bool,
+) -> None:
+    caplog.set_level(logging.INFO, logger="lightspeed_agentic")
+    argument_marker = "ARGUMENT_PAYLOAD"
+    argument_tail = "ARGUMENT_TAIL"
+    result_marker = "RESULT_PAYLOAD"
+    error_marker = "TOOL_GENERATED_ERROR"
+    result_tail = "RESULT_TAIL"
+    tool_arguments = {"command": argument_marker + "a" * 700 + argument_tail}
+    native_result = {"stdout": result_marker + "b" * 100 + error_marker + "c" * 1_500 + result_tail}
+    call_id = "tool-call-1"
+
+    class GuardedProvider(MockProvider):
+        @property
+        def name(self) -> str:
+            return sdk_name
+
+        async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            audit_logger = options.audit_logger
+            assert audit_logger is not None
+            tool = audit_logger.start_tool(
+                name="Bash",
+                call_id=call_id,
+                arguments=tool_arguments,
+            )
+            audit_logger.end_tool(tool, result=native_result)
+            yield ToolCallEvent(
+                name="Bash",
+                input=json.dumps(tool_arguments),
+                call_id=call_id,
+            )
+            yield ToolResultEvent(
+                output=json.dumps(native_result),
+                call_id=call_id,
+            )
+            yield ResultEvent(
+                text='{"success": true, "summary": "complete"}',
+                input_tokens=3,
+                output_tokens=2,
+            )
+
+    result = await run_agent_query(
+        GuardedProvider(),
+        prompt="request body",
+        system_prompt="instructions",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+        tool_output_inspection_enabled=False,
+    )
+
+    assert result.output == {"success": True, "summary": "complete"}
+    assert "Bash" in caplog.text
+    if logs_tool_payload:
+        assert argument_marker in caplog.text
+        assert result_marker in caplog.text
+        assert error_marker in caplog.text
+        assert argument_tail not in caplog.text
+        assert result_tail not in caplog.text
+    else:
+        for secret in (argument_marker, argument_tail, result_marker, error_marker, result_tail):
+            assert secret not in caplog.text
+
+    tool_span = next(
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "execute_tool Bash"
+        and span.attributes.get("gen_ai.tool.call.id") == call_id
+    )
+    assert json.loads(tool_span.attributes["gen_ai.tool.call.arguments"]) == tool_arguments
+    assert json.loads(tool_span.attributes["gen_ai.tool.call.result"]) == native_result
+    assert tool_span.status.status_code == StatusCode.UNSET
 
 
 @pytest.mark.asyncio

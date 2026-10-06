@@ -72,7 +72,13 @@ Inference message attributes MUST reflect the request content actually visible t
 
 18d. Existing generic inference instrumentation can observe classifier calls. The sandbox MUST add no feature-specific Prometheus metric.
 
-18e. Developer logs and `tool_result.inspection` telemetry MUST NOT contain tool arguments, tool results, or tool-generated errors.
+18e. DeepAgents developer logs MUST omit tool arguments and tool-result content, including
+     tool-generated errors. Non-DeepAgents developer logs MAY contain only the capped tool-payload
+     diagnostics permitted by `provider-contract.md` rule 25. The `EventLogger` representation
+     escapes payload-bearing text and tool names onto one physical line, applying character caps
+     to source text before rendering without altering source-span content. All
+     `tool_result.inspection` telemetry MUST remain payload-free and MUST NOT contain tool
+     arguments, tool results, or tool-generated errors.
 
 18f. At successful native tool completion, before any subsequent inspection, `AuditLogger` MUST retain the complete raw callback result on that source span's `gen_ai.tool.call.result`, when the span is recording, regardless of later inspection outcome. Inspection rejection does not retroactively alter the completed tool span.
 
@@ -120,6 +126,7 @@ Duration metric error labels MUST use a bounded vocabulary: `TimeoutError`, `Can
 
 ## Verification
 
+- Developer-log restoration: `tests/test_logging.py` and `tests/test_run_agent.py` cover capped diagnostics, thinking flush boundaries, DeepAgents-only tool-payload suppression, and unchanged raw source spans. An offline `run_agent_query()` smoke used local echo-token script output with deployment argument fixtures for all three providers; restored diagnostics, exact terminal-output extraction, source-result retention, and content-disabled compliance copies passed. This was not a live provider or cluster E2E run.
 - Focused offline suite (controller-reported: 295 passed): `tests/test_audit.py`, `tests/test_deepagents_telemetry.py`, `tests/test_deepagents.py`, `tests/test_tool_result_inspection_client.py`, `tests/test_tool_result_inspection_middleware.py`, `tests/test_tool_result_inspection_telemetry.py`, `tests/test_run_agent.py`, `tests/test_gemini_telemetry.py`, `tests/test_tracing.py`, and `tests/test_logging.py` cover native result timing/status, inspection outcomes/correlation, model and event rejection, exact terminal output, payload-free diagnostics, capture filtering, and call IDs.
 - Offline native SDK proof: ADK Runner/FunctionTool dispatch preserves supplied and SDK-assigned IDs in finalized model output and actual tools, while IDs stripped from later effective requests remain absent. Cleanup smokes exercised the actual OpenAI Runner with parallel same-name FunctionTools, the ADK Runner with a local subprocess tool, and native LangChain model/tool dispatch. OpenAI retained separate successful and failed spans; ADK retained observed model/usage and joined the finalized call ID to the raw result; LangChain retained the completed raw tool span while model-boundary rejection blocked delivery.
 - CodeRabbit regressions: `tests/test_gemini_telemetry.py` covers candidate-only usage and omitted reasoning; `tests/test_metrics.py` covers bounded error labels on completion and cleanup with preserved exported span diagnostics; `tests/test_openai_telemetry.py` covers overlapping same-tool failures and ambiguous call IDs. A separate offline smoke used the actual OpenAI Runner with a deterministic model and concurrent FunctionTool calls: the failed call retained `ERROR` and no result, while its sibling retained its own subprocess output and native end time. Importing OpenAI telemetry also succeeded with `agents` imports deliberately blocked.

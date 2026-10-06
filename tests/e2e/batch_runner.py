@@ -8,8 +8,10 @@ source span in the batch pod's OTLP JSON stdout.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import secrets
+import shlex
 import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -454,6 +456,142 @@ _OPENAI_EXEC_SUCCESS_RESULT_RE = re.compile(
 )
 _ECHO_TOKEN_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
+_SHELL_TOOL_ARGUMENT_KEYS = {
+    "execute": "command",
+    "execute_bash": "command",
+    "exec_command": "cmd",
+}
+_SHELL_TOOL_DEFAULT_CWDS = {
+    "execute": E2E_POD_SKILLS_DIR,
+    "execute_bash": E2E_POD_SKILLS_DIR,
+    "exec_command": posixpath.dirname(E2E_POD_SKILLS_DIR),
+}
+_ECHO_TOKEN_SKILL_PATHS = frozenset(
+    posixpath.join(skills_root, "echo-token")
+    for skills_root in (E2E_POD_SKILLS_DIR, E2E_POD_SKILLS_WORKDIR)
+)
+_ECHO_TOKEN_SCRIPT_PATHS = frozenset(
+    posixpath.join(skill_dir, "scripts", "echo-token.sh") for skill_dir in _ECHO_TOKEN_SKILL_PATHS
+)
+_ECHO_TOKEN_SKILL_INSTRUCTION_PATHS = frozenset(
+    posixpath.join(skill_dir, "SKILL.md") for skill_dir in _ECHO_TOKEN_SKILL_PATHS
+)
+
+
+def _tool_command_invokes_echo_token(
+    tool_name: str | None,
+    arguments_json: str | None,
+) -> bool:
+    """Match only a native shell command that executes the fixture script."""
+    if tool_name is None or not isinstance(arguments_json, str):
+        return False
+    argument_key = _SHELL_TOOL_ARGUMENT_KEYS.get(tool_name)
+    if argument_key is None:
+        return False
+    try:
+        arguments = json.loads(arguments_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(arguments, dict):
+        return False
+    command = arguments.get(argument_key)
+    if not isinstance(command, str) or not command.strip():
+        return False
+
+    cwd = _SHELL_TOOL_DEFAULT_CWDS[tool_name]
+    if tool_name == "exec_command":
+        workdir = arguments.get("workdir")
+        if workdir is not None:
+            if not isinstance(workdir, str):
+                return False
+            if workdir:
+                cwd = posixpath.normpath(
+                    workdir if workdir.startswith("/") else posixpath.join(cwd, workdir)
+                )
+
+    # Split only unquoted top-level &&; reject other shell control syntax.
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    position = 0
+    while position < len(command):
+        char = command[position]
+        if escaped:
+            escaped = False
+        elif quote == "'":
+            if char == "'":
+                quote = None
+        elif quote == '"':
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                quote = None
+        elif char == "\\":
+            escaped = True
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "&":
+            if command[position : position + 2] != "&&":
+                return False
+            part = command[start:position].strip()
+            if not part:
+                return False
+            parts.append(part)
+            position += 2
+            start = position
+            continue
+        elif char in "|;()\n":
+            return False
+        position += 1
+    if quote is not None or escaped:
+        return False
+    part = command[start:].strip()
+    if not part:
+        return False
+    parts.append(part)
+
+    try:
+        commands = [shlex.split(part, posix=True) for part in parts]
+    except ValueError:
+        return False
+    if any(not command_tokens for command_tokens in commands):
+        return False
+
+    command_index = 0
+    if commands[0][0] == "cd":
+        directory_command = commands[0]
+        if len(directory_command) != 2:
+            return False
+        directory = directory_command[1]
+        cwd = posixpath.normpath(
+            directory if directory.startswith("/") else posixpath.join(cwd, directory)
+        )
+        if cwd not in _ECHO_TOKEN_SKILL_PATHS:
+            return False
+        command_index += 1
+
+    if command_index < len(commands) and commands[command_index][0] == "cat":
+        cat_command = commands[command_index]
+        if len(cat_command) != 2:
+            return False
+        instruction = cat_command[1]
+        instruction_path = (
+            instruction if instruction.startswith("/") else posixpath.join(cwd, instruction)
+        )
+        if posixpath.normpath(instruction_path) not in _ECHO_TOKEN_SKILL_INSTRUCTION_PATHS:
+            return False
+        command_index += 1
+
+    if command_index != len(commands) - 1:
+        return False
+    invocation = commands[command_index]
+    if len(invocation) != 2 or invocation[0] not in {"bash", "/bin/bash"}:
+        return False
+    script = invocation[1]
+    script_path = script if script.startswith("/") else posixpath.join(cwd, script)
+    return posixpath.normpath(script_path) in _ECHO_TOKEN_SCRIPT_PATHS
+
 
 def _parse_echo_token_from_otlp_stdout(
     pod_logs: str,
@@ -461,16 +599,22 @@ def _parse_echo_token_from_otlp_stdout(
     run_uid: str,
     phase: str,
 ) -> str:
-    """Return a token only from a correlated, successful tool-result span."""
+    """Return a token only from a correlated successful echo-token tool result."""
     matches = []
     for span in _iter_otlp_spans(pod_logs):
         attributes = _otel_string_attributes(span)
+        tool_name = attributes.get("gen_ai.tool.name")
         if (
             attributes.get("gen_ai.operation.name") != "execute_tool"
             or attributes.get("agenticrun.uid") != run_uid
             or attributes.get("agenticrun.phase") != phase
-            or not attributes.get("gen_ai.tool.name")
+            or not tool_name
             or _span_has_error(span)
+        ):
+            continue
+        if not _tool_command_invokes_echo_token(
+            tool_name,
+            attributes.get("gen_ai.tool.call.arguments"),
         ):
             continue
         result_json = attributes.get("gen_ai.tool.call.result")

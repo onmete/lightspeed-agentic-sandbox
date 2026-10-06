@@ -20,9 +20,25 @@ from lightspeed_agentic.logging import EventLogger
 from lightspeed_agentic.mcp import AdmittedMCPProviderServer
 from lightspeed_agentic.tools import DEFAULT_ALLOWED_TOOLS
 from lightspeed_agentic.tracing import get_tracer, parse_traceparent
-from lightspeed_agentic.types import AgentProvider, ProviderQueryOptions
+from lightspeed_agentic.types import (
+    AgentProvider,
+    ProviderEvent,
+    ProviderQueryOptions,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 
 logger = logging.getLogger("lightspeed_agentic")
+
+
+def _developer_log_event(provider_name: str, event: ProviderEvent) -> ProviderEvent:
+    """Return a logging-only event copy with DeepAgents tool payloads removed."""
+    if provider_name == "deepagents":
+        if isinstance(event, ToolCallEvent):
+            return ToolCallEvent(name=event.name, call_id=event.call_id)
+        if isinstance(event, ToolResultEvent):
+            return ToolResultEvent(call_id=event.call_id)
+    return event
 
 
 @dataclass
@@ -169,7 +185,8 @@ async def run_agent_query(
     _, traceparent_context = parse_traceparent(traceparent)
     agent_parent_context = traceparent_context if traceparent_context is not None else Context()
     tracer = get_tracer()
-    provider_name = resolve_provider_name(provider.name)
+    provider_sdk_name = provider.name
+    provider_name = resolve_provider_name(provider_sdk_name)
     audit_logger = AuditLogger(
         phase=step,
         model=model,
@@ -255,7 +272,7 @@ async def run_agent_query(
                 )
                 event_logger = EventLogger("run")
                 async for event in result:
-                    event_logger.log(event)
+                    event_logger.log(_developer_log_event(provider_sdk_name, event))
                     if event.type == "result":
                         text = event.text
                         input_tokens = event.input_tokens

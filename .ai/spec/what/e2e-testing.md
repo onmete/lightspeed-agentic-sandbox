@@ -198,11 +198,23 @@ BDD steps assert a response envelope (`run_result.py`) built from:
    `agenticrun.uid` and `agenticrun.phase`. Decode the assistant text part of
    `gen_ai.output.messages` and merge the exact post-shaped `AgentResult.output` JSON.
    Typed CR fields and failed CR status are never overwritten.
-3. **Echo-token evidence** — use only `gen_ai.tool.call.result` from a correlated,
-   successful `execute_tool` span. Developer logs and the agent's final response do not
-   prove script execution. Missing or content-filtered spans do not fabricate output.
-   Successful OpenAI `exec_command` stdout can be a JSON object or contain
-   complete JSON lines among other text; token-like prose does not count.
+3. **Echo-token evidence** — use only `gen_ai.tool.call.result` from a
+   correlated, successful `execute_tool` span whose native shell tool name and
+   recorded arguments on that same span identify execution of
+   `scripts/echo-token.sh` from the echo-token skill directory. DeepAgents
+   `execute` and Gemini `execute_bash` record the command in `command`;
+   OpenAI `exec_command` records `cmd` and optional `workdir`. A direct Bash
+   invocation is accepted, as is a limited top-level `&&` chain with an
+   optional `cd` to the configured echo-token skill directory and an optional
+   `cat` whose path resolves to that directory's `SKILL.md`, followed by direct
+   Bash invocation of the fixture script. Arbitrary prefixes, pipelines,
+   subshells, `||`, and other conditional or compound shell syntax are
+   rejected. The command must invoke the script; merely mentioning or
+   reading/printing its path is not evidence of execution. Developer
+   diagnostics and the agent's final response do not prove script execution.
+   Missing or content-filtered spans do not fabricate output. Successful
+   OpenAI `exec_command` stdout can be a JSON object or contain complete JSON
+   lines among other text; token-like prose does not count.
 
 OLS-4371 offline verification replayed the failed Bedrock run's recorded pod logs:
 all 18 normally completed invocation outputs were recovered exactly, including
