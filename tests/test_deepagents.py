@@ -1297,6 +1297,7 @@ async def test_provider_installs_boundary_when_inspection_is_enabled() -> None:
     )
     assert isinstance(kwargs["middleware"][0], ToolResultInspectionMiddleware)
     assert kwargs["middleware"][0]._inspector is not None
+    assert kwargs["middleware"][1].name == "SummarizationMiddleware"
     assert expected_instruction in kwargs["system_prompt"]
     task_subagent = next(spec for spec in kwargs["subagents"] if spec["name"] == "general-purpose")
     assert task_subagent["description"] == "Default general-purpose agent"
@@ -1304,6 +1305,7 @@ async def test_provider_installs_boundary_when_inspection_is_enabled() -> None:
     assert expected_instruction in task_subagent["system_prompt"]
     assert isinstance(task_subagent["middleware"][0], ToolResultInspectionMiddleware)
     assert task_subagent["middleware"][0] is kwargs["middleware"][0]
+    assert task_subagent["middleware"][1].name == "SummarizationMiddleware"
 
 
 @pytest.mark.asyncio
@@ -1348,9 +1350,10 @@ async def test_provider_installs_boundary_when_inspection_is_disabled() -> None:
     )
     middleware = kwargs.get("middleware", [])
     subagents = kwargs.get("subagents", [])
-    assert len(middleware) == 1
+    assert len(middleware) == 2
     assert isinstance(middleware[0], ToolResultInspectionMiddleware)
     assert middleware[0]._inspector is None
+    assert middleware[1].name == "SummarizationMiddleware"
     assert len(subagents) == 1
     subagent = subagents[0]
     assert subagent["name"] == "general-purpose"
@@ -1359,6 +1362,7 @@ async def test_provider_installs_boundary_when_inspection_is_disabled() -> None:
     assert kwargs["system_prompt"].startswith(system_prompt)
     assert expected_instruction in subagent["system_prompt"]
     assert subagent["system_prompt"].startswith("Default subagent prompt")
+    assert subagent["middleware"][1].name == "SummarizationMiddleware"
     resolve_model.assert_called_once()
 
 

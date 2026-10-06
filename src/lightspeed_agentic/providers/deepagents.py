@@ -340,6 +340,9 @@ class DeepAgentsProvider(AgentProvider):
                 TOOL_DATA_TRUST_INSTRUCTION,
                 ToolResultInspectionMiddleware,
             )
+            from lightspeed_agentic.inspection.summarization import (
+                create_tool_data_summarization_middleware,
+            )
         except Exception as exc:
             raise ToolResultSafetyInspectionFailed() from exc
 
@@ -417,8 +420,9 @@ class DeepAgentsProvider(AgentProvider):
                 raise ToolResultSafetyInspectionFailed() from exc
 
         inspection_middleware = ToolResultInspectionMiddleware(inspector_callback)
-        agent_kwargs["middleware"] = [inspection_middleware]
-        subagent_spec["middleware"] = [inspection_middleware]
+        summarization_middleware = create_tool_data_summarization_middleware(chat_model, backend)
+        agent_kwargs["middleware"] = [inspection_middleware, summarization_middleware]
+        subagent_spec["middleware"] = [inspection_middleware, summarization_middleware]
         agent_kwargs["subagents"] = [subagent_spec]
 
         if has_skills(options.cwd):
