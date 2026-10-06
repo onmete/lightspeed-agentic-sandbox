@@ -162,9 +162,11 @@ def _ensure_openai_init() -> None:
     global _openai_initialized
     if _openai_initialized:
         return
+    from agents import enable_verbose_stdout_logging
     from agents.tracing import set_tracing_disabled
 
     set_tracing_disabled(True)
+    enable_verbose_stdout_logging()  # type: ignore[no-untyped-call]
     _patch_exec_command_args()
     _openai_initialized = True
 

@@ -11,9 +11,9 @@ Sandbox-owned boundary for the source spans used by cross-repository Agentic pro
 3. When a source span is recording, `invoke_agent lightspeed` and every non-classifier inference span, including main-agent, shape, and subagent requests, MUST retain full available input, output, instruction, and tool-definition content in standard span attributes, independent of `LIGHTSPEED_CAPTURE_CONTENT`. The agent span MUST record the exact post-shaped `AgentResult.output` whenever a terminal result is normally produced, including domain `success=false`; pre-terminal failures have no fabricated output. Each successful native tool span MUST retain available arguments and the complete raw callback result at actual SDK completion, independently of inspection; only native execution failures omit the success-only result. Do not redact or truncate captured content beyond upstream SDK/adapter limits. Adapters pass structured Python values to `AuditLogger`, which JSON-serializes them only when the span is recording. Missing model/usage observations remain absent; an observed zero is valid.
 Standalone safety-classifier inference MUST retain timing, endpoint provider, requested/observed model, observed usage, and error status/type but MUST omit input messages, output messages, and system instructions even when recording, as required by the parent tool-result-inspection contract. Valid benign or malicious `tool_result.inspection` outcomes are `UNSET`; `classifier_error`, including cancellation, is `ERROR` with controlled metadata. A fail-closed rejection or classifier failure leaves the enclosing invocation `ERROR` with no terminal output and MUST keep rejected content out of model context, application result events, Result CRs, and termination messages. Inference span inputs reflect the available content actually visible to the provider, including DeepAgents SAFE-02 model-facing wrappers and wrapped historical tool-result copies supplied to summary requests. Tool spans retain the complete raw native result, not a model-facing wrapper.
 
-4. GenAI input, output, instructions, tools, and content belong in the v1.41.0 span attributes described by `audit-logging.md`. The sandbox MUST NOT emit parallel `gen_ai.choice` or other GenAI content span events, define a product-specific input/output event catalog, or derive a second telemetry source from normalized `ProviderEvent` messages.
+4. GenAI input, output, instructions, tools, and content belong in the v1.41.0 source-span attributes described by `audit-logging.md`. The sandbox MUST NOT emit parallel `gen_ai.choice` or other GenAI content span events, define a product-specific input/output event catalog, or derive duplicate source spans from normalized `ProviderEvent` messages. The existing audit LOG contract is separate: normalized provider events feed only buffered `event=gen_ai.choice` records for completion/reasoning, not source spans or span events.
 
-5. Compliance stdout and templog content are separate filtered projections governed by `audit-logging.md`. Compliance filters MUST NOT mutate the source spans used by the existing trace endpoint.
+5. The stdout TRACE exporter emits the complete serialized native source spans when audit is enabled; OTLP TRACE export remains endpoint-controlled. `LIGHTSPEED_CAPTURE_CONTENT` controls only completion/reasoning fields in legacy choice LOG bodies and MUST NOT filter source spans, stdout, or the trace endpoint.
 
 ## Correlation
 
@@ -25,7 +25,7 @@ Standalone safety-classifier inference MUST retain timing, endpoint provider, re
 ## Cross-References
 
 - Parent product contract: `ols/.ai/spec/what/agentic-data-collection.md`
-- `audit-logging.md` — v1.41.0 agent/model/tool spans, content attributes, and compliance projections
+- `audit-logging.md` — v1.41.0 native GenAI spans, full source content, and the separate legacy choice-event LOG contract
 - `provider-contract.md` — provider SDK lifecycle instrumentation
 - `run-api.md` — effective input construction and batch trace lifecycle
 - [Official OpenTelemetry GenAI Semantic Conventions v1.41.0](https://github.com/open-telemetry/semantic-conventions/tree/v1.41.0/docs/gen-ai)

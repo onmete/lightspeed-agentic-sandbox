@@ -75,10 +75,10 @@ class TestOtelVerify:
         *,
         uid: str | None = None,
         phase: str | None = "analysis",
-        event: str | None = "chat",
-        body: str = '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai"}',
+        event: str | None = "gen_ai.choice",
+        body: str = '{"gen_ai.completion":"answer"}',
         trace_id: str = "1" * 32,
-        span_id: str = "2" * 16,
+        span_id: str = "4" * 16,
         resource_uid: str | None = None,
         resource_phase: str | None = None,
         service_name: str = "lightspeed-agentic-sandbox",
@@ -148,16 +148,20 @@ class TestOtelVerify:
             pytest.param({}, {"event": "invoke_agent"}, True, False, id="event-body-mismatch"),
             pytest.param(
                 {},
-                {"body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai"}'},
+                {
+                    "body": (
+                        '{"gen_ai.completion":"answer","gen_ai.provider.name":"gcp.vertex_ai"}'
+                    ),
+                },
                 True,
                 False,
-                id="wrong-body-provider",
+                id="non-choice-body",
             ),
             pytest.param({}, {"trace_id": "malformed"}, True, False, id="invalid-log-trace-id"),
             pytest.param({}, {"span_id": "0" * 16}, True, False, id="zero-log-span-id"),
             pytest.param(
                 {},
-                {"body": '{"gen_ai.operation.name":'},
+                {"body": '{"gen_ai.completion":'},
                 True,
                 False,
                 id="malformed-body",
@@ -167,8 +171,7 @@ class TestOtelVerify:
                 {
                     "uid": None,
                     "resource_uid": RUN_UID,
-                    "body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
-                    f'"agenticrun.uid":"{RUN_UID}"}}',
+                    "body": '{"gen_ai.completion":"answer"}',
                 },
                 True,
                 False,
@@ -179,8 +182,7 @@ class TestOtelVerify:
                 {
                     "phase": None,
                     "resource_phase": "analysis",
-                    "body": '{"gen_ai.operation.name":"chat","gen_ai.provider.name":"openai",'
-                    '"agenticrun.phase":"analysis"}',
+                    "body": '{"gen_ai.completion":"answer"}',
                 },
                 True,
                 False,
@@ -197,10 +199,20 @@ class TestOtelVerify:
         expected_audit: bool,
     ) -> None:
         logs = f"agenticrun.uid={self.RUN_UID}\n"
+        source_options: dict[str, Any] | None = None
         if span_options is not None:
-            logs += self._span_block(**{"span_uid": self.RUN_UID, **span_options})
+            source_options = {"span_uid": self.RUN_UID, **span_options}
+            logs += self._span_block(**source_options)
+            if log_options is not None:
+                logs += self._span_block(
+                    **{**source_options, "operation": "invoke_agent", "span_id": "4" * 16}
+                )
         if log_options is not None:
-            logs += self._log_block(**{"uid": self.RUN_UID, **log_options})
+            options: dict[str, Any] = {"uid": self.RUN_UID, "span_id": "4" * 16}
+            if source_options is not None:
+                options["trace_id"] = source_options.get("trace_id", "1" * 32)
+            options.update(log_options)
+            logs += self._log_block(**options)
         assert (
             logs_contain_traces_for_run(
                 logs,
@@ -223,18 +235,25 @@ class TestOtelVerify:
 
     def test_captured_collector_debug_format_with_bedrock(self) -> None:
         trace_id = "3" * 32
-        span_id = "4" * 16
+        agent_span_id = "4" * 16
         logs = self._span_block(
             span_uid=self.RUN_UID,
             provider="aws.bedrock",
             trace_id=trace_id,
-            span_id=span_id,
+            span_id="2" * 16,
+        )
+        logs += self._span_block(
+            span_uid=self.RUN_UID,
+            operation="invoke_agent",
+            provider="aws.bedrock",
+            trace_id=trace_id,
+            span_id=agent_span_id,
         )
         logs += self._log_block(
             uid=self.RUN_UID,
-            body='{"gen_ai.operation.name":"chat","gen_ai.provider.name":"aws.bedrock"}',
+            body='{"gen_ai.completion":"answer"}',
             trace_id=trace_id,
-            span_id=span_id,
+            span_id=agent_span_id,
         )
 
         assert logs_contain_traces_for_run(
@@ -339,20 +358,27 @@ class TestOtelVerify:
         self,
     ) -> None:
         trace_id = "3" * 32
-        span_id = "4" * 16
+        agent_span_id = "4" * 16
         log_body = (
             "collector terminal: café 東京\n"
             + self._span_block(
                 span_uid=self.RUN_UID,
                 provider="aws.bedrock",
                 trace_id=trace_id,
-                span_id=span_id,
+                span_id="2" * 16,
+            )
+            + self._span_block(
+                span_uid=self.RUN_UID,
+                operation="invoke_agent",
+                provider="aws.bedrock",
+                trace_id=trace_id,
+                span_id=agent_span_id,
             )
             + self._log_block(
                 uid=self.RUN_UID,
-                body=('{"gen_ai.operation.name":"chat","gen_ai.provider.name":"aws.bedrock"}'),
+                body='{"gen_ai.completion":"answer"}',
                 trace_id=trace_id,
-                span_id=span_id,
+                span_id=agent_span_id,
             )
         ).encode("utf-8")
         pod_list_body = (

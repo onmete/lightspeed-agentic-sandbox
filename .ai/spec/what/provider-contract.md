@@ -14,9 +14,9 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 4. **Content block stop (`content_block_stop`).** Signals that a content or tool block has completed; used by logging to flush buffered thinking.
 
-5. **Tool call (`tool_call`).** Carries the tool name and a complete string representation of inputs. Provider adapters MUST NOT length-truncate this value. `EventLogger` caps only its developer-log rendering under rule 25; the complete event remains available to consumers.
+5. **Tool call (`tool_call`).** Carries the tool name and a complete string representation of inputs. Provider adapters MUST NOT length-truncate this value. `EventLogger` can truncate its developer-log rendering, subject to OLS-3928 rule 6.
 
-6. **Tool result (`tool_result`).** Carries a complete string representation of tool output. Provider adapters MUST NOT length-truncate this value. `EventLogger` caps only its developer-log rendering under rule 25; the complete event remains available to consumers.
+6. **Tool result (`tool_result`).** Carries a complete string representation of tool output. Provider adapters MUST NOT length-truncate this value. `EventLogger` can truncate its developer-log rendering, subject to OLS-3928 rule 6.
 
 7. **Result (`result`).** Terminal event: final text payload (may be JSON or plain text depending on structured-output path), input/output token counts, reasoning token count, and response model metadata.
 
@@ -54,21 +54,7 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 24. **Default allowed tools list.** Shared default names: `Bash`, `Read`, `Glob`, `Grep`, `Skill`. `run_agent_query()` always passes this list unless a future contract exposes overrides. [PLANNED: OLS-3033]
 
-25. **Event logging.** The phase-tagged `EventLogger` buffers `thinking_delta` text, flushing at
-    `THINKING_BUF_FLUSH=50_000`, on `content_block_stop`, and before `tool_call` or `result`. Each
-    flush strips surrounding whitespace and logs at most `MAX_THINKING_LOG=2_000` characters. A
-    tool-call logs its name and at most `MAX_TOOL_INPUT_LOG=500` input characters; a tool-result
-    logs at most `MAX_TOOL_OUTPUT_LOG=1_000` output characters. A terminal `result` logs the
-    aggregate input-plus-output token count and, when final text is nonempty after stripping,
-    at most `MAX_RESULT_LOG=500` characters under `[provider:run] output:`. `EventLogger` MUST NOT
-    log prompt/request content or `text_delta` content. All providers log capped thinking and
-    terminal-result text. Non-DeepAgents provider logs retain capped tool payloads; DeepAgents
-    MUST omit tool arguments and tool-result content, including tool-generated errors, from its
-    developer-log copy. The DeepAgents restriction MUST NOT alter normalized events or source
-    span content. Payload-bearing text and tool names are rendered with `%r`, escaping control
-    and line-separator characters so each diagnostic occupies one physical line while printable
-    Unicode remains readable. Character caps apply to source text before rendering; tool names
-    are not capped.
+25. **Event logging.** A phase-tagged logger buffers `thinking_delta` events, flushes when buffer size exceeds an internal threshold or on `content_block_stop` or tool/result events, and logs truncated thinking. Tool calls and results are logged with separate input/output truncation caps. The `result` event logs the combined token count and truncated final text. [PLANNED: OLS-3928] DeepAgents MUST NOT log tool arguments or inspected tool-result content. It can log only controlled inspection fields and safe tool metadata.
 
 26. **Stringifying tool I/O.** Non-string tool arguments and results are JSON-serialized for events when the SDK exposes structured objects.
 

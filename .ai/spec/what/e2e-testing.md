@@ -180,8 +180,8 @@ suite default remains `false`.
 | `E2E_ARGS` | user / `--` passthrough | Extra pytest args (e.g. `-v`, `-k`, single file) |
 | `E2E_SKIP_FIXTURES` | user | Skip `e2e-install-fixtures.sh` when fixtures already present |
 | `ARTIFACT_DIR` | CI | Pytest tee to `e2e-<provider>-pytest.log` and summary file |
-| `LIGHTSPEED_AUDIT_ENABLED` | `batch_runner.py` | Always `true` on batch Jobs to emit source-span OTLP JSON to stdout |
-| `LIGHTSPEED_CAPTURE_CONTENT` | `batch_runner.py` | Always `true` so response and successful tool-result content remains in those compliance copies |
+| `LIGHTSPEED_AUDIT_ENABLED` | `batch_runner.py` | Always `true` on batch Jobs to enable pre-existing audit log export |
+| `LIGHTSPEED_CAPTURE_CONTENT` | `batch_runner.py` | Always `true` so existing audit choice log bodies include content; it does not filter source spans written to stdout |
 
 ### Response bodies
 
@@ -189,6 +189,8 @@ Batch and collector log bodies are raw HTTP response bytes: the harness MUST
 fetch them with `_preload_content=False` and decode `response.data` as UTF-8
 before parsing. Kubernetes `ApiClient` string deserialization otherwise turns
 multi-line bytes into an escaped `b'...'` representation, hiding span evidence.
+Batch pod stdout retains the full serialized source trace, including the new GenAI spans.
+`LIGHTSPEED_CAPTURE_CONTENT` controls content in the pre-existing audit choice log bodies only; it does not filter those source spans.
 
 BDD steps assert a response envelope (`run_result.py`) built from:
 
@@ -198,23 +200,13 @@ BDD steps assert a response envelope (`run_result.py`) built from:
    `agenticrun.uid` and `agenticrun.phase`. Decode the assistant text part of
    `gen_ai.output.messages` and merge the exact post-shaped `AgentResult.output` JSON.
    Typed CR fields and failed CR status are never overwritten.
-3. **Echo-token evidence** — use only `gen_ai.tool.call.result` from a
-   correlated, successful `execute_tool` span whose native shell tool name and
-   recorded arguments on that same span identify execution of
-   `scripts/echo-token.sh` from the echo-token skill directory. DeepAgents
-   `execute` and Gemini `execute_bash` record the command in `command`;
-   OpenAI `exec_command` records `cmd` and optional `workdir`. A direct Bash
-   invocation is accepted, as is a limited top-level `&&` chain with an
-   optional `cd` to the configured echo-token skill directory and an optional
-   `cat` whose path resolves to that directory's `SKILL.md`, followed by direct
-   Bash invocation of the fixture script. Arbitrary prefixes, pipelines,
-   subshells, `||`, and other conditional or compound shell syntax are
-   rejected. The command must invoke the script; merely mentioning or
-   reading/printing its path is not evidence of execution. Developer
-   diagnostics and the agent's final response do not prove script execution.
-   Missing or content-filtered spans do not fabricate output. Successful
-   OpenAI `exec_command` stdout can be a JSON object or contain complete JSON
-   lines among other text; token-like prose does not count.
+3. **Echo-token evidence** — extract only from `gen_ai.tool.call.result` on a
+   correlated, successful `execute_tool` span. Successful OpenAI
+   `exec_command` output may be a JSON object or contain complete JSON lines
+   among other text; token-like prose does not count. This is result-only
+   evidence and does not establish that a specific shell command or fixture
+   script executed. Developer logs and the agent's final response are not
+   fallback sources.
 
 OLS-4371 offline verification replayed the failed Bedrock run's recorded pod logs:
 all 18 normally completed invocation outputs were recovered exactly, including

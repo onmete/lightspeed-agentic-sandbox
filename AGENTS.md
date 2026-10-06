@@ -121,10 +121,10 @@ src/lightspeed_agentic/
 ├── factory.py            # create_provider(name) — SDK name from config.resolve_sdk()
 ├── readiness.py          # R1 credential checks; run_readiness_checks() at batch startup
 ├── mcp.py                # parse_mcp_servers(); header resolution
-├── audit.py              # AuditLogger standard GenAI agent/model/tool spans
+├── audit.py              # native GenAI source spans and buffered normalized-choice OTLP logs
 ├── metrics.py            # Prometheus histograms (in-process; no /metrics route)
-├── tracing.py            # TracerProvider, traceparent helpers
-├── logging.py            # EventLogger (debug thinking buffer)
+├── tracing.py            # TracerProvider, full-source stdout, traceparent, stdlib-to-OTLP log bridge
+├── logging.py            # EventLogger (provider/developer events and baseline formatting/caps)
 ├── skills.py             # has_skills() — SKILL.md presence under cwd
 ├── tools.py              # DEFAULT_ALLOWED_TOOLS only
 ├── types.py              # Provider events, query options, AgentProvider ABC
@@ -241,20 +241,20 @@ The Konflux pipeline will prefetch the new versions on the next PR.
 | `LIGHTSPEED_PROVIDER_PROJECT` | Cloud project ID (Vertex) |
 | `LIGHTSPEED_PROVIDER_REGION` | Cloud region (Vertex, Bedrock) |
 | `LIGHTSPEED_PROVIDER_API_VERSION` | API version (Azure) |
-| `LIGHTSPEED_AUDIT_ENABLED` | Enable compliance stdout and completed-GenAI-span log projections (see audit-logging.md) |
-| `LIGHTSPEED_CAPTURE_CONTENT` | Filter six standard content attributes from compliance copies only; source span content is unaffected |
+| `LIGHTSPEED_AUDIT_ENABLED` | Enable complete source spans on stdout and normalized `gen_ai.choice` OTLP logs when an endpoint is configured; source trace export remains endpoint-controlled |
+| `LIGHTSPEED_CAPTURE_CONTENT` | Include completion/reasoning text in normalized choice-log bodies; it never filters source spans, stdout, or OTLP traces |
 | `LIGHTSPEED_MCP_SERVERS` | JSON array of MCP server configs |
 | `LIGHTSPEED_REASONING_CONFIG` | JSON object with reasoning/thinking params, parsed at startup, passed to adapters |
 | `LIGHTSPEED_SKILLS_DIR` | Skills root mounted in the sandbox pod, default `/app/skills` |
-| `LIGHTSPEED_AGENTICRUN_UID` | AgenticRun UID on source spans and bridged OTLP log record attrs when set |
-| `LIGHTSPEED_AGENTICRUN_STEP` | AgenticRun step → `agenticrun.phase` on source spans and bridged OTLP log records when set |
+| `LIGHTSPEED_AGENTICRUN_UID` | AgenticRun UID on source spans and OTLP log-record attributes when set |
+| `LIGHTSPEED_AGENTICRUN_STEP` | AgenticRun step → `agenticrun.phase` on source spans and OTLP log-record attributes when set |
 | `ANTHROPIC_MODEL` | Default Anthropic model for query routes |
 | `GEMINI_MODEL` | Default Gemini model for query routes |
 | `OPENAI_MODEL` | Default OpenAI model for query routes |
 | `OPENAI_BASE_URL` | Optional OpenAI-compatible endpoint override |
 | `CLAUDE_CODE_USE_BEDROCK` | Set by config mapping for Bedrock → DeepAgents |
 | `CLAUDE_CODE_USE_VERTEX` | When set to `1`, DeepAgents uses Vertex-backed Anthropic (`ChatAnthropicVertex`) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Shared OTLP endpoint for traces and logs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Shared OTLP base endpoint for traces and logs; with HTTP, TRACE appends `/v1/traces` while LOG uses the configured base URL |
 | `SSL_CERT_FILE` | Combined system and operator-provided CA bundle |
 | `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` | Combined CA bundle used by gRPC |
 | `AWS_CA_BUNDLE` | Combined CA bundle used by AWS/Botocore |

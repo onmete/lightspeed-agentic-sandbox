@@ -191,13 +191,6 @@ async def inspect_tool_result(
                 span.set_attribute("inspection.failure_type", "cancelled")
                 span.set_attribute("error.type", "cancelled")
                 span.set_status(Status(StatusCode.ERROR))
-                logger.warning(
-                    "tool result safety inspection failed",
-                    extra={
-                        "inspection.outcome": "classifier_error",
-                        "inspection.failure_type": "cancelled",
-                    },
-                )
                 raise
             except InspectionError as exc:
                 span.set_attribute("inspection.attempt_count", exc.attempt_count or 3)

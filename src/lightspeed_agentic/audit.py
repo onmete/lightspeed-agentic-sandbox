@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
 
+from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.trace import NonRecordingSpan, Span, SpanKind, StatusCode
 
 from lightspeed_agentic.metrics import operation_duration, token_usage, tool_duration
-from lightspeed_agentic.tracing import get_tracer
+from lightspeed_agentic.tracing import emit_audit_log_records, get_tracer
+from lightspeed_agentic.types import ProviderEvent
 
 _METRIC_ERROR_TYPES = frozenset(
     {
@@ -100,26 +102,99 @@ def _unique_span_handle(span: Span) -> Span:
 
 
 class AuditLogger:
-    """Record actual provider inference and tool spans beneath one agent span."""
+    """Record native GenAI spans and buffer legacy choice-event logs."""
 
     def __init__(
         self,
+        *,
         phase: str,
         model: str,
         provider: str,
+        enabled: bool = True,
+        capture_content: bool = False,
         agenticrun_uid: str = "",
     ) -> None:
+        """Configure native-span metadata and optional legacy choice-event logs.
+
+        ``enabled`` and ``capture_content`` control only normalized-event logs;
+        source-span recording remains controlled by the tracer provider.
+        """
         self._phase = phase
         self._model = model
         self._provider = provider
+        self._enabled = enabled
+        self._capture_content = capture_content
         self._agenticrun_uid = agenticrun_uid
         self._tracer = get_tracer()
         self._parent_context: Context = Context()
+        self._event_log_context: Context | None = None
+        self._event_log_recording = False
+        self._event_log_records: list[dict[str, str]] = []
+        self._text_buffer: list[str] = []
+        self._thinking_buffer: list[str] = []
         self._open_spans: dict[int, _OpenSpan] = {}
 
     def set_parent_context(self, ctx: Context) -> None:
-        """Set the agent context used explicitly as parent for every child span."""
+        """Set the agent context used for child spans and buffered audit logs."""
         self._parent_context = ctx
+        self._event_log_context = ctx
+        self._event_log_recording = trace.get_current_span(ctx).is_recording()
+
+    def process_event(self, event: ProviderEvent) -> None:
+        """Buffer normalized completion/reasoning for legacy audit log records."""
+        if not self._enabled:
+            return
+        match event.type:
+            case "text_delta":
+                self._text_buffer.append(event.text)
+            case "thinking_delta":
+                self._thinking_buffer.append(event.thinking)
+            case "content_block_stop" | "tool_call" | "result":
+                self._flush_event_buffers()
+
+    def _flush_event_buffers(self) -> None:
+        """Queue completion before reasoning, matching the legacy choice flush."""
+        if not self._enabled:
+            self._text_buffer.clear()
+            self._thinking_buffer.clear()
+            return
+        if self._event_log_context is None:
+            span = trace.get_current_span()
+            self._event_log_context = trace.set_span_in_context(span)
+            self._event_log_recording = span.is_recording()
+        if not self._event_log_recording:
+            self._text_buffer.clear()
+            self._thinking_buffer.clear()
+            return
+        if self._text_buffer:
+            text = "".join(self._text_buffer)
+            self._text_buffer.clear()
+            if text:
+                self._event_log_records.append(
+                    {"gen_ai.completion": text} if self._capture_content else {}
+                )
+        if self._thinking_buffer:
+            thinking = "".join(self._thinking_buffer)
+            self._thinking_buffer.clear()
+            if thinking:
+                self._event_log_records.append(
+                    {"gen_ai.reasoning_content": thinking} if self._capture_content else {}
+                )
+
+    def flush_event_logs(self) -> None:
+        """Emit queued choice records after the enclosing agent span has ended."""
+        context = self._event_log_context
+        records = self._event_log_records
+        recording = self._event_log_recording
+        self._event_log_records = []
+        self._event_log_context = None
+        self._event_log_recording = False
+        if not records or not self._enabled or not recording or context is None:
+            return
+        emit_audit_log_records(
+            context,
+            (("gen_ai.choice", attributes) for attributes in records),
+        )
 
     def start_inference(
         self,
@@ -287,7 +362,8 @@ class AuditLogger:
         span.end(end_time=end_time)
 
     def close(self, error: BaseException | str = "operation_cancelled") -> None:
-        """End only outstanding child spans as failed, preserving completed spans."""
+        """Flush partial log buffers and end only outstanding child spans."""
+        self._flush_event_buffers()
         end_monotonic_ns = time.monotonic_ns()
         for state in tuple(self._open_spans.values()):
             self._open_spans.pop(id(state.span), None)

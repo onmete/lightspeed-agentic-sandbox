@@ -56,6 +56,32 @@ async def test_run_agent_query_shapes_structured_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_agent_query_logs_uncoerced_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="lightspeed_agentic")
+    provider = MockProvider(events=[ResultEvent(text='{"success":"unchanged","summary":"done"}')])
+
+    result = await run_agent_query(
+        provider,
+        prompt="test",
+        system_prompt="You are an AI agent.",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+
+    assert result.output["success"] == "unchanged"
+    assert any(
+        record.getMessage() == "[agent] query complete: success=unchanged"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_query_passes_system_prompt() -> None:
     provider = MockProvider()
     result = await run_agent_query(
@@ -119,8 +145,11 @@ async def test_run_agent_query_with_output_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_accepts_traceparent(span_exporter) -> None:
+async def test_run_agent_query_accepts_traceparent(
+    span_exporter, caplog: pytest.LogCaptureFixture
+) -> None:
     traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    caplog.set_level(logging.INFO, logger="lightspeed_agentic")
     result = await run_agent_query(
         MockProvider(),
         prompt="test",
@@ -135,6 +164,11 @@ async def test_run_agent_query_accepts_traceparent(span_exporter) -> None:
     )
 
     assert result.output["success"] is True
+    assert any(
+        record.getMessage() == "[agent] Starting query "
+        "(model=test-model, provider=mock, trace_id=4bf92f3577b34da6a3ce929d0e0e4736)"
+        for record in caplog.records
+    )
     agent_span = next(
         s for s in span_exporter.get_finished_spans() if s.name == "invoke_agent lightspeed"
     )
@@ -569,7 +603,7 @@ async def test_run_agent_query_cancellation_closes_open_children(span_exporter) 
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_exception_closes_open_children_without_logging_details(
+async def test_run_agent_query_exception_closes_open_children_with_exception_log(
     span_exporter,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -598,8 +632,11 @@ async def test_run_agent_query_exception_closes_open_children_without_logging_de
     )
 
     assert result.output["success"] is False
-    assert "secret provider detail" not in caplog.text
-    assert "error_type=RuntimeError" in caplog.text
+    assert "secret provider detail" in caplog.text
+    assert any(
+        record.message == "[agent] query error" and record.exc_info is not None
+        for record in caplog.records
+    )
     spans = span_exporter.get_finished_spans()
     agent_span = next(s for s in spans if s.name == "invoke_agent lightspeed")
     inference = next(s for s in spans if s.name == "chat test-model")

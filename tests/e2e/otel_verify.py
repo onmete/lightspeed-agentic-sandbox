@@ -249,15 +249,22 @@ def logs_contain_audit_logs_for_run(
     expected_operation: str,
     expected_provider: str,
 ) -> bool:
-    """True when a GenAI span-derived log record is correlated to its exported span."""
+    """True when a legacy choice-event log is correlated to its source trace."""
     spans = _genai_spans_for_run(
         logs,
         run_uid,
         expected_operation=expected_operation,
         expected_provider=expected_provider,
     )
-    if not spans:
+    agent_spans = _genai_spans_for_run(
+        logs,
+        run_uid,
+        expected_operation="invoke_agent",
+        expected_provider=expected_provider,
+    )
+    if not spans or not agent_spans:
         return False
+    inference_traces = {trace_id for trace_id, _span_id in spans}
 
     for resource, _scope, record in _debug_records(logs, signal="logs"):
         resource_attributes = _debug_attributes(resource)
@@ -267,24 +274,23 @@ def logs_contain_audit_logs_for_run(
         if (
             attributes.get("agenticrun.uid") != run_uid
             or attributes.get("agenticrun.phase") != phase
+            or attributes.get("event") != "gen_ai.choice"
         ):
             continue
         body = _json_log_body(record)
-        if body is None:
-            continue
-        operation = body.get("gen_ai.operation.name")
         if (
-            operation != expected_operation
-            or attributes.get("event") != operation
-            or body.get("gen_ai.provider.name") != expected_provider
+            body is None
+            or not set(body).issubset({"gen_ai.completion", "gen_ai.reasoning_content"})
+            or len(body) > 1
+            or any(not isinstance(value, str) for value in body.values())
         ):
             continue
-        trace_id = _debug_field(record, "Trace ID")
-        span_id = _debug_field(record, "Span ID")
+        trace_id = _debug_field(record, "Trace ID").lower()
+        span_id = _debug_field(record, "Span ID").lower()
         if not _nonzero_hex_id(trace_id, 32) or not _nonzero_hex_id(span_id, 16):
             continue
-        span_resource = spans.get((trace_id.lower(), span_id.lower()))
-        if span_resource == resource_attributes:
+        source_resource = agent_spans.get((trace_id, span_id))
+        if source_resource == resource_attributes and trace_id in inference_traces:
             return True
     return False
 
@@ -353,7 +359,7 @@ def wait_for_otel_audit_logs(
     timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> str:
-    """Poll collector logs until a correlated GenAI span-derived record is visible."""
+    """Poll collector logs until a legacy ``gen_ai.choice`` audit record is visible."""
     return _poll_collector_logs(
         core_api,
         namespace,
@@ -367,10 +373,7 @@ def wait_for_otel_audit_logs(
         ),
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
-        evidence_kind=(
-            f"audit logs (phase={phase}, operation={expected_operation}, "
-            f"provider={expected_provider})"
-        ),
+        evidence_kind=f"audit logs (phase={phase}, event=gen_ai.choice)",
     )
 
 

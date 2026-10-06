@@ -379,14 +379,12 @@ async def test_provider_error_telemetry_contains_safe_http_metadata(
 @pytest.mark.asyncio
 async def test_classifier_cancellation_errors_span_without_payload_and_propagates(
     span_exporter,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import asyncio
 
     from opentelemetry import trace
     from opentelemetry.trace import StatusCode
 
-    caplog.set_level(logging.WARNING)
     cancellation = asyncio.CancelledError("CLASSIFIER-CANCEL-SECRET")
 
     class CancelledClient:
@@ -424,4 +422,3 @@ async def test_classifier_cancellation_errors_span_without_payload_and_propagate
     for secret in ("CLASSIFIER-CANCEL-SECRET", "TOOL-RESULT-SECRET"):
         assert secret not in repr(attributes)
         assert secret not in repr(span.events)
-        assert secret not in caplog.text

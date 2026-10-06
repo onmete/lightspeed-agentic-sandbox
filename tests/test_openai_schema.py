@@ -169,23 +169,6 @@ def test_custom_endpoint_keeps_schema_non_strict() -> None:
     assert "additionalProperties" not in wrapper.json_schema()
 
 
-def test_openai_init_disables_sdk_tracing_without_verbose_content_logging(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from lightspeed_agentic.providers import openai as provider
-
-    monkeypatch.setattr(provider, "_openai_initialized", False)
-    with (
-        patch("agents.tracing.set_tracing_disabled") as set_tracing_disabled,
-        patch("agents.enable_verbose_stdout_logging") as verbose_logging,
-        patch.object(provider, "_patch_exec_command_args"),
-    ):
-        provider._ensure_openai_init()
-
-    set_tracing_disabled.assert_called_once_with(True)
-    verbose_logging.assert_not_called()
-
-
 def test_build_manifest_parent_of_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """Manifest root should be cwd's parent so exec_command reaches the full workspace."""
     monkeypatch.delenv("E2E_OUTPUT_DIR", raising=False)

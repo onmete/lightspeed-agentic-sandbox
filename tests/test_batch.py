@@ -75,6 +75,30 @@ class TestBatchMain:
             == "Execute the approved action."
         )
 
+    @pytest.mark.parametrize(
+        ("capture_content", "audit_enabled", "expected"),
+        [
+            ("true", False, True),
+            (" false ", True, False),
+            (None, True, True),
+            (None, False, False),
+        ],
+    )
+    def test_capture_content_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capture_content: str | None,
+        audit_enabled: bool,
+        expected: bool,
+    ) -> None:
+        from lightspeed_agentic.batch import _resolve_capture_content
+
+        if capture_content is None:
+            monkeypatch.delenv("LIGHTSPEED_CAPTURE_CONTENT", raising=False)
+        else:
+            monkeypatch.setenv("LIGHTSPEED_CAPTURE_CONTENT", capture_content)
+        assert _resolve_capture_content(audit_enabled) is expected
+
     def test_input_read_failure_writes_termination_log_and_exits(self) -> None:
         with (
             patch(
@@ -104,6 +128,8 @@ class TestBatchMain:
         )
         monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_UID", "run-uid")
         monkeypatch.setenv("LIGHTSPEED_AGENTICRUN_STEP", "execution")
+        monkeypatch.setenv("LIGHTSPEED_AUDIT_ENABLED", "true")
+        monkeypatch.setenv("LIGHTSPEED_CAPTURE_CONTENT", "false")
 
         with (
             patch("lightspeed_agentic.batch.read_batch_inputs", return_value=_INPUTS),
@@ -196,6 +222,8 @@ class TestBatchMain:
             assert run_query.call_args.kwargs["step"] == "execution"
             assert run_query.call_args.kwargs["timeout_seconds"] == 300
             assert run_query.call_args.kwargs["max_turns"] == 200
+            assert run_query.call_args.kwargs["audit_enabled"] is True
+            assert run_query.call_args.kwargs["capture_content"] is False
             exit_mock.assert_not_called()
 
     def test_safety_failure_writes_marker_without_publishing_result(self) -> None:

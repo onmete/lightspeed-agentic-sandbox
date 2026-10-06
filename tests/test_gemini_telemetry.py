@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 from opentelemetry import trace
-from opentelemetry._logs import NoOpLogger
 from opentelemetry.trace import StatusCode
 from prometheus_client import REGISTRY
 
@@ -377,14 +376,12 @@ def test_native_adk_tracing_suppression_is_module_scoped(monkeypatch: Any) -> No
         *gemini_telemetry._ADK_TRACER_ALIAS_MODULES,
     )
     modules = {name: SimpleNamespace(tracer=original_tracer) for name in module_names}
-    modules["google.adk.telemetry.tracing"].otel_logger = object()
     monkeypatch.setattr(gemini_telemetry.importlib, "import_module", modules.__getitem__)
     provider = trace.get_tracer_provider()
 
     disable_adk_native_telemetry()
 
     assert isinstance(modules["google.adk.telemetry.tracing"].tracer, trace.NoOpTracer)
-    assert isinstance(modules["google.adk.telemetry.tracing"].otel_logger, NoOpLogger)
     for name in gemini_telemetry._ADK_TRACER_ALIAS_MODULES:
         assert modules[name].tracer is modules["google.adk.telemetry.tracing"].tracer
     assert trace.get_tracer_provider() is provider

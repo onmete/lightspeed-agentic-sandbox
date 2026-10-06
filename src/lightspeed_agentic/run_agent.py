@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -165,6 +166,8 @@ async def run_agent_query(
     mcp_servers: list[AdmittedMCPProviderServer] | None = None,
     reasoning_config: dict[str, Any] | None = None,
     tool_output_inspection_enabled: bool = True,
+    audit_enabled: bool = False,
+    capture_content: bool = False,
     agenticrun_uid: str = "",
     traceparent: str | None = None,
     step: str = "",
@@ -182,7 +185,7 @@ async def run_agent_query(
             return AgentResult(output={"success": False, "summary": str(exc)})
         prompt = f"{prefix}\n\n{prompt}"
 
-    _, traceparent_context = parse_traceparent(traceparent)
+    trace_id, traceparent_context = parse_traceparent(traceparent)
     agent_parent_context = traceparent_context if traceparent_context is not None else Context()
     tracer = get_tracer()
     provider_sdk_name = provider.name
@@ -191,6 +194,8 @@ async def run_agent_query(
         phase=step,
         model=model,
         provider=provider_name,
+        enabled=audit_enabled,
+        capture_content=capture_content,
         agenticrun_uid=agenticrun_uid,
     )
 
@@ -218,11 +223,14 @@ async def run_agent_query(
         attributes=span_attrs,
     )
     span_context = agent_span.get_span_context()
-    trace_id = f"{span_context.trace_id:032x}" if span_context.is_valid else ""
+    if not trace_id and span_context.is_valid:
+        trace_id = f"{span_context.trace_id:032x}"
+    if not trace_id:
+        trace_id = secrets.token_hex(16)
     logger.info(
         "[agent] Starting query (model=%s, provider=%s, trace_id=%s)",
         model,
-        provider_name,
+        provider.name,
         trace_id,
     )
     agent_context = trace.set_span_in_context(agent_span, agent_parent_context)
@@ -273,6 +281,7 @@ async def run_agent_query(
                 event_logger = EventLogger("run")
                 async for event in result:
                     event_logger.log(_developer_log_event(provider_sdk_name, event))
+                    audit_logger.process_event(event)
                     if event.type == "result":
                         text = event.text
                         input_tokens = event.input_tokens
@@ -308,7 +317,7 @@ async def run_agent_query(
     except Exception as exc:
         failure = exc
         _set_agent_error(exc)
-        logger.error("[agent] query error (error_type=%s)", type(exc).__name__)
+        logger.exception("[agent] query error")
         return AgentResult(
             output={"success": False, "summary": f"Agent error: {exc}"},
         )
@@ -345,7 +354,7 @@ async def run_agent_query(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
-            logger.info("[agent] query complete: success=%s", bool(success))
+            logger.info("[agent] query complete: success=%s", success)
         else:
             result = AgentResult(
                 output={"success": True, "summary": text},
@@ -378,4 +387,7 @@ async def run_agent_query(
         try:
             audit_logger.close(failure or "operation_cancelled")
         finally:
-            agent_span.end()
+            try:
+                agent_span.end()
+            finally:
+                audit_logger.flush_event_logs()

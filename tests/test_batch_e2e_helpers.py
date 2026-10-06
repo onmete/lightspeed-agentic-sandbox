@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import posixpath
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,7 +38,6 @@ from tests.e2e.batch_runner import (
 from tests.e2e.skills_fixtures import (
     E2E_POD_SKILLS_DIR,
     E2E_POD_SKILLS_SRC_DIR,
-    E2E_POD_SKILLS_WORKDIR,
     _cm_key_from_rel,
     _rel_from_cm_key,
     skill_materialize_script,
@@ -50,15 +48,6 @@ from tests.e2e.suite_setup import (
     load_batch_e2e_config,
     resolve_llm_secret,
     resolve_model,
-)
-
-_ECHO_TOKEN_SKILL_PATH = posixpath.join(E2E_POD_SKILLS_DIR, "echo-token")
-_ECHO_TOKEN_SKILL_INSTRUCTIONS = posixpath.join(_ECHO_TOKEN_SKILL_PATH, "SKILL.md")
-_ECHO_TOKEN_SCRIPT = posixpath.join(_ECHO_TOKEN_SKILL_PATH, "scripts", "echo-token.sh")
-_OPENAI_ECHO_TOKEN_WORKDIR = posixpath.join(E2E_POD_SKILLS_WORKDIR, "echo-token")
-_OPENAI_ECHO_TOKEN_RELATIVE_WORKDIR = posixpath.relpath(
-    _OPENAI_ECHO_TOKEN_WORKDIR,
-    posixpath.dirname(E2E_POD_SKILLS_DIR),
 )
 
 
@@ -93,39 +82,20 @@ def _agent_span(
     return "invoke_agent lightspeed", attributes, status_code
 
 
-_DEFAULT_TOOL_ARGUMENTS = object()
-
-
 def _tool_span(
     result: Any,
     *,
     run_uid: str,
     phase: str,
-    tool_name: str = "execute_bash",
-    tool_arguments: Any = _DEFAULT_TOOL_ARGUMENTS,
-    tool_arguments_json: str | None = None,
+    tool_name: str = "shell",
     status_code: StatusCode | None = None,
 ) -> tuple[str, dict[str, Any], StatusCode | None]:
-    if tool_arguments is _DEFAULT_TOOL_ARGUMENTS:
-        if tool_name == "exec_command":
-            tool_arguments = {
-                "cmd": "bash scripts/echo-token.sh",
-                "workdir": _OPENAI_ECHO_TOKEN_WORKDIR,
-            }
-        elif tool_name in {"execute", "execute_bash"}:
-            tool_arguments = {"command": "cd echo-token && bash scripts/echo-token.sh"}
-        else:
-            tool_arguments = None
     attributes: dict[str, Any] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_name,
         "agenticrun.uid": run_uid,
         "agenticrun.phase": phase,
     }
-    if tool_arguments_json is not None:
-        attributes["gen_ai.tool.call.arguments"] = tool_arguments_json
-    elif tool_arguments is not None:
-        attributes["gen_ai.tool.call.arguments"] = json.dumps(tool_arguments)
     if result is not None:
         attributes["gen_ai.tool.call.result"] = json.dumps(result)
     return f"execute_tool {tool_name}", attributes, status_code
@@ -142,29 +112,14 @@ def _openai_exec_result(output: str, *, exit_code: int) -> str:
     )
 
 
-def _successful_echo_tool_result(tool_name: str, token: str) -> Any:
-    output = json.dumps({"token": token, "status": "ok"})
-    if tool_name == "execute":
-        return output + "\n\n[Command succeeded with exit code 0]"
-    if tool_name == "execute_bash":
-        return {"exit_code": 0, "stderr": "", "stdout": output + "\n"}
-    if tool_name == "exec_command":
-        return _openai_exec_result(output + "\n", exit_code=0)
-    raise AssertionError(f"unsupported tool name: {tool_name}")
-
-
 def _export_otlp_stdout(
     capsys: pytest.CaptureFixture[str],
     spans: list[tuple[str, dict[str, Any], StatusCode | None]],
-    *,
-    capture_content: bool = True,
 ) -> str:
     provider = TracerProvider(
         resource=Resource.create({"service.name": "lightspeed-agentic-sandbox"})
     )
-    provider.add_span_processor(
-        SimpleSpanProcessor(OTLPJsonStdoutExporter(capture_content=capture_content))
-    )
+    provider.add_span_processor(SimpleSpanProcessor(OTLPJsonStdoutExporter()))
     tracer = provider.get_tracer(
         "lightspeed_agentic",
         schema_url="https://opentelemetry.io/schemas/1.41.0",
@@ -429,7 +384,7 @@ class TestEnrichBodyFromOtlpStdout:
             == body
         )
 
-    def test_filtered_missing_or_failed_terminal_output_does_not_invent_result(
+    def test_missing_or_failed_terminal_output_does_not_invent_result(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -437,11 +392,6 @@ class TestEnrichBodyFromOtlpStdout:
         phase = "analysis"
         body = {"success": True, "summary": "Step completed"}
         output = {"success": True, "summary": "must not be recovered"}
-        filtered = _export_otlp_stdout(
-            capsys,
-            [_agent_span(output, run_uid=run_uid, phase=phase)],
-            capture_content=False,
-        )
         no_terminal = _export_otlp_stdout(
             capsys,
             [_agent_span(None, run_uid=run_uid, phase=phase)],
@@ -457,15 +407,6 @@ class TestEnrichBodyFromOtlpStdout:
                     status_code=StatusCode.ERROR,
                 )
             ],
-        )
-        assert (
-            _enrich_body_from_otlp_stdout(
-                body,
-                filtered,
-                run_uid=run_uid,
-                phase=phase,
-            )
-            == body
         )
         assert (
             _enrich_body_from_otlp_stdout(
@@ -633,68 +574,6 @@ class TestParseEchoTokenFromToolSpans:
             == returncode_token
         )
 
-    @pytest.mark.parametrize(
-        ("tool_name", "tool_arguments"),
-        [
-            (
-                "execute",
-                {"command": f"bash {_ECHO_TOKEN_SCRIPT}"},
-            ),
-            (
-                "execute",
-                {"command": (f"cat {_ECHO_TOKEN_SKILL_INSTRUCTIONS} && bash {_ECHO_TOKEN_SCRIPT}")},
-            ),
-            (
-                "execute_bash",
-                {"command": ("cd echo-token && cat SKILL.md && bash scripts/echo-token.sh")},
-            ),
-            (
-                "exec_command",
-                {
-                    "cmd": "cat SKILL.md && bash scripts/echo-token.sh",
-                    "workdir": _OPENAI_ECHO_TOKEN_WORKDIR,
-                },
-            ),
-            (
-                "exec_command",
-                {
-                    "cmd": "cat SKILL.md && bash scripts/echo-token.sh",
-                    "workdir": _OPENAI_ECHO_TOKEN_RELATIVE_WORKDIR,
-                },
-            ),
-        ],
-    )
-    def test_extracts_token_from_native_provider_command(
-        self,
-        capsys: pytest.CaptureFixture[str],
-        tool_name: str,
-        tool_arguments: dict[str, str],
-    ) -> None:
-        run_uid = "run-uid"
-        phase = "analysis"
-        token = "a" * 32
-        stdout = _export_otlp_stdout(
-            capsys,
-            [
-                _tool_span(
-                    _successful_echo_tool_result(tool_name, token),
-                    run_uid=run_uid,
-                    phase=phase,
-                    tool_name=tool_name,
-                    tool_arguments=tool_arguments,
-                )
-            ],
-        )
-
-        assert (
-            _parse_echo_token_from_otlp_stdout(
-                stdout,
-                run_uid=run_uid,
-                phase=phase,
-            )
-            == token
-        )
-
     def test_openai_exec_result_requires_success_exit_code(
         self,
         capsys: pytest.CaptureFixture[str],
@@ -704,9 +583,6 @@ class TestParseEchoTokenFromToolSpans:
         token = "f" * 32
         token_json = json.dumps({"token": token, "status": "ok"})
         output = f"Contents of SKILL.md\n{token_json}\n"
-        openai_arguments = {
-            "cmd": (f"cd {_ECHO_TOKEN_SKILL_PATH} && cat SKILL.md && bash scripts/echo-token.sh"),
-        }
         successful = _export_otlp_stdout(
             capsys,
             [
@@ -715,7 +591,6 @@ class TestParseEchoTokenFromToolSpans:
                     run_uid=run_uid,
                     phase=phase,
                     tool_name="exec_command",
-                    tool_arguments=openai_arguments,
                 )
             ],
         )
@@ -731,7 +606,6 @@ class TestParseEchoTokenFromToolSpans:
                     run_uid=run_uid,
                     phase=phase,
                     tool_name="exec_command",
-                    tool_arguments=openai_arguments,
                 )
             ],
         )
@@ -743,7 +617,6 @@ class TestParseEchoTokenFromToolSpans:
                     run_uid=run_uid,
                     phase=phase,
                     tool_name="exec_command",
-                    tool_arguments=openai_arguments,
                 )
             ],
         )
@@ -758,7 +631,6 @@ class TestParseEchoTokenFromToolSpans:
                     run_uid=run_uid,
                     phase=phase,
                     tool_name="exec_command",
-                    tool_arguments=openai_arguments,
                 )
             ],
         )
@@ -812,7 +684,6 @@ class TestParseEchoTokenFromToolSpans:
                     script_json + "\n\n[Command succeeded with exit code 0]",
                     run_uid=run_uid,
                     phase=phase,
-                    tool_name="execute",
                 )
             ],
         )
@@ -823,7 +694,6 @@ class TestParseEchoTokenFromToolSpans:
                     script_json + "\n\n[Command failed with exit code 1]",
                     run_uid=run_uid,
                     phase=phase,
-                    tool_name="execute",
                 )
             ],
         )
@@ -845,7 +715,7 @@ class TestParseEchoTokenFromToolSpans:
             == ""
         )
 
-    def test_rejects_unrelated_failed_filtered_and_echoed_tokens(
+    def test_rejects_unrelated_failed_and_echoed_tokens(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -899,11 +769,6 @@ class TestParseEchoTokenFromToolSpans:
             ],
         )
         logs = f"INFO lightspeed_agentic: token={token}\n{stdout}"
-        filtered = _export_otlp_stdout(
-            capsys,
-            [_tool_span(tool_result, run_uid=run_uid, phase=phase)],
-            capture_content=False,
-        )
 
         assert (
             _parse_echo_token_from_otlp_stdout(
@@ -912,92 +777,6 @@ class TestParseEchoTokenFromToolSpans:
                 phase=phase,
             )
             == ""
-        )
-        assert (
-            _parse_echo_token_from_otlp_stdout(
-                filtered,
-                run_uid=run_uid,
-                phase=phase,
-            )
-            == ""
-        )
-
-    def test_ignores_unrelated_tools_and_ambiguous_shell_commands(
-        self,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        run_uid = "run-uid"
-        phase = "analysis"
-        accepted_token = "a" * 32
-        unrelated_token = "b" * 32
-        unrelated_result = _successful_echo_tool_result("execute_bash", unrelated_token)
-        rejected_commands = (
-            f"cat {_ECHO_TOKEN_SCRIPT}",
-            f"printf '%s\\n' 'bash {_ECHO_TOKEN_SCRIPT}'",
-            "cd echo-token && cat SKILL.md",
-            "cd echo-token && printf '%s\\n' 'bash scripts/echo-token.sh'",
-            "cd echo-token && cat README.md && bash scripts/echo-token.sh",
-            "cd echo-token '&&' cat SKILL.md && bash scripts/echo-token.sh",
-            "printf x | cd echo-token && bash scripts/echo-token.sh",
-            "false && cd echo-token && bash scripts/echo-token.sh",
-            "(cd echo-token) && bash scripts/echo-token.sh",
-        )
-        spans = [
-            _tool_span(
-                _successful_echo_tool_result("execute_bash", accepted_token),
-                run_uid=run_uid,
-                phase=phase,
-                tool_name="execute_bash",
-                tool_arguments={"command": f"bash {_ECHO_TOKEN_SCRIPT}"},
-            ),
-            _tool_span(
-                unrelated_result,
-                run_uid=run_uid,
-                phase=phase,
-                tool_name="mcp__filesystem__read_file",
-                tool_arguments={"path": _ECHO_TOKEN_SCRIPT},
-            ),
-            *[
-                _tool_span(
-                    unrelated_result,
-                    run_uid=run_uid,
-                    phase=phase,
-                    tool_name="execute_bash",
-                    tool_arguments={"command": command},
-                )
-                for command in rejected_commands
-            ],
-            _tool_span(
-                unrelated_result,
-                run_uid=run_uid,
-                phase=phase,
-                tool_name="execute_bash",
-                tool_arguments=None,
-            ),
-            _tool_span(
-                unrelated_result,
-                run_uid=run_uid,
-                phase=phase,
-                tool_name="execute_bash",
-                tool_arguments_json='{"command":',
-            ),
-            _tool_span(
-                unrelated_result,
-                run_uid=run_uid,
-                phase=phase,
-                tool_name="execute_bash",
-                tool_arguments={"cmd": f"bash {_ECHO_TOKEN_SCRIPT}"},
-            ),
-        ]
-        stdout = _export_otlp_stdout(capsys, spans)
-
-        assert (
-            _parse_echo_token_from_otlp_stdout(
-                stdout,
-                run_uid=run_uid,
-                phase=phase,
-            )
-            == accepted_token
         )
 
 
@@ -1030,26 +809,6 @@ class TestFetchedPodLogs:
                     run_uid=run_uid,
                     phase=phase,
                     tool_name="exec_command",
-                    tool_arguments={
-                        "cmd": (
-                            f"cd {_ECHO_TOKEN_SKILL_PATH} && cat SKILL.md && "
-                            "bash scripts/echo-token.sh"
-                        ),
-                    },
-                ),
-                _tool_span(
-                    _successful_echo_tool_result("execute_bash", "b" * 32),
-                    run_uid=run_uid,
-                    phase=phase,
-                    tool_name="mcp__filesystem__read_file",
-                    tool_arguments={"path": _ECHO_TOKEN_SCRIPT},
-                ),
-                _tool_span(
-                    _successful_echo_tool_result("execute_bash", "c" * 32),
-                    run_uid=run_uid,
-                    phase=phase,
-                    tool_name="execute_bash",
-                    tool_arguments={"command": f"cat {_ECHO_TOKEN_SCRIPT}"},
                 ),
             ],
         )

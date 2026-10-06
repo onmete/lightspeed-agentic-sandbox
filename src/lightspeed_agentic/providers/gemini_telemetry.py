@@ -30,10 +30,6 @@ class _ADKTracerModule(Protocol):
     tracer: Any
 
 
-class _ADKTelemetryModule(_ADKTracerModule, Protocol):
-    otel_logger: Any
-
-
 @dataclass
 class _InferenceCall:
     span: Any
@@ -295,25 +291,22 @@ class GeminiTelemetry:
 
 
 def disable_adk_native_telemetry() -> None:
-    """Disable ADK's legacy OTel sources without changing global OTel settings.
+    """Disable ADK's legacy span source without changing global OTel settings.
 
     Google ADK 2.5.0 has no per-invocation switch that disables its built-in
-    spans. Its tracing module also emits legacy GenAI LogRecords independently
-    of those spans, so both module-scoped sources are replaced for this
-    one-shot sandbox invocation. The process TracerProvider, LoggerProvider,
-    exporters, and capture environment remain untouched.
+    spans, so its module-scoped tracer aliases are replaced for this one-shot
+    sandbox invocation. The process TracerProvider, LoggerProvider, exporters,
+    and capture environment remain untouched.
     """
     from opentelemetry import trace
-    from opentelemetry._logs import NoOpLoggerProvider
 
     adk_tracing = cast(
-        _ADKTelemetryModule,
+        _ADKTracerModule,
         importlib.import_module("google.adk.telemetry.tracing"),
     )
     adk_tracer = adk_tracing.tracer
     noop_tracer = trace.NoOpTracer()
     adk_tracing.tracer = noop_tracer
-    adk_tracing.otel_logger = NoOpLoggerProvider().get_logger("gcp.vertex.agent")
 
     for module_name in _ADK_TRACER_ALIAS_MODULES:
         module = importlib.import_module(module_name)
