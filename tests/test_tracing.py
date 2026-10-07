@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest,
+)
 
 import lightspeed_agentic.tracing as _tracing_mod
+from lightspeed_agentic.run_agent import run_agent_query
 from lightspeed_agentic.tracing import (
     get_tracer,
     init_tracer,
@@ -16,6 +21,9 @@ from lightspeed_agentic.tracing import (
     parse_traceparent,
     shutdown_tracer,
 )
+from lightspeed_agentic.types import ResultEvent, ToolCallEvent, ToolResultEvent
+
+from .conftest import MockProvider
 
 _TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -328,3 +336,54 @@ class TestInitTracer:
             if (r.log_record.attributes or {}).get("event") == "gen_ai.choice"
         ]
         assert matching == []
+
+
+@pytest.mark.asyncio
+async def test_json_span_attributes_survive_otlp_protobuf_round_trip(span_exporter) -> None:
+    text = "left \ud800 café 🌍 middle \udfff right"
+    expected_tool_payload = {"text": text}
+    tool_payload = json.dumps(expected_tool_payload, ensure_ascii=True, separators=(",", ":"))
+
+    await run_agent_query(
+        MockProvider(
+            events=[
+                ToolCallEvent(name="lookup", input=tool_payload, call_id="call-1"),
+                ToolResultEvent(output=tool_payload, call_id="call-1"),
+                ResultEvent(text='{"success": true, "summary": "done"}'),
+            ]
+        ),
+        prompt=text,
+        system_prompt=text,
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+
+    request = _tracing_mod.encode_spans(span_exporter.get_finished_spans())
+    round_tripped_request = ExportTraceServiceRequest()
+    round_tripped_request.ParseFromString(request.SerializeToString())
+
+    attributes_by_span = {
+        span.name: {attribute.key: attribute.value.string_value for attribute in span.attributes}
+        for resource_span in round_tripped_request.resource_spans
+        for scope_span in resource_span.scope_spans
+        for span in scope_span.spans
+    }
+    invocation_attributes = attributes_by_span["invoke_agent"]
+    tool_attributes = attributes_by_span["execute_tool lookup"]
+    invocation_json = invocation_attributes["gen_ai.input.messages"]
+    tool_arguments_json = tool_attributes["gen_ai.tool.call.arguments"]
+    tool_result_json = tool_attributes["gen_ai.tool.call.result"]
+
+    assert json.loads(invocation_json) == [
+        {"role": "user", "parts": [{"type": "text", "content": text}]}
+    ]
+    assert json.loads(tool_arguments_json) == expected_tool_payload
+    assert json.loads(tool_result_json) == expected_tool_payload
+    for value in (invocation_json, tool_arguments_json, tool_result_json):
+        assert r"\ud800" in value
+        assert r"\udfff" in value
+        assert "café 🌍" in value

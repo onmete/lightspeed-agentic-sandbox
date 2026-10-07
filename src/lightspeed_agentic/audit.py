@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from typing import Any
 
@@ -10,8 +12,35 @@ from opentelemetry.context import Context
 from opentelemetry.trace import SpanKind, StatusCode
 
 from lightspeed_agentic.metrics import tool_duration
-from lightspeed_agentic.tracing import get_tracer
+from lightspeed_agentic.tracing import get_tracer, set_json_span_attribute
 from lightspeed_agentic.types import ProviderEvent
+
+
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return number
+
+
+def _tool_payload(value: str) -> dict[str, Any]:
+    """Normalize payloads to an object; ``content`` wraps nonobject values.
+
+    The envelope is normalization, not a native tool-argument name.
+    """
+    try:
+        parsed = json.loads(value, parse_float=_finite_float, parse_constant=_finite_float)
+    except (RecursionError, ValueError):
+        parsed = value
+    return parsed if isinstance(parsed, dict) else {"content": parsed}
+
+
+def _set_tool_payload(span: Any, name: str, value: str) -> None:
+    payload = _tool_payload(value)
+    try:
+        set_json_span_attribute(span, name, payload)
+    except RecursionError:
+        set_json_span_attribute(span, name, {"content": value})
 
 
 class AuditLogger:
@@ -41,7 +70,7 @@ class AuditLogger:
         self._agenticrun_uid = agenticrun_uid
         self._text_buffer: list[str] = []
         self._thinking_buffer: list[str] = []
-        self._tool_spans: dict[str, tuple[Any, float]] = {}
+        self._tool_spans: dict[str | int, tuple[Any, float]] = {}
         self._next_call_id: int = 0
         self._tracer = get_tracer()
         self._parent_context: Context | None = None
@@ -61,33 +90,37 @@ class AuditLogger:
                 self._flush_buffers()
             case "tool_call":
                 self._flush_buffers()
-                call_id = event.call_id or f"_auto_{self._next_call_id}"
-                self._next_call_id += 1
+                call_key = event.call_id or self._next_call_id
+                if not event.call_id:
+                    self._next_call_id += 1
                 tool_name = event.name or "unknown"
                 attrs: dict[str, str] = {
                     "gen_ai.operation.name": "execute_tool",
                     "gen_ai.tool.name": tool_name,
-                    "gen_ai.tool.call.id": call_id,
                     "gen_ai.tool.type": "function",
                 }
+                if event.call_id:
+                    attrs["gen_ai.tool.call.id"] = event.call_id
                 if self._agenticrun_uid:
                     attrs["agenticrun.uid"] = self._agenticrun_uid
                 if self._agenticrun_phase:
                     attrs["agenticrun.phase"] = self._agenticrun_phase
-                if event.input:
-                    attrs["tool.input"] = event.input
                 span = self._tracer.start_span(
                     f"execute_tool {tool_name}",
                     kind=SpanKind.INTERNAL,
                     context=self._parent_context,
                     attributes=attrs,
                 )
-                self._tool_spans[call_id] = (span, time.monotonic())
+                _set_tool_payload(span, "gen_ai.tool.call.arguments", event.input)
+                self._tool_spans[call_key] = (span, time.monotonic())
             case "tool_result":
                 call_id = event.call_id
-                entry = self._tool_spans.pop(call_id, None) if call_id else None
-                if entry is None and not call_id and self._tool_spans:
-                    entry = self._tool_spans.pop(next(iter(self._tool_spans)))
+                if call_id:
+                    entry = self._tool_spans.pop(call_id, None)
+                elif len(self._tool_spans) == 1:
+                    _, entry = self._tool_spans.popitem()
+                else:
+                    entry = None
                 if entry is not None:
                     tool_span, start = entry
                     tool_name = (
@@ -98,8 +131,7 @@ class AuditLogger:
                     tool_duration.labels(gen_ai_tool_name=tool_name).observe(
                         time.monotonic() - start
                     )
-                    if event.output:
-                        tool_span.set_attribute("tool.output", event.output)
+                    _set_tool_payload(tool_span, "gen_ai.tool.call.result", event.output)
                     tool_span.set_status(StatusCode.OK)
                     tool_span.end()
             case "result":
@@ -108,34 +140,34 @@ class AuditLogger:
     def complete(
         self,
         *,
-        success: bool,
         input_tokens: int,
         output_tokens: int,
         reasoning_tokens: int = 0,
-        response_model: str = "",
         span: Any = None,
     ) -> None:
         """Flush buffers, close open tool spans, and stamp usage on the inference span."""
         self._flush_buffers(span)
-        for _call_id, (tool_span, start) in self._tool_spans.items():
+        for _span_key, (tool_span, start) in self._tool_spans.items():
             tool_name = (
                 tool_span.attributes.get("gen_ai.tool.name", "unknown")
                 if hasattr(tool_span, "attributes")
                 else "unknown"
             )
             tool_duration.labels(gen_ai_tool_name=tool_name).observe(time.monotonic() - start)
-            tool_span.set_status(StatusCode.ERROR, "tool span not closed by result event")
-            tool_span.end()
-        self._tool_spans.clear()
+        self.close_pending_tools()
         if span is not None and span.is_recording():
-            if response_model:
-                span.set_attribute("gen_ai.response.model", response_model)
             span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
             span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
             if reasoning_tokens:
-                span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
-            if not success:
-                span.set_status(StatusCode.ERROR, "agent run failed")
+                span.set_attribute("gen_ai.usage.reasoning.output_tokens", reasoning_tokens)
+
+    def close_pending_tools(self) -> None:
+        """Close unresolved tool spans without flushing buffered choice events."""
+        for tool_span, _start in self._tool_spans.values():
+            tool_span.set_attribute("error.type", "missing_tool_result")
+            tool_span.set_status(StatusCode.ERROR, "tool span not closed by result event")
+            tool_span.end()
+        self._tool_spans.clear()
 
     def _flush_buffers(self, explicit_span: Any = None) -> None:
         """Emit buffered completion/thinking text as ``gen_ai.choice`` span events."""

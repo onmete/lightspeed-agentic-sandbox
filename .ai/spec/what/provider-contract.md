@@ -2,7 +2,7 @@
 
 Audience: AI agents (Claude). Precision over narrative.
 
-Cross-references: batch agent invocation → `run-api.md`. Env and build → `configuration.md`. Provider-neutral product trace events → `data-collection.md`.
+Cross-references: batch agent invocation → `run-api.md`. Env and build → `configuration.md`. Sandbox trace profile → `data-collection.md`.
 
 ## Behavioral Rules
 
@@ -96,23 +96,23 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
     | Azure Entra ID (OLS-3050) | `client_id` / `tenant_id` / `client_secret` | `azure.identity` `ClientSecretCredential` via `azure_ad_token_provider` (rule 29) |
     | AWS Bedrock (OLS-4092) | `aws_access_key_id` / `aws_secret_access_key` + optional `role_arn` | `botocore` credential-provider chain: with `role_arn` it performs STS assume-role and refreshes the short-lived credentials (see `configuration.md` rule 9b). The Anthropic-on-Bedrock model path is unchanged. |
 
-### Agentic product trace normalization
+### Agentic Trace Profile
 
-39. [PLANNED: OLS-3569] Provider adapters MUST expose the complete provider-neutral completion, reasoning, tool call/result, explicit skill load/use, and terminal-result values required by `data-collection.md`. Provider-specific SDK object shapes MUST stop at the adapter boundary and MUST NOT create alternate content-event names.
+39. PR1 leaves the provider `ProviderEvent`/`ResultEvent` APIs, provider logging, and result shaping unchanged. Cancellation propagates unchanged: root telemetry records ERROR/`CancelledError`, pending tools close ERROR/`missing_tool_result` without output or duration observations, and cancellation adds no legacy choice/log flush. Shared invocation attributes and legacy choice events are defined in `data-collection.md` and `audit-logging.md`; choice events are not a canonical ordered transcript.
 
-40. [PLANNED: OLS-3569] Tool input/result and assistant/reasoning values retained for content trace events MUST NOT be length-truncated. The existing `EventLogger` can truncate its developer-log rendering. For DeepAgents tool calls and results, OLS-3928 rule 6 prohibits payload content in that rendering.
+40. The root trace uses the configured request model and does not claim `gen_ai.provider.name` or `gen_ai.response.model`. Existing `ResultEvent` metadata and aggregate usage remain unchanged for result handling; adapter fallbacks are not promoted to actual root response metadata. Root reasoning usage is recorded only when nonzero, as specified in `data-collection.md`.
 
-41. [PLANNED: OLS-3569] Every adapter's terminal `result` MUST carry the exact final response, requested-model fallback or actual response model, input tokens, output tokens, and reasoning tokens. When an SDK does not expose the actual model or a token category, the adapter MUST use the requested model or zero respectively; it MUST NOT omit the field or invent usage.
+41. `AuditLogger` records observed tool input/result in `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` as JSON objects. Strict parsing accepts standards-compliant finite JSON only; `NaN`, `Infinity`, `-Infinity`, exponent overflow, and parser/encoder-limit failures fall back to the complete original raw string under `{"content": raw_string}`. Parsed dictionaries pass through unchanged; other valid decoded values are wrapped as `{"content": value}`. This is trace normalization, not provider-native field mapping; it MUST NOT truncate data or raise a telemetry-only provider error. Preserve empty-versus-missing values, use only results admitted by the existing safety/redaction path, and leave `EventLogger` behavior unchanged.
 
-42. [PLANNED: OLS-3569] Gemini MUST retain terminal text from non-streamed ADK responses and pass it through the terminal `result`; it MUST NOT leave the final value empty because the text arrived in a non-partial event. Gemini MUST also expose response-model and token metadata under rule 41.
+42. Emit only actual SDK tool-call IDs. A result without an ID may match only one pending call; an ambiguous result stays unmatched, with unresolved calls ending ERROR as `error.type="missing_tool_result"`. Do not fabricate IDs or results.
 
-43. [PLANNED: OLS-3569] DeepAgents structured output MUST preserve the first agent pass's ordered completion, reasoning, tool, and skill signals and pass the second tool-free shape result as terminal `result` text. Usage totals MUST include both passes, and response-model fallback follows rule 41.
+43. PR1 adds no trace-only optional provider-event fields, custom transcript attribute/event, or skill events. Do not infer skill use from completion text or generic tool output.
 
-44. [PLANNED: OLS-3569] OpenAI MUST serialize `result.final_output` as the terminal `result` value and expose model and token metadata under rule 41, including reasoning tokens from output-token details when available.
+44. [PLANNED: OLS-3569, subsequent PRs] Add sandbox-owned canonical per-generation capture at actual SDK lifecycle boundaries as standard CLIENT `chat`/`generate_content` spans. Existing SDK-native ADK `call_llm`/`generate_content` spans remain unchanged framework detail and outside the canonical profile until PR3's exported-view normalization. Use only provider/model/response/usage values exposed by the SDK boundaries; omit unavailable metadata rather than applying requested-model or zero-usage fallbacks to trace attributes.
 
-45. [PLANNED: OLS-3569] Adapters MUST emit skill-loaded and skill-used signals only when their SDK or sandbox integration explicitly exposes those facts. They MUST include identity and all available content or metadata without redaction or truncation and MUST NOT infer skill use from model text or generic tool output.
+45. [PLANNED: OLS-3569, subsequent PRs] Scope that new canonical capture to main-agent generations, including the separate DeepAgents structured-output shaping generation; exclude nested-agent, classifier, and summarization generations. PR1 adds no such sandbox-owned canonical spans; existing SDK-native ADK spans remain unchanged and noncanonical until PR3's exported-view normalization.
 
-46. [PLANNED: OLS-3569] Adapters MUST preserve the same tool name and stable call ID across each tool call/result pair and the corresponding operational tool span, retain complete input and output, and normalize result status to `ok` or `error`. When the SDK omits a call ID, the adapter MUST generate one stable ID for the pair.
+46. [PLANNED: OLS-3569, subsequent PRs] Preserve SDK-provided generation output/part order. Do not derive generation output or repeated request history from the existing normalized `ProviderEvent` stream or legacy choice-event buffers.
 
 ### Tool-Result Prompt-Injection Inspection [PLANNED: OLS-3928]
 

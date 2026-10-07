@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import ToolMessage
+from opentelemetry.trace import SpanKind, StatusCode
 
 from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 from lightspeed_agentic.inspection.middleware import ToolResultInspectionMiddleware
@@ -17,6 +19,8 @@ from lightspeed_agentic.types import (
     ProviderEvent,
     ProviderQueryOptions,
     ResultEvent,
+    TextDeltaEvent,
+    ThinkingDeltaEvent,
     ToolCallEvent,
     ToolResultEvent,
 )
@@ -59,24 +63,151 @@ async def test_run_agent_query_with_system_prompt() -> None:
     assert result.output["success"] is True
 
 
+@pytest.mark.parametrize(
+    ("audit_enabled", "capture_content"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 @pytest.mark.asyncio
-async def test_run_agent_query_with_context() -> None:
-    """Workflow context dict is formatted and passed through to the provider."""
+async def test_run_agent_query_with_context(
+    span_exporter,
+    audit_enabled: bool,
+    capture_content: bool,
+) -> None:
+    """Export effective invocation content and preserve the old choice-event gates."""
+    prompt = 'Inspect the pod named "café"\nand report ☃.'
+    system_prompt = 'System instructions: café "雪"\nsecond line'
+    context = {
+        "targetNamespaces": ["default", 'café\n"north"'],
+        "previousAttempts": [{"attempt": 1, "failureReason": 'previous "failure"\n雪'}],
+    }
+    output_schema = {"type": "object", "properties": {"success": {"type": "boolean"}}}
+    reasoning = 'thinking\n"carefully" 雪'
+    completion = 'Searching "pod-a" in café\nnamespace.'
+    tool_arguments = {"namespace": 'café\n"north"', "label": "team=ops"}
+    tool_result = {"status": "Running", "note": 'retained "as-is"\n雪'}
+    terminal_text = (
+        '{\n  "success": true,\n  "summary": "done: \\"café\\"\\nsecond line",\n  "stage": 2\n}'
+    )
+    events = [
+        ThinkingDeltaEvent(thinking=reasoning),
+        TextDeltaEvent(text=completion),
+        ToolCallEvent(
+            name="lookup",
+            input=json.dumps(tool_arguments, ensure_ascii=False, separators=(",", ":")),
+            call_id="call-1",
+        ),
+        ToolResultEvent(
+            output=json.dumps(tool_result, ensure_ascii=False, separators=(",", ":")),
+            call_id="call-1",
+        ),
+        ResultEvent(
+            text=terminal_text,
+            input_tokens=11,
+            output_tokens=7,
+            reasoning_tokens=3,
+            response_model="observed-model",
+        ),
+    ]
+
+    class RecordingProvider(MockProvider):
+        def __init__(self) -> None:
+            super().__init__(events=events)
+            self.options: ProviderQueryOptions | None = None
+
+        @property
+        def name(self) -> str:
+            return "deepagents"
+
+        async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            self.options = options
+            async for event in super().query(options):
+                yield event
+
+    provider = RecordingProvider()
     result = await run_agent_query(
-        MockProvider(),
-        prompt="fix it",
-        system_prompt="You are an AI agent.",
-        output_schema=None,
-        context={
-            "targetNamespaces": ["default"],
-            "previousAttempts": [{"attempt": 1, "failureReason": "timeout"}],
-        },
+        provider,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        output_schema=output_schema,
+        context=context,
         skills_dir="/workspace",
         model="test-model",
         max_turns=200,
         timeout_seconds=300,
+        audit_enabled=audit_enabled,
+        capture_content=capture_content,
+        agenticrun_uid="run-uid",
+        step="execution",
     )
-    assert result.output["success"] is True
+
+    effective_prompt = f"{format_context_prefix(context)}\n\n{prompt}"
+    assert result.output == {
+        "success": True,
+        "summary": 'done: "café"\nsecond line',
+        "stage": 2,
+    }
+    assert provider.options is not None
+    assert provider.options.prompt == effective_prompt
+    assert provider.options.system_prompt == system_prompt
+    assert provider.options.output_schema == output_schema
+
+    root_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(root_span.attributes)
+    input_messages = [{"role": "user", "parts": [{"type": "text", "content": effective_prompt}]}]
+    system_instructions = [{"type": "text", "content": system_prompt}]
+    terminal_messages = [
+        {"role": "assistant", "parts": [{"type": "text", "content": terminal_text}]}
+    ]
+    assert root_span.kind is SpanKind.INTERNAL
+    assert attrs["gen_ai.operation.name"] == "invoke_agent"
+    assert attrs["gen_ai.request.model"] == "test-model"
+    assert attrs["agenticrun.uid"] == "run-uid"
+    assert attrs["agenticrun.phase"] == "execution"
+    assert "gen_ai.provider.name" not in attrs
+    assert "gen_ai.response.model" not in attrs
+    assert attrs["gen_ai.output.type"] == "json"
+    assert json.loads(attrs["gen_ai.input.messages"]) == input_messages
+    assert attrs["gen_ai.input.messages"] == json.dumps(
+        input_messages, ensure_ascii=False, separators=(",", ":")
+    )
+    assert json.loads(attrs["gen_ai.system_instructions"]) == system_instructions
+    assert attrs["gen_ai.system_instructions"] == json.dumps(
+        system_instructions, ensure_ascii=False, separators=(",", ":")
+    )
+    assert json.loads(attrs["gen_ai.output.messages"]) == terminal_messages
+    assert attrs["gen_ai.output.messages"] == json.dumps(
+        terminal_messages, ensure_ascii=False, separators=(",", ":")
+    )
+    assert attrs["gen_ai.usage.reasoning.output_tokens"] == 3
+    assert "gen_ai.usage.reasoning_tokens" not in attrs
+
+    tool_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "execute_tool lookup"
+    )
+    tool_attrs = dict(tool_span.attributes)
+    assert tool_span.parent is not None
+    assert tool_span.parent.span_id == root_span.context.span_id
+    assert tool_attrs["gen_ai.tool.call.id"] == "call-1"
+    assert json.loads(tool_attrs["gen_ai.tool.call.arguments"]) == tool_arguments
+    assert json.loads(tool_attrs["gen_ai.tool.call.result"]) == tool_result
+
+    choice_events = [event for event in root_span.events if event.name == "gen_ai.choice"]
+    if not audit_enabled:
+        assert choice_events == []
+    else:
+        assert len(choice_events) == 2
+        choice_attrs = [dict(event.attributes or {}) for event in choice_events]
+        if capture_content:
+            assert {
+                key: value for event_attrs in choice_attrs for key, value in event_attrs.items()
+            } == {
+                "gen_ai.completion": completion,
+                "gen_ai.reasoning_content": reasoning,
+            }
+        else:
+            assert choice_attrs == [{}, {}]
 
 
 @pytest.mark.asyncio
@@ -98,8 +229,9 @@ async def test_run_agent_query_with_output_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_accepts_traceparent() -> None:
-    """W3C traceparent (operator TRACEPARENT env) links inference span to phase trace."""
+async def test_run_agent_query_accepts_traceparent(span_exporter) -> None:
+    """W3C traceparent links the invocation span to the remote phase span."""
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     result = await run_agent_query(
         MockProvider(),
         prompt="test",
@@ -110,9 +242,18 @@ async def test_run_agent_query_accepts_traceparent() -> None:
         model="test-model",
         max_turns=200,
         timeout_seconds=300,
-        traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        traceparent=traceparent,
     )
     assert result.output["success"] is True
+
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    assert invocation_span.kind is SpanKind.INTERNAL
+    assert invocation_span.context.trace_id == int("4bf92f3577b34da6a3ce929d0e0e4736", 16)
+    assert invocation_span.parent is not None
+    assert invocation_span.parent.span_id == int("00f067aa0ba902b7", 16)
+    assert invocation_span.parent.is_remote
 
 
 @pytest.mark.asyncio
@@ -131,8 +272,15 @@ async def test_run_agent_query_stamps_inference_correlation(span_exporter) -> No
         step="execution",
     )
 
-    chat_span = next(s for s in span_exporter.get_finished_spans() if s.name == "chat test-model")
-    attrs = dict(chat_span.attributes)
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(invocation_span.attributes)
+    assert invocation_span.kind is SpanKind.INTERNAL
+    assert attrs["gen_ai.operation.name"] == "invoke_agent"
+    assert attrs["gen_ai.request.model"] == "test-model"
+    assert "gen_ai.provider.name" not in attrs
+    assert "gen_ai.output.type" not in attrs
     assert attrs["agenticrun.uid"] == "run-uid"
     assert attrs["agenticrun.phase"] == "execution"
 
@@ -141,8 +289,8 @@ async def test_run_agent_query_stamps_inference_correlation(span_exporter) -> No
 async def test_run_agent_query_does_not_invent_correlation(span_exporter) -> None:
     await run_agent_query(
         MockProvider(),
-        prompt="test",
-        system_prompt="You are an AI agent.",
+        prompt="",
+        system_prompt="",
         output_schema=None,
         context=None,
         skills_dir="/workspace",
@@ -151,14 +299,24 @@ async def test_run_agent_query_does_not_invent_correlation(span_exporter) -> Non
         timeout_seconds=300,
     )
 
-    chat_span = next(s for s in span_exporter.get_finished_spans() if s.name == "chat test-model")
-    attrs = dict(chat_span.attributes)
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(invocation_span.attributes)
+    assert json.loads(attrs["gen_ai.input.messages"]) == [
+        {"role": "user", "parts": [{"type": "text", "content": ""}]}
+    ]
+    assert json.loads(attrs["gen_ai.system_instructions"]) == [{"type": "text", "content": ""}]
+    assert attrs["gen_ai.operation.name"] == "invoke_agent"
+    assert attrs["gen_ai.request.model"] == "test-model"
+    assert "gen_ai.provider.name" not in attrs
+    assert "gen_ai.output.type" not in attrs
     assert "agenticrun.uid" not in attrs
     assert "agenticrun.phase" not in attrs
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_re_raises_tool_result_safety_failure() -> None:
+async def test_run_agent_query_re_raises_tool_result_safety_failure(span_exporter) -> None:
     class SafetyFailureProvider(MockProvider):
         async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
             raise ToolResultSafetyInspectionFailed()
@@ -176,6 +334,99 @@ async def test_run_agent_query_re_raises_tool_result_safety_failure() -> None:
             max_turns=200,
             timeout_seconds=300,
         )
+
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    assert invocation_span.attributes["error.type"] == "ToolResultSafetyInspectionFailed"
+    assert invocation_span.status.status_code == StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_run_agent_query_records_exception_type(span_exporter) -> None:
+    class FailingProvider(MockProvider):
+        async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            raise ValueError("provider failure")
+            yield  # pragma: no cover
+
+    result = await run_agent_query(
+        FailingProvider(),
+        prompt="test",
+        system_prompt="You are an AI agent.",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+
+    assert result.output == {"success": False, "summary": "Agent error: provider failure"}
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    assert invocation_span.attributes["error.type"] == "ValueError"
+    assert invocation_span.status.status_code == StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_run_agent_query_cancellation_closes_spans_without_flush(
+    span_exporter, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancellation exports failures without flushing buffered legacy events."""
+    ready = asyncio.Event()
+    resume = asyncio.Event()
+
+    class BlockingProvider(MockProvider):
+        async def query(self, _options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+            yield ToolCallEvent(name="lookup", input='{"query":"safe"}', call_id="call-1")
+            yield ThinkingDeltaEvent(thinking="UNFLUSHED_REASONING")
+            yield TextDeltaEvent(text="UNFLUSHED_TEXT")
+            ready.set()
+            await resume.wait()
+            yield ResultEvent(text='{"success":true,"summary":"fabricated"}')
+
+    caplog.set_level(logging.INFO, logger="lightspeed_agentic")
+    task = asyncio.create_task(
+        run_agent_query(
+            BlockingProvider(),
+            prompt="test",
+            system_prompt="You are an AI agent.",
+            output_schema=None,
+            context=None,
+            skills_dir="/workspace",
+            model="test-model",
+            max_turns=200,
+            timeout_seconds=300,
+            audit_enabled=True,
+            capture_content=True,
+        )
+    )
+
+    await ready.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    spans = span_exporter.get_finished_spans()
+    root_span = next(span for span in spans if span.name == "invoke_agent")
+    root_attrs = dict(root_span.attributes)
+    assert root_attrs["error.type"] == "CancelledError"
+    assert root_span.status.status_code == StatusCode.ERROR
+    assert root_span.status.description == "agent run failed"
+    assert "gen_ai.output.messages" not in root_attrs
+    assert not [event for event in root_span.events if event.name == "gen_ai.choice"]
+
+    tool_span = next(span for span in spans if span.name == "execute_tool lookup")
+    tool_attrs = dict(tool_span.attributes)
+    assert tool_attrs["error.type"] == "missing_tool_result"
+    assert "gen_ai.tool.call.result" not in tool_attrs
+    assert tool_span.status.status_code == StatusCode.ERROR
+    assert tool_span.status.description == "tool span not closed by result event"
+
+    assert "UNFLUSHED_REASONING" not in caplog.text
+    assert "UNFLUSHED_TEXT" not in caplog.text
+    assert "CancelledError" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -213,7 +464,7 @@ async def test_run_agent_query_deadline_during_inspection_is_safety_failure() ->
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_timeout() -> None:
+async def test_run_agent_query_timeout(span_exporter) -> None:
     """Wall-clock timeout yields agent failure with a timed-out summary."""
 
     class SlowProvider(MockProvider):
@@ -236,11 +487,16 @@ async def test_run_agent_query_timeout() -> None:
     assert result.output["success"] is False
     assert "timeout" in result.output["summary"].lower()
     assert result.timed_out is True
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    assert invocation_span.attributes["error.type"] == "timeout"
+    assert invocation_span.status.status_code == StatusCode.ERROR
 
 
 @pytest.mark.asyncio
-async def test_run_agent_query_empty_response() -> None:
-    """Empty ResultEvent text is treated as agent failure."""
+async def test_run_agent_query_empty_response(span_exporter) -> None:
+    """Empty ResultEvent text is preserved and treated as agent failure."""
     result = await run_agent_query(
         MockProvider(events=[ResultEvent(text="")]),
         prompt="test",
@@ -254,6 +510,76 @@ async def test_run_agent_query_empty_response() -> None:
     )
     assert result.output["success"] is False
     assert result.output["summary"] == "Agent returned empty response"
+
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(invocation_span.attributes)
+    empty_messages = [{"role": "assistant", "parts": [{"type": "text", "content": ""}]}]
+    assert attrs["error.type"] == "empty_response"
+    assert invocation_span.status.status_code == StatusCode.ERROR
+    assert json.loads(attrs["gen_ai.output.messages"]) == empty_messages
+    assert attrs["gen_ai.output.messages"] == json.dumps(
+        empty_messages, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_query_absent_result_event_omits_output(span_exporter) -> None:
+    result = await run_agent_query(
+        MockProvider(events=[TextDeltaEvent(text="partial but not terminal")]),
+        prompt="test",
+        system_prompt="You are an AI agent.",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+
+    assert result.output == {"success": False, "summary": "Agent returned empty response"}
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(invocation_span.attributes)
+    assert attrs["error.type"] == "empty_response"
+    assert invocation_span.status.status_code == StatusCode.ERROR
+    assert "gen_ai.output.messages" not in attrs
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_success"),
+    [
+        ('{"success": false, "summary": "not ready"}', False),
+        ('{"success": 0, "summary": "not ready"}', 0),
+        ('{"success": null, "summary": "not ready"}', None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_agent_query_domain_outcomes_do_not_mark_trace_error(
+    span_exporter, response: str, expected_success: bool | int | None
+) -> None:
+    result = await run_agent_query(
+        MockProvider(events=[ResultEvent(text=response)]),
+        prompt="test",
+        system_prompt="You are an AI agent.",
+        output_schema=None,
+        context=None,
+        skills_dir="/workspace",
+        model="test-model",
+        max_turns=200,
+        timeout_seconds=300,
+    )
+
+    assert result.output == {"success": expected_success, "summary": "not ready"}
+    assert type(result.output["success"]) is type(expected_success)
+    invocation_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "invoke_agent"
+    )
+    attrs = dict(invocation_span.attributes)
+    assert invocation_span.status.status_code == StatusCode.UNSET
+    assert "error.type" not in attrs
 
 
 @pytest.mark.asyncio
@@ -329,8 +655,12 @@ async def test_deepagents_logs_redact_tool_payloads_but_audit_keeps_passed_conte
     tool_span = next(
         span for span in span_exporter.get_finished_spans() if span.name == "execute_tool execute"
     )
-    assert tool_span.attributes["tool.input"] == "SECRET-TOOL-ARGUMENT"
-    assert tool_span.attributes["tool.output"] == "COMPLETE-PASSED-TOOL-RESULT"
+    assert json.loads(tool_span.attributes["gen_ai.tool.call.arguments"]) == {
+        "content": "SECRET-TOOL-ARGUMENT"
+    }
+    assert json.loads(tool_span.attributes["gen_ai.tool.call.result"]) == {
+        "content": "COMPLETE-PASSED-TOOL-RESULT"
+    }
 
 
 @pytest.mark.asyncio

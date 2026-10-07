@@ -52,7 +52,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
     SpanExportResult,
 )
-from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+from opentelemetry.trace import NonRecordingSpan, Span, SpanContext, TraceFlags
 
 _DEFAULT_SERVICE_NAME = "lightspeed-agentic-sandbox"
 _TRACER_NAME = "lightspeed_agentic"
@@ -312,6 +312,16 @@ def shutdown_tracer() -> None:
 def get_tracer() -> trace.Tracer:
     """Get a tracer instance for creating spans."""
     return trace.get_tracer(_TRACER_NAME)
+
+
+def set_json_span_attribute(span: Span, name: str, value: object) -> None:
+    """Set a span attribute to compact UTF-8-safe JSON when recording."""
+    if span.is_recording():
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        span.set_attribute(
+            name,
+            encoded.encode("utf-8", errors="backslashreplace").decode("utf-8"),
+        )
 
 
 def parse_traceparent(header: str | None) -> tuple[str, Context | None]:

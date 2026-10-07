@@ -9,9 +9,11 @@ Package tree: `AGENTS.md`. Behavioral rules: `what/run-api.md`, `what/provider-c
 2. `run_agent_query()` applies context prefix, passes pre-parsed `mcp_servers` and operator-resolved maximum turns into `ProviderQueryOptions`, and calls `provider.query(...)`. [PLANNED: OLS-3743] The outer agent invocation is bounded by the operator-resolved timeout; timeout returns a structured classification used by Result status assembly.
 2a. [PLANNED: OLS-3928] The DeepAgents adapter installs result-inspection middleware around model-visible tool results and errors. The middleware uses the resolved DeepAgents model for isolated classifier calls.
 2b. DeepAgents installs model-boundary middleware even when inspection is disabled. Output limits and artifact offload run first. Enabled inspection runs before wrapping. The middleware escapes external closing markers, HTML-escapes tool names, and wraps results before model delivery. The adapter appends the trust instruction to the main-agent and general-purpose-subagent system prompts.
-3. Handler async-iterates events; `EventLogger` and `AuditLogger` side effects; metrics histograms updated; stops at first `result` event.
-4. `publish_agent_result()` builds status from agent output, creates Result CR via Kubernetes API (`create_namespaced_custom_object`), replaces status (`replace_namespaced_custom_object_status`).
-5. `shutdown_tracer()`; exit 0 on sandbox success (including agent failure), non-zero on infrastructure failure with termination log.
+3. `run_agent_query()` starts an INTERNAL `invoke_agent` span beneath the received operator context, with effective prompt/system attributes and exact terminal `ResultEvent.text` before shaping; it uses the configured request model without claiming a provider or response model.
+4. `AuditLogger` creates local `execute_tool` INTERNAL children. Existing normalized ProviderEvents still drive `EventLogger`, legacy `gen_ai.choice`/templog projections, metrics, and result handling; choice-event flush order is not transcript chronology.
+5. [PLANNED: OLS-3569, later PRs] Add sandbox-owned canonical main-agent `chat`/`generate_content` spans, including DeepAgents structured-output shaping, while excluding nested-agent, classifier, and summarization generations. PR1 adds no such spans. Existing SDK-native ADK `call_llm`/`generate_content` spans remain unchanged framework detail, outside the canonical profile until PR3's exported-view normalization.
+6. `publish_agent_result()` builds status from agent output, creates Result CR via Kubernetes API (`create_namespaced_custom_object`), replaces status (`replace_namespaced_custom_object_status`).
+7. `shutdown_tracer()`; exit 0 on sandbox success (including agent failure), non-zero on infrastructure failure with termination log.
 
 ## Key Abstractions
 
@@ -43,7 +45,7 @@ configuration rather than independent CA arguments.
 - **google-adk / google.genai:** `Agent`, `Runner`, `ExecuteBashTool`, `SkillToolset`. MCP via `McpToolset` + `StreamableHTTPConnectionParams`.
 - **openai-agents (+ openai):** `SandboxAgent`, `Runner`, `UnixLocalSandboxClient`. MCP via `MCPServerStreamableHttp`. Client selection by provider (`what/provider-contract.md` rule 29): native OpenAI → `AsyncOpenAI` + `OpenAIResponsesModel`; Azure → the SDK's built-in `AsyncAzureOpenAI` + `OpenAIChatCompletionsModel`.
 - **azure.identity (Azure Entra ID):** `ClientSecretCredential` + `get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")` supplies the `azure_ad_token_provider` passed to `AsyncAzureOpenAI`; the library owns token caching/refresh (`what/provider-contract.md` rule 38). Imported inside the adapter method (optional-extra convention). **New dependency** [OLS-3050]: `azure-identity` (pulls `azure-core`) is added to the `openai` optional extra — `AsyncAzureOpenAI` and its `azure_ad_token_provider` param ship in `openai` (via `openai-agents`), but the credential classes do not. Adding it requires regenerating the Konflux hashed requirements/lockfiles.
-- **OpenTelemetry:** `tracing.py` TracerProvider; `audit.py` GenAI spans/events; `metrics.py` in-process Prometheus histograms (no `/metrics` route).
+- **OpenTelemetry:** `tracing.py` shared runtime; `run_agent.py` invocation span; `audit.py` tool spans and legacy choice events; new sandbox-owned canonical provider-generation capture planned; existing ADK native spans remain framework detail until PR3 normalization; `metrics.py` in-process Prometheus histograms (no `/metrics` route).
 
 ## Implementation Notes
 
