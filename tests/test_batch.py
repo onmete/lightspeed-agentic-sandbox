@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from lightspeed_agentic.batch import BatchInput, InputReadError
@@ -18,6 +22,7 @@ from lightspeed_agentic.mcp import (
     MCPConfigError,
     MCPPolicyEntry,
 )
+from lightspeed_agentic.providers.openai import OpenAIProvider
 from lightspeed_agentic.run_agent import AgentResult
 
 _TEMPLATE = {
@@ -35,6 +40,68 @@ _INPUTS = BatchInput(
 )
 
 _MOCK_SDK = ResolvedSDK("deepagents", ("ANTHROPIC_API_KEY",))
+
+
+class TestProviderLifecycle:
+    def test_closes_keepalive_connection_on_query_loop(self) -> None:
+        """The batch owns the async client until teardown on its query loop."""
+        from lightspeed_agentic.batch import _run_with_provider_cleanup
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        provider = OpenAIProvider()
+        try:
+
+            async def run_query(_provider: OpenAIProvider) -> AgentResult:
+                from openai import AsyncAzureOpenAI
+
+                provider._client = AsyncAzureOpenAI(
+                    azure_endpoint=f"http://127.0.0.1:{server.server_port}",
+                    api_version="2025-03-01-preview",
+                    api_key="test",
+                    http_client=httpx.AsyncClient(),
+                )
+                response = await provider._client._client.get(
+                    f"http://127.0.0.1:{server.server_port}/probe"
+                )
+                assert response.text == "ok"
+                return AgentResult(output={"success": True})
+
+            with patch("lightspeed_agentic.batch.run_agent_query", side_effect=run_query):
+                result = asyncio.run(_run_with_provider_cleanup(provider))
+            assert result.output == {"success": True}
+            assert provider._client is None
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_closes_credential_when_client_close_fails(self) -> None:
+        provider = OpenAIProvider()
+        client = AsyncMock()
+        client.close.side_effect = RuntimeError("client teardown failed")
+        credential = AsyncMock()
+        provider._client = client
+        provider._azure_credential = credential
+
+        with pytest.raises(RuntimeError, match="client teardown failed"):
+            await provider.aclose()
+
+        credential.close.assert_awaited_once_with()
 
 
 class TestBatchMain:

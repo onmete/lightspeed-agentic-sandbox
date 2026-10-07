@@ -7,6 +7,7 @@ The SDK handles tool registration, skill discovery, and command execution.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
 
@@ -33,6 +35,10 @@ else:
             pass
 
 
+from lightspeed_agentic.config import (
+    azure_api_version_supports_responses,
+    azure_api_version_supports_structured_outputs,
+)
 from lightspeed_agentic.skills import has_skills
 from lightspeed_agentic.types import (
     MAX_TOOL_RETURN_CHARS,
@@ -227,10 +233,117 @@ async def _build_mcp_function_tools(servers: list[Any]) -> list[Any]:
 
 class OpenAIProvider(AgentProvider):
     _client: Any = None
+    _azure_credentials: dict[str, str] | None = None
+    _azure_credential: Any = None
+
+    async def aclose(self) -> None:
+        """Close provider-owned async client and Azure credential resources."""
+        client = self._client
+        credential = self._azure_credential
+        self._client = None
+        self._azure_credential = None
+
+        try:
+            if client is not None:
+                close = getattr(client, "close", None) or getattr(client, "aclose", None)
+                if close is not None:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+        finally:
+            if credential is not None:
+                result = credential.close()
+                if inspect.isawaitable(result):
+                    await result
 
     @property
     def name(self) -> str:
         return "openai"
+
+    def _build_azure_client(self, model: str) -> tuple[Any, Any]:
+        """Build AsyncAzureOpenAI client and compatible model wrapper for Azure.
+
+        Returns (client, model_wrapper). Entra ID mode uses azure_ad_token_provider;
+        API-key mode uses api_key. API versions before 2025-03-01-preview use
+        Chat Completions; newer versions use Responses API.
+        """
+        from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient
+
+        from lightspeed_agentic.tls import get_ssl_context
+
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        if endpoint and urlparse(endpoint).scheme != "https":
+            raise ValueError("AZURE_OPENAI_ENDPOINT must use https")
+        api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
+        if not api_version:
+            raise ValueError("AZURE_OPENAI_API_VERSION is required")
+
+        client_kwargs: dict[str, Any] = {
+            "azure_endpoint": endpoint or None,
+            "api_version": api_version,
+            # Leave the base URL deployment-free so Chat Completions routes by request model.
+            "http_client": DefaultAsyncHttpxClient(
+                verify=get_ssl_context(),
+                follow_redirects=False,
+            ),
+        }
+
+        if self._azure_credentials:
+            # Entra ID mode — import azure.identity.aio inside method (optional-extra)
+            import aiohttp
+            from azure.core.pipeline.transport import AioHttpTransport
+            from azure.identity.aio import ClientSecretCredential, get_bearer_token_provider
+            from openai.lib.azure import API_KEY_SENTINEL
+
+            identity_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=get_ssl_context()),
+                cookie_jar=aiohttp.DummyCookieJar(),
+                auto_decompress=False,
+                trust_env=True,
+            )
+            identity_transport = AioHttpTransport(
+                session=identity_session,
+                session_owner=True,
+            )
+            credential = ClientSecretCredential(
+                self._azure_credentials["tenant_id"],
+                self._azure_credentials["client_id"],
+                self._azure_credentials["client_secret"],
+                transport=identity_transport,
+            )
+            self._azure_credential = credential
+            token_provider = get_bearer_token_provider(
+                credential,
+                "https://cognitiveservices.azure.com/.default",
+            )
+            client_kwargs["api_key"] = API_KEY_SENTINEL
+            client_kwargs["azure_ad_token_provider"] = token_provider
+            logger.info("Azure OpenAI client: Entra ID (service principal)")
+        else:
+            # API-key mode
+            client_kwargs["api_key"] = os.environ.get("AZURE_OPENAI_API_KEY", "")
+            logger.info("Azure OpenAI client: API key")
+
+        client = AsyncAzureOpenAI(**client_kwargs)
+        return client, self._build_azure_model(client, model, api_version)
+
+    def _build_azure_model(self, client: Any, model: str, api_version: str) -> Any:
+        """Build the Azure model wrapper for the configured API version."""
+        if azure_api_version_supports_responses(api_version):
+            from agents.models.openai_responses import OpenAIResponsesModel
+
+            return OpenAIResponsesModel(
+                model=model,
+                openai_client=client,
+            )
+
+        from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+
+        return OpenAIChatCompletionsModel(
+            model=model,
+            openai_client=client,
+            buffer_streamed_tool_calls=True,
+        )
 
     def _build_model_settings(self, reasoning_config: dict[str, Any]) -> Any:
         """Build ModelSettings from reasoning config.
@@ -259,16 +372,35 @@ class OpenAIProvider(AgentProvider):
         """
         _ensure_openai_init()
 
-        if self._client is None:
-            from openai import AsyncOpenAI, DefaultAsyncHttpxClient
-
-            from lightspeed_agentic.tls import get_ssl_context
-
-            self._client = AsyncOpenAI(
-                base_url=os.environ.get("OPENAI_BASE_URL"),
-                api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-                http_client=DefaultAsyncHttpxClient(verify=get_ssl_context()),
+        is_azure = os.environ.get("LIGHTSPEED_PROVIDER", "").strip().lower() == "azure"
+        if (
+            is_azure
+            and options.output_schema
+            and not azure_api_version_supports_structured_outputs(
+                os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
             )
+        ):
+            raise ValueError(
+                "Azure OpenAI structured output requires API version 2024-08-01 or later"
+            )
+        azure_model: Any | None = None
+
+        if self._client is None:
+            if is_azure:
+                self._client, azure_model = self._build_azure_client(options.model)
+            else:
+                from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+
+                from lightspeed_agentic.tls import get_ssl_context
+
+                self._client = AsyncOpenAI(
+                    base_url=os.environ.get("OPENAI_BASE_URL"),
+                    api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+                    http_client=DefaultAsyncHttpxClient(
+                        verify=get_ssl_context(),
+                        follow_redirects=False,
+                    ),
+                )
 
         from agents import (
             RawResponsesStreamEvent,
@@ -291,15 +423,36 @@ class OpenAIProvider(AgentProvider):
             ResponseTextDeltaEvent,
         )
 
-        # Setup model and capabilities based on endpoint
-        is_native = _is_native_openai()
+        # Setup model and capabilities based on endpoint.
+        azure_uses_responses_api = is_azure and azure_api_version_supports_responses(
+            os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
+        )
+        uses_responses_api = azure_uses_responses_api if is_azure else _is_native_openai()
         capabilities: list[Any] = [Shell()]
         function_tools_list: list[Any] | None = None
 
-        if is_native:
+        if is_azure:
+            # Azure client is cached, but the model wrapper is query/model specific.
+            model: Any = azure_model or self._build_azure_model(
+                self._client,
+                options.model,
+                os.environ.get("AZURE_OPENAI_API_VERSION", "").strip(),
+            )
+            if azure_uses_responses_api:
+                capabilities.append(Filesystem())
+            else:
+                from lightspeed_agentic.function_tools import (
+                    apply_patch,
+                    list_directory,
+                    read_file,
+                    write_file,
+                )
+
+                function_tools_list = [read_file, write_file, list_directory, apply_patch]
+        elif uses_responses_api:
             from agents.models.openai_responses import OpenAIResponsesModel
 
-            model: Any = OpenAIResponsesModel(model=options.model, openai_client=self._client)
+            model = OpenAIResponsesModel(model=options.model, openai_client=self._client)
             # Native OpenAI: use full Filesystem() capability
             capabilities.append(Filesystem())
         else:
@@ -371,7 +524,7 @@ class OpenAIProvider(AgentProvider):
                 raise
 
         try:
-            if not is_native and mcp_servers_for_agent and function_tools_list is not None:
+            if not uses_responses_api and mcp_servers_for_agent and function_tools_list is not None:
                 function_tools_list.extend(await _build_mcp_function_tools(mcp_servers_for_agent))
 
             agent_kwargs: dict[str, Any] = {
@@ -380,7 +533,7 @@ class OpenAIProvider(AgentProvider):
                 "model": model,
                 "capabilities": capabilities,
                 "default_manifest": manifest,
-                "mcp_servers": mcp_servers_for_agent if is_native else [],
+                "mcp_servers": mcp_servers_for_agent if uses_responses_api else [],
             }
 
             # Add function tools for vLLM/custom endpoints, including MCP tools.
@@ -395,7 +548,7 @@ class OpenAIProvider(AgentProvider):
             # Set output_type for structured output
             if options.output_schema:
                 agent_kwargs["output_type"] = _RawJsonSchema(
-                    options.output_schema, is_native=is_native
+                    options.output_schema, is_native=uses_responses_api
                 )
 
             agent = SandboxAgent(**agent_kwargs)
