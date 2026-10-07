@@ -97,3 +97,7 @@ class AgentProvider(ABC):
 
     @abstractmethod
     def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]: ...
+
+    async def aclose(self) -> None:
+        """Release provider-owned async resources, if any."""
+        return None
