@@ -426,7 +426,8 @@ class DeepAgentsProvider(AgentProvider):
         agent_kwargs["subagents"] = [subagent_spec]
 
         if has_skills(options.cwd):
-            agent_kwargs["skills"] = [options.cwd]
+            # SkillsMiddleware paths are virtual to this backend; "/" maps to root_dir.
+            agent_kwargs["skills"] = ["/"]
 
         schema_model: Any | None = None
         if options.output_schema:
