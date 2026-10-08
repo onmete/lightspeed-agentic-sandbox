@@ -191,26 +191,50 @@ starts, with no network access during the build itself.
 | `.konflux/requirements.hashes.source.txt` | PyPI sdist deps with hashes | `make requirements` |
 | `.konflux/requirements.hashes.wheel.pypi.txt` | PyPI wheel deps with hashes | `make requirements` |
 | `.konflux/requirements-build.txt` | Build-time deps for source distributions | `make requirements` |
-| `.konflux/requirements.overrides.txt` | Manual version pins for RHOAI compatibility | Edit manually, then `make requirements` |
-| `rpms.in.yaml` | System RPM package list | Edit manually |
-| `rpms.lock.yaml` | Resolved RPM lockfile | `make rpm-lockfile` |
-| `ubi.repo` | UBI 9 repo definitions for RPM resolution | Rarely changes |
+| `.konflux/requirements.hermetic.txt` | Hashed bootstrap wheels | `make requirements` |
+| `.konflux/requirements.overrides.txt` | Optional RHOAI compatibility overrides (currently no pins) | Edit manually, then `make requirements` |
+| `.konflux/pypi_wheel_only.txt` | Packages that must use PyPI wheels instead of source distributions | Edit manually, then `make requirements` |
+| `.konflux/profiles.toml` | Package index, Python version, architectures, extras, and bootstrap packages | Edit manually, then `make requirements` |
+| `.konflux/build.args` | Release base images (RHOAI 3.5) and hermetic build arguments | Edit manually |
+| `.konflux/rpms.in.yaml` | System RPM package list | Edit manually |
+| `.konflux/rpms.lock.yaml` | Resolved RPM lockfile | `make rpm-lockfile` |
+| `.konflux/redhat.repo` | RHEL 9.6 EUS and RHEL AI 3.5 repositories for RPM resolution | Edit when repository configuration changes |
 | `artifacts.lock.yaml` | Generic binary lockfile (may be empty; `oc`/`kubectl` come from image stages) | Edit manually when used |
 
 ### Bumping dependencies
 
+Local development uses `uv.lock`. Konflux resolves a separate dependency graph
+from `pyproject.toml`, preferring the RHOAI index over PyPI. RHOAI packages use
+wheels; PyPI packages use source distributions unless explicitly listed in
+`.konflux/pypi_wheel_only.txt` or no source distribution exists, in which case
+they use wheels. Versions can differ from `uv.lock`.
+`make verify-hermetic-requirements` checks package coverage, stale allowlist
+entries, and orphan packages; RHOAI and PyPI version skew produces warnings.
+
+Requirements regeneration needs network access, Podman or Docker, access to
+`quay.io/syedriko/uv:prefer-index`, Python 3.12+ with `packaging` available to
+`python3`, and `pybuild-deps` on `PATH`. These are separate from the ordinary
+`make install` setup. For example, install the host tools with
+`uv tool install pybuild-deps` and install `packaging` in the Python environment
+used by `python3`.
+
+RPM regeneration needs Podman or Docker and a Red Hat subscription; set
+`ACTIVATION_KEY` and `ORG_ID`. It reads the release base image from
+`.konflux/build.args` and repository definitions from `.konflux/redhat.repo`.
+
 ```bash
-make bump-deps          # upgrade uv.lock + regenerate .konflux/requirements.hashes.*.txt
-make rpm-lockfile       # regenerate rpms.lock.yaml (needs podman)
+make bump-deps          # upgrade uv.lock + regenerate Konflux requirements and Tekton package lists
+make rpm-lockfile       # regenerate .konflux/rpms.lock.yaml
 ```
 
-After bumping, commit all changed lockfiles and requirements files together.
-The Konflux pipeline will prefetch the new versions on the next PR.
+Review and commit all changed lockfiles, hashed runtime/bootstrap requirements,
+build requirements, and `.tekton/` pipeline package lists together. The Konflux
+pipeline will prefetch the new versions on the next PR.
 
 ### Adding a new system package
 
-1. Add the package name to `rpms.in.yaml`
-2. Run `make rpm-lockfile` to regenerate `rpms.lock.yaml`
+1. Add the package name to `.konflux/rpms.in.yaml`
+2. Run `make rpm-lockfile` to regenerate `.konflux/rpms.lock.yaml`
 3. Add the `dnf install` line to the appropriate section in `Containerfile`
 
 ### Adding a new external binary

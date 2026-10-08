@@ -10,8 +10,8 @@
 # Network access is disabled during build.
 #
 # Base images are parameterized via build args:
-#   Konflux (hermetic): overrides via build.args → RHOAI base image
-#   OpenShift CI (non-hermetic): uses defaults below → standard RHEL images
+#   Konflux (hermetic): overrides via .konflux/build.args → RHOAI 3.5 CPU images
+#   OpenShift CI / development (non-hermetic): defaults below → UBI Python images
 ARG BUILDER_BASE_IMAGE=registry.redhat.io/ubi9/python-312:latest
 ARG RUNTIME_BASE_IMAGE=registry.redhat.io/ubi9/python-312-minimal:latest
 ARG RUNTIME_DNF_COMMAND=microdnf
@@ -73,12 +73,13 @@ LABEL org.opencontainers.image.revision=${BUILD_VERSION}
 USER 0
 WORKDIR /app
 
-# System packages (resolved from rpms.in.yaml via rpm prefetch).
+# System packages (resolved from .konflux/rpms.in.yaml via rpm prefetch).
 # Split into functional groups for readability.
 
 # Agent runtime requirements
 RUN ${RUNTIME_DNF_COMMAND} install -y --nodocs \
     bash git wget jq \
+    && ${RUNTIME_DNF_COMMAND} update -y --nodocs \
     && ${RUNTIME_DNF_COMMAND} clean all
 
 # SRE debugging toolkit

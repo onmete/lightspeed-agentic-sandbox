@@ -127,13 +127,13 @@ Each adapter is a thin wrapper. The SDK owns tool execution, skill discovery, an
 
 ## Container & Deployment
 
-The sandbox ships as a container image built with Konflux hermetic builds (dependencies prefetched, no network during build).
+The sandbox ships as a container image built with Konflux hermetic builds (dependencies prefetched, no network during build). Release builds use RHOAI 3.5 CPU base images configured in `.konflux/build.args`; non-hermetic developer builds default to UBI 9 Python 3.12 images.
 
 ```mermaid
 graph TD
     subgraph "Container Image"
         direction TB
-        Base["UBI 9 base"]
+        Base["RHOAI 3.5 CPU base (release)<br/>UBI 9 Python base (development)"]
         Sys["System packages<br/>(bash, git, oc, kubectl, catatonit)"]
         Py["Python 3.12 + site-packages<br/>(kubernetes, provider SDKs)"]
         AppSrc["Application source<br/>/opt/lightspeed/src/"]

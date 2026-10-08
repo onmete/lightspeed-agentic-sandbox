@@ -42,14 +42,14 @@ format: ## Auto-format with ruff
 	$(UV) run ruff check . --fix
 
 mypy: ## Run mypy against application package
-	$(UV) run mypy src/lightspeed_agentic
+	$(UV) run --extra dev mypy src/lightspeed_agentic
 
 verify: verify-hermetic-requirements ## Run non-mutating formatting, lint, and type checks
 	$(UV) run ruff format . --check
 	$(UV) run ruff check .
-	$(UV) run mypy src/lightspeed_agentic
+	$(UV) run --extra dev mypy src/lightspeed_agentic
 
-verify-hermetic-requirements: ## Verify hermetic build hash files are in sync with uv.lock
+verify-hermetic-requirements: ## Check hermetic package coverage against uv.lock; warn on version skew
 	bash scripts/verify_hermetic_requirements.sh
 
 image: ## Build container image for local development and e2e
@@ -68,7 +68,7 @@ bump-deps: ## Upgrade all dependencies and regenerate requirements
 	$(UV) lock --upgrade
 	$(MAKE) requirements
 
-rpm-lockfile: .konflux/rpms.in.yaml .konflux/redhat.repo ## Regenerate rpms.lock.yaml (requires podman + RH subscription)
+rpm-lockfile: .konflux/rpms.in.yaml .konflux/redhat.repo ## Regenerate .konflux/rpms.lock.yaml (requires podman/docker + RH subscription)
 	./scripts/generate-rpm-lock.sh -a $${ACTIVATION_KEY} -g $${ORG_ID}
 
 clean: ## Remove build artifacts and caches
