@@ -159,7 +159,7 @@ These legacy projections and their SDK/event behavior remain unchanged in PR1+PR
 
 ## Verification
 
-- Exported regressions: [test_run_agent.py](../../../tests/test_run_agent.py), [test_audit.py](../../../tests/test_audit.py), [test_tracing.py](../../../tests/test_tracing.py), [test_deepagents.py](../../../tests/test_deepagents.py), and [test_openai_generation_spans.py](../../../tests/test_openai_generation_spans.py) cover invocation/tool/provider-generation spans and legacy audit/log projections.
+- Exported regressions: [test_run_agent.py](../../../tests/test_run_agent.py), [test_audit.py](../../../tests/test_audit.py), [test_tracing.py](../../../tests/test_tracing.py), [test_deepagents_generation_spans.py](../../../tests/test_deepagents_generation_spans.py), and [test_openai_generation_spans.py](../../../tests/test_openai_generation_spans.py) cover invocation/tool/provider-generation spans and legacy audit/log projections.
 - PR1+PR2 offline smoke proof and detailed producer/wire scope: [data-collection.md Verification](data-collection.md#verification). It exercised in-memory exports, all four audit/content-gate combinations, OTLP protobuf reconstruction, failure/cancellation, and inspection rejection; no live provider API or deployed collector/FileExporter/Dataverse path was exercised.
 - Cancellation boundary/OTLP smoke: root ERROR/`CancelledError` and pending-tool ERROR/`missing_tool_result` survived the wire with no tool result, duration-histogram observation, or cancellation-triggered choice/log flush.
 - Existing behavior checks: [test_logging.py](../../../tests/test_logging.py) — payload-free developer records for inspected DeepAgents results; [test_metrics.py](../../../tests/test_metrics.py) — in-process histogram recording.

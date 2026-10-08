@@ -197,7 +197,7 @@ Decision record: [0001-tool-output-boundary.md](../decisions/0001-tool-output-bo
 
 ## Verification
 
-- Provider trace regressions: [test_deepagents.py](../../../tests/test_deepagents.py) covers DeepAgents main-agent/raw-shaping spans; [test_openai_generation_spans.py](../../../tests/test_openai_generation_spans.py) covers OpenAI generation output, metadata/usage, API-type routing, and hook boundaries.
+- Provider trace regressions: [test_deepagents_generation_spans.py](../../../tests/test_deepagents_generation_spans.py) covers DeepAgents main-agent/raw-shaping spans, callback selection, and partial failures; [test_openai_generation_spans.py](../../../tests/test_openai_generation_spans.py) covers OpenAI generation output, metadata/usage, API-type routing, and hook boundaries.
 - Other provider contracts: [test_run_agent.py](../../../tests/test_run_agent.py) — event stream, structured output, context prefix; [test_tool_data_summarization.py](../../../tests/test_tool_data_summarization.py) — summary-model boundary and raw history offload; [test_mcp.py](../../../tests/test_mcp.py) — canonical admission projections and Gemini/OpenAI native filters; [test_openai_schema.py](../../../tests/test_openai_schema.py) — OpenAI complete-set initialization and fail-closed behavior.
 - PR1+PR2 offline smoke proof and producer/wire-only limitations: [data-collection.md Verification](data-collection.md#verification); no live provider API or deployed collector/FileExporter/Dataverse path was exercised.
 - [PLANNED: OLS-3928] Fast mock tests verify contract conformance, offloaded read paths, disabled inspection, and controlled sandbox failure.

@@ -60,6 +60,36 @@ def _model_response(
     )
 
 
+def _text_response(
+    text: str,
+    *,
+    message_id: str,
+    response_id: str | None = None,
+) -> Any:
+    from openai.types.responses.response_output_message import ResponseOutputMessage
+    from openai.types.responses.response_output_text import ResponseOutputText
+
+    return _model_response(
+        [
+            ResponseOutputMessage(
+                id=message_id,
+                content=[
+                    ResponseOutputText(
+                        text=text,
+                        type="output_text",
+                        annotations=[],
+                        logprobs=[],
+                    )
+                ],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ],
+        response_id=response_id,
+    )
+
+
 def _invocation_span() -> Any:
     return trace.get_tracer("openai-generation-tests").start_span(
         "invoke_agent",
@@ -67,33 +97,111 @@ def _invocation_span() -> Any:
     )
 
 
-def _generation_span(exporter: Any) -> Any:
-    return next(
+def _generation_spans(exporter: Any) -> list[Any]:
+    return [
         span
         for span in exporter.get_finished_spans()
         if span.attributes.get("gen_ai.operation.name") == "chat"
+    ]
+
+
+def _generation_span(exporter: Any) -> Any:
+    return next(iter(_generation_spans(exporter)))
+
+
+async def _capture_generation_span(
+    response: Any,
+    exporter: Any,
+    options: ProviderQueryOptions,
+    *,
+    api_type: str = "responses",
+) -> Any:
+    from lightspeed_agentic.providers.openai import _create_generation_hooks
+
+    agent = _FakeAgent()
+    invocation = _invocation_span()
+    with trace.use_span(invocation, end_on_exit=False):
+        hooks = _create_generation_hooks(
+            agent,
+            options,
+            otel_context.get_current(),
+            api_type=api_type,
+        )
+        await hooks.on_llm_start(None, agent, None, [])
+        await hooks.on_llm_end(None, agent, response)
+    invocation.end()
+    return _generation_span(exporter)
+
+
+def _text_delta_event(
+    text: str,
+    *,
+    item_id: str = "msg_1",
+    sequence_number: int = 1,
+) -> Any:
+    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+
+    return ResponseTextDeltaEvent(
+        content_index=0,
+        delta=text,
+        item_id=item_id,
+        logprobs=[],
+        output_index=0,
+        sequence_number=sequence_number,
+        type="response.output_text.delta",
     )
 
 
-class _FakeStreamingResult:
+def _reasoning_delta_event(text: str) -> Any:
+    from openai.types.responses.response_reasoning_text_delta_event import (
+        ResponseReasoningTextDeltaEvent,
+    )
+
+    return ResponseReasoningTextDeltaEvent(
+        content_index=0,
+        delta=text,
+        item_id="rs_1",
+        output_index=0,
+        sequence_number=1,
+        type="response.reasoning_text.delta",
+    )
+
+
+def _apply_patch_tool_events(agent: Any, patch_call: Any, function_call: Any) -> list[Any]:
+    from agents.items import ToolCallItem, ToolCallOutputItem
+    from agents.stream_events import RunItemStreamEvent
+
+    return [
+        RunItemStreamEvent(name="tool_called", item=ToolCallItem(agent, patch_call)),
+        RunItemStreamEvent(
+            name="tool_output",
+            item=ToolCallOutputItem(agent, SimpleNamespace(call_id="call-patch"), {"safe": True}),
+        ),
+        RunItemStreamEvent(name="tool_called", item=ToolCallItem(agent, function_call)),
+        RunItemStreamEvent(
+            name="tool_output",
+            item=ToolCallOutputItem(agent, SimpleNamespace(call_id="call-dict"), "read result"),
+        ),
+    ]
+
+
+class _FakeProviderQueryStream:
     def __init__(
         self,
         agent: Any,
         hooks: Any,
         *,
         response: Any,
-        events_before_end: list[Any],
-        events_after_end: list[Any],
-        failure: BaseException | None,
-        other_response: Any | None,
+        events_before_response: list[Any],
+        events_after_response: list[Any],
+        other_agent_response: Any | None,
     ) -> None:
         self._agent = agent
         self._hooks = hooks
         self._response = response
-        self._events_before_end = events_before_end
-        self._events_after_end = events_after_end
-        self._failure = failure
-        self._other_response = other_response
+        self._events_before_response = events_before_response
+        self._events_after_response = events_after_response
+        self._other_agent_response = other_agent_response
         self.context_wrapper = SimpleNamespace(
             usage=SimpleNamespace(
                 input_tokens=6,
@@ -106,17 +214,14 @@ class _FakeStreamingResult:
 
     async def stream_events(self):
         await self._hooks.on_llm_start(None, self._agent, None, [])
-        if self._other_response is not None:
+        if self._other_agent_response is not None:
             other_agent = _FakeAgent()
             await self._hooks.on_llm_start(None, other_agent, None, [])
-            await self._hooks.on_llm_end(None, other_agent, self._other_response)
-        for event in self._events_before_end:
+            await self._hooks.on_llm_end(None, other_agent, self._other_agent_response)
+        for event in self._events_before_response:
             yield event
-        if self._failure is not None:
-            raise self._failure
-        if self._response is not None:
-            await self._hooks.on_llm_end(None, self._agent, self._response)
-        for event in self._events_after_end:
+        await self._hooks.on_llm_end(None, self._agent, self._response)
+        for event in self._events_after_response:
             yield event
 
 
@@ -128,10 +233,9 @@ def _install_provider_query(
     base_url: str | None = None,
     azure_api_version: str | None = None,
     response: Any | None = None,
-    events_before_end: list[Any] | None = None,
-    events_after_end: list[Any] | Callable[[Any], list[Any]] | None = None,
-    failure: BaseException | None = None,
-    other_response: Any | None = None,
+    events_before_response: list[Any] | None = None,
+    events_after_response: Callable[[Any], list[Any]] | None = None,
+    other_agent_response: Any | None = None,
 ) -> tuple[Any, ProviderQueryOptions]:
     import agents.models.openai_chatcompletions as chatcompletions
     import agents.models.openai_responses as responses
@@ -165,17 +269,14 @@ def _install_provider_query(
     model_response = response if response is not None else _model_response([])
 
     def run_streamed(agent: Any, _prompt: str, *, hooks: Any, **_kwargs: Any) -> Any:
-        after_end = (
-            events_after_end(agent) if callable(events_after_end) else events_after_end or []
-        )
-        return _FakeStreamingResult(
+        after_response = events_after_response(agent) if events_after_response else []
+        return _FakeProviderQueryStream(
             agent,
             hooks,
             response=model_response,
-            events_before_end=events_before_end or [],
-            events_after_end=after_end,
-            failure=failure,
-            other_response=other_response,
+            events_before_response=events_before_response or [],
+            events_after_response=after_response,
+            other_agent_response=other_agent_response,
         )
 
     monkeypatch.setattr(Runner, "run_streamed", staticmethod(run_streamed))
@@ -183,34 +284,26 @@ def _install_provider_query(
 
 
 @pytest.mark.asyncio
-async def test_responses_generation_maps_typed_output_and_metadata(
+async def test_responses_generation_preserves_output_item_and_content_order(
     span_exporter: Any, tmp_path: Path
 ) -> None:
-    from openai.types.responses.response_custom_tool_call import (
-        ResponseCustomToolCall,
-    )
-    from openai.types.responses.response_function_tool_call import (
-        ResponseFunctionToolCall,
-    )
+    from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
+    from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
     from openai.types.responses.response_output_message import ResponseOutputMessage
     from openai.types.responses.response_output_refusal import ResponseOutputRefusal
     from openai.types.responses.response_output_text import ResponseOutputText
     from openai.types.responses.response_reasoning_item import (
-        Content as ReasoningContent,
-    )
-    from openai.types.responses.response_reasoning_item import (
+        Content,
         ResponseReasoningItem,
         Summary,
     )
-
-    from lightspeed_agentic.providers.openai import _create_generation_hooks
 
     patch_input = '*** Begin Patch\n*** Update File: "雪 file.py"\n+quoted "line"\n*** End Patch'
     response = _model_response(
         [
             ResponseReasoningItem(
                 id="rs_1",
-                content=[ReasoningContent(text="think-first", type="reasoning_text")],
+                content=[Content(text="think-first", type="reasoning_text")],
                 summary=[Summary(text="summary-next", type="summary_text")],
                 type="reasoning",
             ),
@@ -218,24 +311,6 @@ async def test_responses_generation_maps_typed_output_and_metadata(
                 arguments='{"pod": "pod-a"}',
                 call_id="call-lookup",
                 name="lookup",
-                type="function_call",
-            ),
-            ResponseFunctionToolCall(
-                arguments="{not-json",
-                call_id="call-raw",
-                name="raw_tool",
-                type="function_call",
-            ),
-            ResponseFunctionToolCall(
-                arguments="NaN",
-                call_id="call-nan",
-                name="raw_nan",
-                type="function_call",
-            ),
-            ResponseFunctionToolCall(
-                arguments='{"too_large": 1e999}',
-                call_id="call-overflow",
-                name="raw_overflow",
                 type="function_call",
             ),
             ResponseCustomToolCall(
@@ -254,62 +329,17 @@ async def test_responses_generation_maps_typed_output_and_metadata(
                         logprobs=[],
                     ),
                     ResponseOutputRefusal(refusal="refusal text", type="refusal"),
-                    ResponseOutputText(
-                        text="",
-                        type="output_text",
-                        annotations=[],
-                        logprobs=[],
-                    ),
+                    ResponseOutputText(text="", type="output_text", annotations=[], logprobs=[]),
                 ],
                 role="assistant",
                 status="completed",
                 type="message",
             ),
-        ],
-        response_id="resp_actual",
-        request_id="transport_request_only",
-        input_tokens=0,
-        output_tokens=9,
-        reasoning_tokens=4,
+        ]
     )
-    options = _options(tmp_path)
-    main_agent = _FakeAgent()
-    invocation = _invocation_span()
 
-    with trace.use_span(invocation, end_on_exit=False):
-        parent_context = otel_context.get_current()
-        hooks = _create_generation_hooks(main_agent, options, parent_context, api_type="responses")
-        await hooks.on_llm_start(None, main_agent, "ignored", [{"role": "user"}])
-        assert (
-            trace.get_current_span().get_span_context().span_id
-            == invocation.get_span_context().span_id
-        )
-        await hooks.on_llm_end(None, main_agent, response)
-        assert (
-            trace.get_current_span().get_span_context().span_id
-            == invocation.get_span_context().span_id
-        )
-    invocation.end()
+    span = await _capture_generation_span(response, span_exporter, _options(tmp_path))
 
-    span = _generation_span(span_exporter)
-    assert span.name == "chat gpt-4.1-mini"
-    assert span.kind == SpanKind.CLIENT
-    assert span.status.status_code == StatusCode.UNSET
-    assert span.parent.span_id == invocation.get_span_context().span_id
-    assert span.attributes["gen_ai.operation.name"] == "chat"
-    assert span.attributes["gen_ai.request.model"] == options.model
-    assert span.attributes["gen_ai.provider.name"] == "openai"
-    assert span.attributes["openai.api.type"] == "responses"
-    assert span.attributes["agenticrun.uid"] == "run-123"
-    assert span.attributes["agenticrun.phase"] == "task"
-    assert span.attributes["gen_ai.response.id"] == "resp_actual"
-    assert span.attributes["gen_ai.usage.input_tokens"] == 0
-    assert span.attributes["gen_ai.usage.output_tokens"] == 9
-    assert span.attributes["gen_ai.usage.reasoning.output_tokens"] == 4
-    assert "gen_ai.response.model" not in span.attributes
-    assert "gen_ai.response.finish_reasons" not in span.attributes
-    assert "gen_ai.input.messages" not in span.attributes
-    assert "gen_ai.system_instructions" not in span.attributes
     assert json.loads(span.attributes["gen_ai.output.messages"]) == [
         {
             "role": "assistant",
@@ -321,24 +351,6 @@ async def test_responses_generation_maps_typed_output_and_metadata(
                     "id": "call-lookup",
                     "name": "lookup",
                     "arguments": {"pod": "pod-a"},
-                },
-                {
-                    "type": "tool_call",
-                    "id": "call-raw",
-                    "name": "raw_tool",
-                    "arguments": "{not-json",
-                },
-                {
-                    "type": "tool_call",
-                    "id": "call-nan",
-                    "name": "raw_nan",
-                    "arguments": "NaN",
-                },
-                {
-                    "type": "tool_call",
-                    "id": "call-overflow",
-                    "name": "raw_overflow",
-                    "arguments": '{"too_large": 1e999}',
                 },
                 {
                     "type": "tool_call",
@@ -354,13 +366,138 @@ async def test_responses_generation_maps_typed_output_and_metadata(
     ]
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param("{not-json", id="malformed-json"),
+        pytest.param("NaN", id="non-finite-number"),
+        pytest.param('{"too_large": 1e999}', id="exponent-overflow"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_chat_converter_output_uses_consistent_completion_id_not_requested_model(
+async def test_responses_generation_preserves_raw_non_json_tool_arguments(
+    span_exporter: Any, tmp_path: Path, arguments: str
+) -> None:
+    from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+
+    response = _model_response(
+        [
+            ResponseFunctionToolCall(
+                arguments=arguments,
+                call_id="call-raw",
+                name="raw_tool",
+                type="function_call",
+            )
+        ]
+    )
+    span = await _capture_generation_span(response, span_exporter, _options(tmp_path))
+
+    assert json.loads(span.attributes["gen_ai.output.messages"]) == [
+        {
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "tool_call",
+                    "id": "call-raw",
+                    "name": "raw_tool",
+                    "arguments": arguments,
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generation_hook_keeps_invocation_active_and_records_observed_metadata(
+    span_exporter: Any, tmp_path: Path
+) -> None:
+    from lightspeed_agentic.providers.openai import _create_generation_hooks
+
+    options = _options(tmp_path)
+    agent = _FakeAgent()
+    invocation = _invocation_span()
+    response = _model_response(
+        [],
+        response_id="resp_actual",
+        request_id="transport_request_only",
+        input_tokens=0,
+        output_tokens=9,
+        reasoning_tokens=4,
+    )
+
+    with trace.use_span(invocation, end_on_exit=False):
+        hooks = _create_generation_hooks(
+            agent,
+            options,
+            otel_context.get_current(),
+            api_type="responses",
+        )
+        await hooks.on_llm_start(
+            None,
+            agent,
+            "system instructions",
+            [{"role": "user", "content": "user prompt"}],
+        )
+        assert (
+            trace.get_current_span().get_span_context().span_id
+            == invocation.get_span_context().span_id
+        )
+        await hooks.on_llm_end(None, agent, response)
+        assert (
+            trace.get_current_span().get_span_context().span_id
+            == invocation.get_span_context().span_id
+        )
+    invocation.end()
+
+    span = _generation_span(span_exporter)
+    attributes = span.attributes
+    assert span.name == "chat gpt-4.1-mini"
+    assert span.kind == SpanKind.CLIENT
+    assert span.status.status_code == StatusCode.UNSET
+    assert span.parent.span_id == invocation.get_span_context().span_id
+    assert attributes["gen_ai.operation.name"] == "chat"
+    assert attributes["gen_ai.request.model"] == options.model
+    assert attributes["gen_ai.provider.name"] == "openai"
+    assert attributes["openai.api.type"] == "responses"
+    assert attributes["agenticrun.uid"] == "run-123"
+    assert attributes["agenticrun.phase"] == "task"
+    assert attributes["gen_ai.response.id"] == "resp_actual"
+    assert attributes["gen_ai.usage.input_tokens"] == 0
+    assert attributes["gen_ai.usage.output_tokens"] == 9
+    assert attributes["gen_ai.usage.reasoning.output_tokens"] == 4
+    assert "gen_ai.response.model" not in attributes
+    assert "gen_ai.response.finish_reasons" not in attributes
+    assert "gen_ai.input.messages" not in attributes
+    assert "gen_ai.system_instructions" not in attributes
+    assert "transport_request_only" not in attributes.values()
+
+
+@pytest.mark.asyncio
+async def test_generation_preserves_zero_usage_and_omits_missing_counts(
+    span_exporter: Any, tmp_path: Path
+) -> None:
+    response = SimpleNamespace(
+        output=[],
+        usage=SimpleNamespace(
+            requests=1,
+            output_tokens=0,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+        ),
+    )
+    span = await _capture_generation_span(response, span_exporter, _options(tmp_path))
+    attributes = span.attributes
+
+    assert "gen_ai.usage.input_tokens" not in attributes
+    assert attributes["gen_ai.usage.output_tokens"] == 0
+    assert "gen_ai.usage.reasoning.output_tokens" not in attributes
+    assert "gen_ai.response.id" not in attributes
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_converter_preserves_output_order_and_actual_response_id(
     span_exporter: Any, tmp_path: Path
 ) -> None:
     from agents.models.chatcmpl_converter import Converter
-
-    from lightspeed_agentic.providers.openai import _create_generation_hooks
 
     tool_call = SimpleNamespace(
         type="function",
@@ -393,30 +530,23 @@ async def test_chat_converter_output_uses_consistent_completion_id_not_requested
         reasoning_tokens=0,
     )
     options = _options(tmp_path)
-    main_agent = _FakeAgent()
-    invocation = _invocation_span()
+    span = await _capture_generation_span(
+        response,
+        span_exporter,
+        options,
+        api_type="chat_completions",
+    )
+    attributes = span.attributes
 
-    with trace.use_span(invocation, end_on_exit=False):
-        hooks = _create_generation_hooks(
-            main_agent,
-            options,
-            otel_context.get_current(),
-            api_type="chat_completions",
-        )
-        await hooks.on_llm_start(None, main_agent, None, [])
-        await hooks.on_llm_end(None, main_agent, response)
-    invocation.end()
-
-    span = _generation_span(span_exporter)
-    assert span.attributes["openai.api.type"] == "chat_completions"
-    assert span.attributes["gen_ai.response.id"] == "chatcmpl_actual"
-    assert span.attributes["gen_ai.usage.input_tokens"] == 13
-    assert span.attributes["gen_ai.usage.output_tokens"] == 0
-    assert "gen_ai.usage.reasoning.output_tokens" not in span.attributes
-    assert "gen_ai.response.model" not in span.attributes
-    assert "gen_ai.response.finish_reasons" not in span.attributes
-    assert "transport_request_only" not in span.attributes.values()
-    assert json.loads(span.attributes["gen_ai.output.messages"]) == [
+    assert attributes["openai.api.type"] == "chat_completions"
+    assert attributes["gen_ai.response.id"] == "chatcmpl_actual"
+    assert attributes["gen_ai.usage.input_tokens"] == 13
+    assert attributes["gen_ai.usage.output_tokens"] == 0
+    assert "gen_ai.usage.reasoning.output_tokens" not in attributes
+    assert "gen_ai.response.model" not in attributes
+    assert "gen_ai.response.finish_reasons" not in attributes
+    assert "transport_request_only" not in attributes.values()
+    assert json.loads(attributes["gen_ai.output.messages"]) == [
         {
             "role": "assistant",
             "parts": [
@@ -434,43 +564,19 @@ async def test_chat_converter_output_uses_consistent_completion_id_not_requested
 
 
 @pytest.mark.asyncio
-async def test_generation_omits_usage_without_observed_request(
+async def test_generation_omits_usage_when_request_count_is_zero(
     span_exporter: Any, tmp_path: Path
 ) -> None:
-    from openai.types.responses.response_output_message import ResponseOutputMessage
-
-    from lightspeed_agentic.providers.openai import _create_generation_hooks
-
     response = _model_response(
-        [
-            ResponseOutputMessage(
-                id="msg_1",
-                content=[],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ],
+        [],
         requests=0,
         input_tokens=12,
         output_tokens=34,
         reasoning_tokens=56,
     )
-    options = _options(tmp_path)
-    main_agent = _FakeAgent()
-    invocation = _invocation_span()
-    with trace.use_span(invocation, end_on_exit=False):
-        hooks = _create_generation_hooks(
-            main_agent,
-            options,
-            otel_context.get_current(),
-            api_type="responses",
-        )
-        await hooks.on_llm_start(None, main_agent, None, [])
-        await hooks.on_llm_end(None, main_agent, response)
-    invocation.end()
+    span = await _capture_generation_span(response, span_exporter, _options(tmp_path))
+    attributes = span.attributes
 
-    attributes = _generation_span(span_exporter).attributes
     assert "gen_ai.usage.input_tokens" not in attributes
     assert "gen_ai.usage.output_tokens" not in attributes
     assert "gen_ai.usage.reasoning.output_tokens" not in attributes
@@ -504,7 +610,7 @@ async def test_generation_omits_usage_without_observed_request(
     ],
 )
 @pytest.mark.asyncio
-async def test_query_api_type_tracks_existing_client_routing(
+async def test_query_generation_api_type_matches_existing_client_routing(
     span_exporter: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -539,24 +645,15 @@ async def test_query_api_type_tracks_existing_client_routing(
 
 
 @pytest.mark.asyncio
-async def test_native_apply_patch_trace_input_does_not_change_events_or_logs(
+async def test_openai_query_keeps_apply_patch_trace_input_out_of_events_and_logs(
     span_exporter: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from agents.items import ToolCallItem, ToolCallOutputItem
-    from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
-    from openai.types.responses.response_custom_tool_call import (
-        ResponseCustomToolCall,
-    )
-    from openai.types.responses.response_function_tool_call import (
-        ResponseFunctionToolCall,
-    )
-    from openai.types.responses.response_reasoning_text_delta_event import (
-        ResponseReasoningTextDeltaEvent,
-    )
-    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+    from agents.stream_events import RawResponsesStreamEvent
+    from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
+    from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
     from lightspeed_agentic.logging import EventLogger
     from lightspeed_agentic.types import (
@@ -576,6 +673,12 @@ async def test_native_apply_patch_trace_input_does_not_change_events_or_logs(
         name="apply_patch",
         type="custom_tool_call",
     )
+    function_call = {
+        "type": "function_call",
+        "call_id": "call-dict",
+        "name": "read_file",
+        "arguments": {"path": "dictionary.py"},
+    }
     response = _model_response(
         [
             custom_call,
@@ -590,55 +693,17 @@ async def test_native_apply_patch_trace_input_does_not_change_events_or_logs(
         input_tokens=10,
         output_tokens=4,
     )
-    reasoning_delta = ResponseReasoningTextDeltaEvent(
-        content_index=0,
-        delta="think-delta",
-        item_id="rs_1",
-        output_index=0,
-        sequence_number=1,
-        type="response.reasoning_text.delta",
-    )
-    text_delta = ResponseTextDeltaEvent(
-        content_index=0,
-        delta="text-delta",
-        item_id="msg_1",
-        logprobs=[],
-        output_index=0,
-        sequence_number=2,
-        type="response.output_text.delta",
-    )
-    dictionary_call = {
-        "type": "function_call",
-        "call_id": "call-dict",
-        "name": "read_file",
-        "arguments": {"path": "dictionary.py"},
-    }
-
-    def tool_events(agent: Any) -> list[Any]:
-        return [
-            RunItemStreamEvent(name="tool_called", item=ToolCallItem(agent, custom_call)),
-            RunItemStreamEvent(
-                name="tool_output",
-                item=ToolCallOutputItem(
-                    agent, SimpleNamespace(call_id="call-patch"), {"safe": True}
-                ),
-            ),
-            RunItemStreamEvent(name="tool_called", item=ToolCallItem(agent, dictionary_call)),
-            RunItemStreamEvent(
-                name="tool_output",
-                item=ToolCallOutputItem(agent, SimpleNamespace(call_id="call-dict"), "read result"),
-            ),
-        ]
-
     provider, options = _install_provider_query(
         monkeypatch,
         tmp_path,
         response=response,
-        events_before_end=[
-            RawResponsesStreamEvent(data=reasoning_delta),
-            RawResponsesStreamEvent(data=text_delta),
+        events_before_response=[
+            RawResponsesStreamEvent(data=_reasoning_delta_event("think-delta")),
+            RawResponsesStreamEvent(data=_text_delta_event("text-delta", sequence_number=2)),
         ],
-        events_after_end=tool_events,
+        events_after_response=lambda agent: _apply_patch_tool_events(
+            agent, custom_call, function_call
+        ),
     )
     events = [event async for event in provider.query(options)]
 
@@ -703,73 +768,74 @@ async def test_native_apply_patch_trace_input_does_not_change_events_or_logs(
 
 
 @pytest.mark.asyncio
-async def test_query_excludes_other_agent_generation(
+async def test_openai_query_records_generation_only_for_main_agent(
     span_exporter: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from openai.types.responses.response_output_message import ResponseOutputMessage
-    from openai.types.responses.response_output_text import ResponseOutputText
-
-    main_response = _model_response(
-        [
-            ResponseOutputMessage(
-                id="main_msg",
-                content=[
-                    ResponseOutputText(
-                        text="main output",
-                        type="output_text",
-                        annotations=[],
-                        logprobs=[],
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ]
-    )
-    other_response = _model_response(
-        [
-            ResponseOutputMessage(
-                id="other_msg",
-                content=[
-                    ResponseOutputText(
-                        text="nested output",
-                        type="output_text",
-                        annotations=[],
-                        logprobs=[],
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ]
-    )
+    main_response = _text_response("main output", message_id="main_msg")
+    other_response = _text_response("nested output", message_id="other_msg")
     provider, options = _install_provider_query(
         monkeypatch,
         tmp_path,
         response=main_response,
-        other_response=other_response,
+        other_agent_response=other_response,
     )
-    [event async for event in provider.query(options)]
 
-    generations = [
-        span
-        for span in span_exporter.get_finished_spans()
-        if span.attributes.get("gen_ai.operation.name") == "chat"
-    ]
+    async for _event in provider.query(options):
+        pass
+
+    generations = _generation_spans(span_exporter)
     assert len(generations) == 1
-    attributes = generations[0].attributes
-    assert json.loads(attributes["gen_ai.output.messages"]) == [
+    assert json.loads(generations[0].attributes["gen_ai.output.messages"]) == [
         {"role": "assistant", "parts": [{"type": "text", "content": "main output"}]}
     ]
-    assert "nested output" not in attributes["gen_ai.output.messages"]
+
+
+class _LateCallbackStreamingResult:
+    def __init__(
+        self,
+        agent: Any,
+        hooks: Any,
+        completed_response: Any,
+        late_response: Any,
+        delta: Any,
+    ) -> None:
+        self._agent = agent
+        self._hooks = hooks
+        self._completed_response = completed_response
+        self._late_response = late_response
+        self._delta = delta
+        self._allow_late_callbacks = asyncio.Event()
+        self._events: asyncio.Queue[Any] = asyncio.Queue()
+        self.background_task: asyncio.Task[Any] | None = None
+
+    async def stream_events(self):
+        self.background_task = asyncio.create_task(self._deliver_callbacks())
+        yield await self._events.get()
+
+    async def _deliver_callbacks(self) -> None:
+        from agents.stream_events import RawResponsesStreamEvent
+
+        await self._hooks.on_llm_start(None, self._agent, None, [])
+        await self._hooks.on_llm_end(None, self._agent, self._completed_response)
+        await self._hooks.on_llm_start(None, self._agent, None, [])
+        await self._events.put(RawResponsesStreamEvent(data=self._delta))
+        await self._allow_late_callbacks.wait()
+
+        # SDK work can finish and start another request after the provider closes.
+        await self._hooks.on_llm_end(None, self._agent, self._late_response)
+        await self._hooks.on_llm_start(None, self._agent, None, [])
+        await self._hooks.on_llm_end(None, self._agent, self._late_response)
+
+    async def finish_background(self) -> None:
+        self._allow_late_callbacks.set()
+        if self.background_task is not None:
+            await asyncio.wait_for(self.background_task, timeout=1)
 
 
 @pytest.mark.asyncio
-async def test_cancellation_terminally_ignores_late_background_runner_callbacks(
+async def test_cancellation_closes_open_generation_and_ignores_late_runner_callbacks(
     span_exporter: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -777,125 +843,52 @@ async def test_cancellation_terminally_ignores_late_background_runner_callbacks(
     import contextlib
 
     from agents import Runner
-    from agents.stream_events import RawResponsesStreamEvent
-    from openai.types.responses.response_output_message import ResponseOutputMessage
-    from openai.types.responses.response_output_text import ResponseOutputText
-    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
 
     from lightspeed_agentic.types import TextDeltaEvent
 
     cancellation = asyncio.CancelledError("cancelled while provider was yielding")
-    delta = ResponseTextDeltaEvent(
-        content_index=0,
-        delta="observed delta only",
-        item_id="msg_partial",
-        logprobs=[],
-        output_index=0,
-        sequence_number=1,
-        type="response.output_text.delta",
-    )
-    completed_response = _model_response(
-        [
-            ResponseOutputMessage(
-                id="msg_before_cancel",
-                content=[
-                    ResponseOutputText(
-                        text="completed before cancellation",
-                        type="output_text",
-                        annotations=[],
-                        logprobs=[],
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ],
+    delta = _text_delta_event("observed delta only", item_id="msg_partial")
+    completed_response = _text_response(
+        "completed before cancellation",
+        message_id="msg_before_cancel",
         response_id="resp_before_cancel",
     )
-    late_response = _model_response(
-        [
-            ResponseOutputMessage(
-                id="msg_late",
-                content=[
-                    ResponseOutputText(
-                        text="late background output",
-                        type="output_text",
-                        annotations=[],
-                        logprobs=[],
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ],
+    late_response = _text_response(
+        "late background output",
+        message_id="msg_late",
         response_id="resp_late",
     )
     provider, options = _install_provider_query(monkeypatch, tmp_path)
-    continue_background = asyncio.Event()
-    results: list[Any] = []
-
-    class _BackgroundStreamingResult:
-        def __init__(self, agent: Any, hooks: Any) -> None:
-            self._agent = agent
-            self._hooks = hooks
-            self.background_task: asyncio.Task[Any] | None = None
-
-        async def stream_events(self):
-            queue: asyncio.Queue[Any] = asyncio.Queue()
-
-            async def continue_run() -> None:
-                await self._hooks.on_llm_start(None, self._agent, None, [])
-                await self._hooks.on_llm_end(None, self._agent, completed_response)
-                await self._hooks.on_llm_start(None, self._agent, None, [])
-                await queue.put(RawResponsesStreamEvent(data=delta))
-                await continue_background.wait()
-                await self._hooks.on_llm_end(None, self._agent, late_response)
-                await self._hooks.on_llm_start(None, self._agent, None, [])
-                await self._hooks.on_llm_end(None, self._agent, late_response)
-
-            self.background_task = asyncio.create_task(continue_run())
-            yield await queue.get()
+    streaming_results: list[_LateCallbackStreamingResult] = []
 
     def run_streamed(agent: Any, _prompt: str, *, hooks: Any, **_kwargs: Any) -> Any:
-        result = _BackgroundStreamingResult(agent, hooks)
-        results.append(result)
+        result = _LateCallbackStreamingResult(
+            agent, hooks, completed_response, late_response, delta
+        )
+        streaming_results.append(result)
         return result
 
     monkeypatch.setattr(Runner, "run_streamed", staticmethod(run_streamed))
 
     invocation = _invocation_span()
     stream = provider.query(options)
-    background_task: asyncio.Task[Any] | None = None
-    cancellation_delivered = False
     try:
         with trace.use_span(invocation, end_on_exit=False):
-            event = await anext(stream)
-            assert event == TextDeltaEvent(text="observed delta only")
-            background_task = results[0].background_task
+            assert await anext(stream) == TextDeltaEvent(text="observed delta only")
+            background_task = streaming_results[0].background_task
             assert background_task is not None
             assert not background_task.done()
             with pytest.raises(asyncio.CancelledError) as exc_info:
                 await stream.athrow(cancellation)
             assert exc_info.value is cancellation
-            cancellation_delivered = True
     finally:
-        if not cancellation_delivered:
-            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                await stream.athrow(cancellation)
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await stream.athrow(cancellation)
         invocation.end()
-        continue_background.set()
-        if background_task is None and results:
-            background_task = results[0].background_task
-        if background_task is not None:
-            await asyncio.wait_for(background_task, timeout=1)
+        if streaming_results:
+            await streaming_results[0].finish_background()
 
-    generations = [
-        span
-        for span in span_exporter.get_finished_spans()
-        if span.attributes.get("gen_ai.operation.name") == "chat"
-    ]
+    generations = _generation_spans(span_exporter)
     assert len(generations) == 2
     completed_span, cancelled_span = generations
     assert completed_span.parent.span_id == invocation.get_span_context().span_id
