@@ -11,7 +11,7 @@ from typing import Any
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, StatusCode
 
 from lightspeed_agentic.audit import AuditLogger
 from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
@@ -19,7 +19,11 @@ from lightspeed_agentic.logging import EventLogger
 from lightspeed_agentic.mcp import AdmittedMCPProviderServer
 from lightspeed_agentic.metrics import operation_duration, token_usage
 from lightspeed_agentic.tools import DEFAULT_ALLOWED_TOOLS
-from lightspeed_agentic.tracing import get_tracer, parse_traceparent
+from lightspeed_agentic.tracing import (
+    get_tracer,
+    parse_traceparent,
+    set_json_span_attribute,
+)
 from lightspeed_agentic.types import (
     AgentProvider,
     ProviderQueryOptions,
@@ -174,8 +178,8 @@ async def run_agent_query(
     """Run the provider agent and return structured output for Result CR publishing.
 
     When ``traceparent`` is set (W3C value from operator ``TRACEPARENT`` env),
-    inference spans are children of the operator phase span. When unset or
-    invalid, a new trace ID is generated (graceful degradation).
+    the agent invocation span is a child of the operator phase span. When unset
+    or invalid, a new trace ID is generated (graceful degradation).
     """
     if context:
         try:
@@ -207,27 +211,33 @@ async def run_agent_query(
     input_tokens = 0
     output_tokens = 0
     reasoning_tokens = 0
-    response_model = ""
-
-    otel_provider_name = {"deepagents": "anthropic", "gemini": "google"}.get(
-        provider.name, provider.name
-    )
     span_attrs: dict[str, Any] = {
-        "gen_ai.operation.name": "chat",
+        "gen_ai.operation.name": "invoke_agent",
         "gen_ai.request.model": model,
-        "gen_ai.provider.name": otel_provider_name,
     }
     if step:
         span_attrs["agenticrun.phase"] = step
     if agenticrun_uid:
         span_attrs["agenticrun.uid"] = agenticrun_uid
-    chat_span = tracer.start_span(
-        f"chat {model}",
-        kind=SpanKind.CLIENT,
+    if output_schema is not None:
+        span_attrs["gen_ai.output.type"] = "json"
+    agent_span = tracer.start_span(
+        "invoke_agent",
+        kind=SpanKind.INTERNAL,
         context=trace_ctx,
         attributes=span_attrs,
     )
-    span_ctx = trace.set_span_in_context(chat_span)
+    set_json_span_attribute(
+        agent_span,
+        "gen_ai.input.messages",
+        [{"role": "user", "parts": [{"type": "text", "content": prompt}]}],
+    )
+    set_json_span_attribute(
+        agent_span,
+        "gen_ai.system_instructions",
+        [{"type": "text", "content": system_prompt}],
+    )
+    span_ctx = trace.set_span_in_context(agent_span)
     audit_logger.set_parent_context(span_ctx)
 
     def _record_metrics(*, in_tokens: int, out_tokens: int, elapsed: float) -> None:
@@ -254,7 +264,7 @@ async def run_agent_query(
     try:
 
         async def run() -> None:
-            nonlocal text, input_tokens, output_tokens, reasoning_tokens, response_model
+            nonlocal text, input_tokens, output_tokens, reasoning_tokens
             token = otel_context.attach(span_ctx)
             try:
                 result = provider.query(
@@ -277,11 +287,20 @@ async def run_agent_query(
                     event_logger.log(_developer_log_event(provider.name, event))
                     audit_logger.process_event(event)
                     if event.type == "result":
+                        set_json_span_attribute(
+                            agent_span,
+                            "gen_ai.output.messages",
+                            [
+                                {
+                                    "role": "assistant",
+                                    "parts": [{"type": "text", "content": event.text}],
+                                }
+                            ],
+                        )
                         text = event.text
                         input_tokens = event.input_tokens
                         output_tokens = event.output_tokens
                         reasoning_tokens = event.reasoning_tokens
-                        response_model = event.response_model
                         break
             finally:
                 otel_context.detach(token)
@@ -289,12 +308,13 @@ async def run_agent_query(
         await asyncio.wait_for(run(), timeout=timeout_seconds)
 
     except TimeoutError:
+        agent_span.set_attribute("error.type", "timeout")
+        agent_span.set_status(StatusCode.ERROR, "agent run failed")
         elapsed = time.monotonic() - start_time
         audit_logger.complete(
-            success=False,
             input_tokens=0,
             output_tokens=0,
-            span=chat_span,
+            span=agent_span,
         )
         timeout_msg = (
             f"Agent invocation exceeded timeout of {timeout_seconds}s after {elapsed:.1f}s"
@@ -306,20 +326,27 @@ async def run_agent_query(
             },
             timed_out=True,
         )
+    except asyncio.CancelledError as exc:
+        agent_span.set_attribute("error.type", type(exc).__name__)
+        agent_span.set_status(StatusCode.ERROR, "agent run failed")
+        audit_logger.close_pending_tools()
+        raise
     except Exception as exc:
         if isinstance(exc, ToolResultSafetyInspectionFailed):
+            agent_span.set_attribute("error.type", type(exc).__name__)
+            agent_span.set_status(StatusCode.ERROR, "agent run failed")
             audit_logger.complete(
-                success=False,
                 input_tokens=0,
                 output_tokens=0,
-                span=chat_span,
+                span=agent_span,
             )
             raise
+        agent_span.set_attribute("error.type", type(exc).__name__)
+        agent_span.set_status(StatusCode.ERROR, "agent run failed")
         audit_logger.complete(
-            success=False,
             input_tokens=0,
             output_tokens=0,
-            span=chat_span,
+            span=agent_span,
         )
         logger.exception("[agent] query error")
         return AgentResult(
@@ -327,13 +354,13 @@ async def run_agent_query(
         )
     else:
         if not text:
+            agent_span.set_attribute("error.type", "empty_response")
+            agent_span.set_status(StatusCode.ERROR, "agent run failed")
             audit_logger.complete(
-                success=False,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 reasoning_tokens=reasoning_tokens,
-                response_model=response_model,
-                span=chat_span,
+                span=agent_span,
             )
             return AgentResult(
                 output={"success": False, "summary": "Agent returned empty response"},
@@ -351,12 +378,10 @@ async def run_agent_query(
             success = True
 
         audit_logger.complete(
-            success=success,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,
-            response_model=response_model,
-            span=chat_span,
+            span=agent_span,
         )
 
         if parsed is not None:
@@ -378,7 +403,7 @@ async def run_agent_query(
             output_tokens=output_tokens,
         )
     finally:
-        chat_span.end()
+        agent_span.end()
         _record_metrics(
             in_tokens=input_tokens,
             out_tokens=output_tokens,

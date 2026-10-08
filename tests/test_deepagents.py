@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
@@ -75,11 +76,24 @@ def _mock_deepagents_modules(
         "langchain_anthropic": MagicMock(),
         "langchain_core": MagicMock(),
         "langchain_core.messages": MagicMock(),
+        "lightspeed_agentic.inspection.summarization": MagicMock(
+            create_tool_data_summarization_middleware=MagicMock(
+                return_value=SimpleNamespace(name="SummarizationMiddleware"),
+            ),
+        ),
     }
     if mcp_client_cls is not None:
         modules["langchain_mcp_adapters"] = MagicMock()
         modules["langchain_mcp_adapters.client"] = MagicMock(MultiServerMCPClient=mcp_client_cls)
     return modules
+
+
+@contextmanager
+def _patch_sys_modules(modules: dict[str, Any]) -> Iterator[None]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        for name, module in modules.items():
+            monkeypatch.setitem(sys.modules, name, module)
+        yield
 
 
 def _resolve_model_patch() -> Any:
@@ -110,8 +124,7 @@ def _deepagents_provider(
 
     import lightspeed_agentic.providers.deepagents as mod  # type: ignore[import-untyped]
 
-    with patch.dict(
-        sys.modules,
+    with _patch_sys_modules(
         _mock_deepagents_modules(
             mock_create,
             mock_backend,
@@ -151,7 +164,7 @@ class TestResolveModel:
         mock_module = MagicMock()
         mock_module.ChatAnthropic = mock_chat_anthropic
 
-        with patch.dict(sys.modules, {"langchain_anthropic": mock_module}):
+        with _patch_sys_modules({"langchain_anthropic": mock_module}):
             from lightspeed_agentic.providers.deepagents import _resolve_model
 
             _resolve_model("claude-sonnet-4-6", reasoning_config=None)
@@ -169,7 +182,7 @@ class TestResolveModel:
         mock_module = MagicMock()
         mock_module.ChatAnthropic = mock_chat_anthropic
 
-        with patch.dict(sys.modules, {"langchain_anthropic": mock_module}):
+        with _patch_sys_modules({"langchain_anthropic": mock_module}):
             from lightspeed_agentic.providers.deepagents import _resolve_model
 
             _resolve_model(
@@ -189,7 +202,7 @@ class TestResolveModel:
         mock_module = MagicMock()
         mock_module.ChatAnthropic = mock_chat_anthropic
 
-        with patch.dict(sys.modules, {"langchain_anthropic": mock_module}):
+        with _patch_sys_modules({"langchain_anthropic": mock_module}):
             from lightspeed_agentic.providers.deepagents import _resolve_model
 
             _resolve_model("gpt-oss-20b", reasoning_config=None)
@@ -210,7 +223,7 @@ class TestResolveModel:
         mock_module = MagicMock()
         mock_module.ChatAnthropic = mock_chat_anthropic
 
-        with patch.dict(sys.modules, {"langchain_anthropic": mock_module}):
+        with _patch_sys_modules({"langchain_anthropic": mock_module}):
             from lightspeed_agentic.providers.deepagents import _resolve_model
 
             _resolve_model("claude-sonnet-4-6", reasoning_config=None)
@@ -228,8 +241,7 @@ class TestResolveModel:
         mock_garden_module = MagicMock()
         mock_garden_module.ChatAnthropicVertex = mock_vertex
 
-        with patch.dict(
-            sys.modules,
+        with _patch_sys_modules(
             {
                 "langchain_google_vertexai": MagicMock(),
                 "langchain_google_vertexai.model_garden": mock_garden_module,
@@ -254,7 +266,7 @@ class TestResolveModel:
         mock_aws_module = MagicMock()
         mock_aws_module.ChatAnthropicBedrock = mock_bedrock
 
-        with patch.dict(sys.modules, {"langchain_aws": mock_aws_module}):
+        with _patch_sys_modules({"langchain_aws": mock_aws_module}):
             from lightspeed_agentic.providers.deepagents import _resolve_model
 
             _resolve_model("claude-sonnet-4-6", reasoning_config=None)
@@ -714,7 +726,6 @@ class TestEventMapping:
         assert result_event.input_tokens == 11
         assert result_event.output_tokens == 5
         audit.complete(
-            success=True,
             input_tokens=result_event.input_tokens,
             output_tokens=result_event.output_tokens,
         )
@@ -724,7 +735,9 @@ class TestEventMapping:
             if span.name.startswith("execute_tool")
         ]
         assert [dict(span.attributes)["gen_ai.tool.call.id"] for span in spans] == call_ids
-        assert [dict(span.attributes)["tool.output"] for span in spans] == raw_results
+        assert [json.loads(dict(span.attributes)["gen_ai.tool.call.result"]) for span in spans] == [
+            {"content": result} for result in raw_results
+        ]
 
     @pytest.mark.parametrize("has_terminal_marker", [True, False])
     @pytest.mark.asyncio
@@ -773,8 +786,7 @@ class TestEventMapping:
         mock_agent.astream = mock_astream
         with (
             _deepagents_provider(MagicMock(return_value=mock_agent), MagicMock()) as provider,
-            patch.dict(
-                sys.modules,
+            _patch_sys_modules(
                 {
                     "langchain_core": langchain_core,
                     "langchain_core.messages": langchain_core.messages,
@@ -798,7 +810,7 @@ class TestEventMapping:
         audit = AuditLogger(phase="execution", model="test-model", provider="deepagents")
         for event in events:
             audit.process_event(event)
-        audit.complete(success=True, input_tokens=0, output_tokens=0)
+        audit.complete(input_tokens=0, output_tokens=0)
 
         tool_spans = [
             span
@@ -808,8 +820,12 @@ class TestEventMapping:
         assert len(tool_spans) == 1
         assert tool_spans[0].name == "execute_tool execute"
         assert dict(tool_spans[0].attributes)["gen_ai.tool.call.id"] == "call-1"
-        assert dict(tool_spans[0].attributes)["tool.input"] == '{"command": "kubectl get pods"}'
-        assert dict(tool_spans[0].attributes)["tool.output"] == "pod-a"
+        assert json.loads(dict(tool_spans[0].attributes)["gen_ai.tool.call.arguments"]) == {
+            "command": "kubectl get pods"
+        }
+        assert json.loads(dict(tool_spans[0].attributes)["gen_ai.tool.call.result"]) == {
+            "content": "pod-a"
+        }
         assert tool_spans[0].status.status_code == StatusCode.OK
 
     @pytest.mark.asyncio
@@ -899,7 +915,7 @@ class TestEventMapping:
             "required": ["status"],
         }
 
-        with patch.dict(sys.modules, _mock_deepagents_modules(mock_create, MagicMock())):
+        with _patch_sys_modules(_mock_deepagents_modules(mock_create, MagicMock())):
             import importlib
 
             import lightspeed_agentic.providers.deepagents as mod
@@ -967,7 +983,7 @@ class TestEventMapping:
             "required": ["status"],
         }
 
-        with patch.dict(sys.modules, _mock_deepagents_modules(mock_create, MagicMock())):
+        with _patch_sys_modules(_mock_deepagents_modules(mock_create, MagicMock())):
             import importlib
 
             import lightspeed_agentic.providers.deepagents as mod
@@ -1096,7 +1112,7 @@ class TestEventMapping:
             "required": ["status"],
         }
 
-        with patch.dict(sys.modules, _mock_deepagents_modules(mock_create, MagicMock())):
+        with _patch_sys_modules(_mock_deepagents_modules(mock_create, MagicMock())):
             import importlib
 
             import lightspeed_agentic.providers.deepagents as mod

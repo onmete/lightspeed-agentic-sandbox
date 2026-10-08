@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import json
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from lightspeed_agentic.audit import AuditLogger
 from lightspeed_agentic.types import (
@@ -21,6 +22,14 @@ def _make_logger(**kwargs) -> AuditLogger:
     defaults = {"phase": "analysis", "model": "m", "provider": "p", "enabled": True}
     defaults.update(kwargs)
     return AuditLogger(**defaults)
+
+
+def _reject_nonstandard_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON constant: {value}")
+
+
+def _strict_json_loads(value: str) -> object:
+    return json.loads(value, parse_constant=_reject_nonstandard_constant)
 
 
 class TestToolSpanNaming:
@@ -41,8 +50,39 @@ class TestToolSpanNaming:
         assert attrs["gen_ai.operation.name"] == "execute_tool"
         assert attrs["gen_ai.tool.name"] == "bash"
         assert attrs["gen_ai.tool.call.id"] == "call_1"
-        assert attrs["tool.input"] == "ls -la"
-        assert attrs["tool.output"] == "done"
+        assert json.loads(attrs["gen_ai.tool.call.arguments"]) == {"content": "ls -la"}
+        assert json.loads(attrs["gen_ai.tool.call.result"]) == {"content": "done"}
+        assert "tool.input" not in attrs
+        assert "tool.output" not in attrs
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            (
+                '{"message": "雪 \\"hello\\"\\nnext"}',
+                {"message": '雪 "hello"\nnext'},
+            ),
+            ("17", {"content": 17}),
+            ('["one", 2, null]', {"content": ["one", 2, None]}),
+            ("null", {"content": None}),
+            ('"scalar"', {"content": "scalar"}),
+            ('raw "quote"\n雪', {"content": 'raw "quote"\n雪'}),
+            ("", {"content": ""}),
+        ],
+    )
+    def test_tool_payloads_are_exported_as_json_objects(
+        self, span_exporter, payload: str, expected: dict[str, object]
+    ) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input=payload, call_id="c1"))
+        al.process_event(ToolResultEvent(output=payload, call_id="c1"))
+
+        attrs = dict(span_exporter.get_finished_spans()[0].attributes)
+        expected_json = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+        assert _strict_json_loads(attrs["gen_ai.tool.call.arguments"]) == expected
+        assert _strict_json_loads(attrs["gen_ai.tool.call.result"]) == expected
+        assert attrs["gen_ai.tool.call.arguments"] == expected_json
+        assert attrs["gen_ai.tool.call.result"] == expected_json
 
     def test_tool_span_has_agenticrun_correlation(self, span_exporter) -> None:
         al = _make_logger(phase="execution", agenticrun_uid="run-uid")
@@ -70,48 +110,186 @@ class TestToolSpanNaming:
         assert spans[0].kind == trace.SpanKind.INTERNAL
 
 
+class TestToolPayloadBoundaries:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            '{"value": NaN}',
+            '{"value": Infinity}',
+            '{"value": -Infinity}',
+            "1e999",
+            '{"value": 1e999}',
+        ],
+    )
+    def test_nonstandard_numbers_fall_back_to_raw_tool_payload(
+        self, span_exporter, payload: str
+    ) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input=payload, call_id="c1"))
+        al.process_event(ToolResultEvent(output=payload, call_id="c1"))
+
+        span = span_exporter.get_finished_spans()[0]
+        attrs = dict(span.attributes)
+        expected = {"content": payload}
+        expected_json = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+        for name in ("gen_ai.tool.call.arguments", "gen_ai.tool.call.result"):
+            assert attrs[name] == expected_json
+            assert _strict_json_loads(attrs[name]) == expected
+        assert span.status.status_code == StatusCode.OK
+
+    def test_deep_result_falls_back_to_exact_raw_string_and_ends_tool(self, span_exporter) -> None:
+        payload = "[" * 10_000 + "0" + "]" * 10_000
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input="{}", call_id="c1"))
+        al.process_event(ToolResultEvent(output=payload, call_id="c1"))
+
+        span = span_exporter.get_finished_spans()[0]
+        attrs = dict(span.attributes)
+        expected = {"content": payload}
+        encoded = attrs["gen_ai.tool.call.result"]
+        assert encoded == json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+        assert _strict_json_loads(encoded) == expected
+        assert span.status.status_code == StatusCode.OK
+
+    def test_encoder_recursion_falls_back_to_raw_result_and_ends_tool(
+        self, span_exporter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = '{"value": 1}'
+        original_dumps = json.dumps
+        injected = False
+
+        def fail_once(value, *args, **kwargs):
+            nonlocal injected
+            if not injected and value == {"value": 1}:
+                injected = True
+                raise RecursionError("injected JSON encoder limit")
+            return original_dumps(value, *args, **kwargs)
+
+        monkeypatch.setattr(json, "dumps", fail_once)
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input="{}", call_id="c1"))
+        al.process_event(ToolResultEvent(output=payload, call_id="c1"))
+
+        spans = span_exporter.get_finished_spans()
+        assert injected
+        assert len(spans) == 1
+        span = spans[0]
+        attrs = dict(span.attributes)
+        expected = {"content": payload}
+        encoded = attrs["gen_ai.tool.call.result"]
+        assert encoded == original_dumps(expected, ensure_ascii=False, separators=(",", ":"))
+        assert _strict_json_loads(encoded) == expected
+        assert span.status.status_code == StatusCode.OK
+
+
 class TestToolSpanLifecycle:
-    def test_tool_result_ends_span(self, span_exporter) -> None:  # noqa: ARG002
+    def test_tool_result_ends_span(self, span_exporter) -> None:
         al = _make_logger()
         al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
-        assert len(al._tool_spans) == 1
+        assert span_exporter.get_finished_spans() == []
+
         al.process_event(ToolResultEvent(output="done", call_id="c1"))
-        assert len(al._tool_spans) == 0
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].status.status_code == StatusCode.OK
 
     def test_parallel_tool_calls_matched_by_id(self, span_exporter) -> None:
         al = _make_logger()
         al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
         al.process_event(ToolCallEvent(name="cat", input="file.txt", call_id="c2"))
-        assert len(al._tool_spans) == 2
-        al.process_event(ToolResultEvent(output="file.txt", call_id="c1"))
         al.process_event(ToolResultEvent(output="content", call_id="c2"))
-        assert len(al._tool_spans) == 0
+        al.process_event(ToolResultEvent(output="file.txt", call_id="c1"))
         spans = span_exporter.get_finished_spans()
         assert len(spans) == 2
         by_name = {s.name: dict(s.attributes) for s in spans}
-        assert by_name["execute_tool bash"]["tool.output"] == "file.txt"
-        assert by_name["execute_tool cat"]["tool.output"] == "content"
+        assert json.loads(by_name["execute_tool bash"]["gen_ai.tool.call.result"]) == {
+            "content": "file.txt"
+        }
+        assert json.loads(by_name["execute_tool cat"]["gen_ai.tool.call.result"]) == {
+            "content": "content"
+        }
 
-    def test_fifo_fallback_when_no_call_id(self, span_exporter) -> None:
+    def test_missing_id_result_matches_single_pending_tool(self, span_exporter) -> None:
         al = _make_logger()
-        al.process_event(ToolCallEvent(name="bash", input="ls"))
+        al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
         al.process_event(ToolResultEvent(output="done"))
         spans = span_exporter.get_finished_spans()
         assert len(spans) == 1
-        assert dict(spans[0].attributes)["tool.output"] == "done"
+        attrs = dict(spans[0].attributes)
+        assert attrs["gen_ai.tool.call.id"] == "c1"
+        assert json.loads(attrs["gen_ai.tool.call.result"]) == {"content": "done"}
+        assert spans[0].status.status_code == StatusCode.OK
+
+    def test_tool_call_without_id_does_not_publish_internal_id(self, span_exporter) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input="ls"))
+        al.process_event(ToolResultEvent(output=""))
+
+        span = span_exporter.get_finished_spans()[0]
+        attrs = dict(span.attributes)
+        assert "gen_ai.tool.call.id" not in attrs
+        assert json.loads(attrs["gen_ai.tool.call.arguments"]) == {"content": "ls"}
+        assert json.loads(attrs["gen_ai.tool.call.result"]) == {"content": ""}
+        assert span.status.status_code == StatusCode.OK
+
+    def test_close_pending_tools_does_not_flush_choice_events(self, span_exporter) -> None:
+        al = _make_logger(capture_content=True)
+        tracer = trace.get_tracer("test")
+        with tracer.start_as_current_span("agent") as agent_span:
+            al.set_parent_context(trace.set_span_in_context(agent_span))
+            al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
+            al.process_event(TextDeltaEvent(text="buffered"))
+            al.close_pending_tools()
+
+        spans = span_exporter.get_finished_spans()
+        agent = next(span for span in spans if span.name == "agent")
+        tool = next(span for span in spans if span.name == "execute_tool bash")
+        assert not agent.events
+        assert tool.status.status_code == StatusCode.ERROR
+        assert dict(tool.attributes)["error.type"] == "missing_tool_result"
 
     def test_complete_ends_orphan_tool_spans_with_error(self, span_exporter) -> None:
         al = _make_logger()
         al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
         al.process_event(ToolCallEvent(name="cat", input="f", call_id="c2"))
-        al.complete(success=True, input_tokens=0, output_tokens=0)
-        assert len(al._tool_spans) == 0
+        al.complete(input_tokens=0, output_tokens=0)
         spans = span_exporter.get_finished_spans()
         assert len(spans) == 2
-        from opentelemetry.trace import StatusCode
+        for span in spans:
+            attrs = dict(span.attributes)
+            assert span.status.status_code == StatusCode.ERROR
+            assert attrs["error.type"] == "missing_tool_result"
+            assert "gen_ai.tool.call.result" not in attrs
 
-        for s in spans:
-            assert s.status.status_code == StatusCode.ERROR
+    def test_ambiguous_missing_id_result_is_not_attached(self, span_exporter) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
+        al.process_event(ToolCallEvent(name="cat", input="f", call_id="c2"))
+        al.process_event(ToolResultEvent(output="ambiguous"))
+        al.complete(input_tokens=0, output_tokens=0)
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 2
+        for span in spans:
+            attrs = dict(span.attributes)
+            assert span.status.status_code == StatusCode.ERROR
+            assert attrs["error.type"] == "missing_tool_result"
+            assert "gen_ai.tool.call.result" not in attrs
+
+    def test_unknown_result_id_does_not_match_pending_tool(self, span_exporter) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
+        al.process_event(ToolResultEvent(output="unmatched", call_id="unknown"))
+        al.complete(input_tokens=0, output_tokens=0)
+
+        span = span_exporter.get_finished_spans()[0]
+        attrs = dict(span.attributes)
+        assert span.status.status_code == StatusCode.ERROR
+        assert attrs["error.type"] == "missing_tool_result"
+        assert "gen_ai.tool.call.result" not in attrs
 
 
 class TestGenAiChoiceEvents:
@@ -155,39 +333,44 @@ class TestGenAiChoiceEvents:
 
 
 class TestComplete:
-    def test_sets_usage_attributes_on_span(self, span_exporter) -> None:  # noqa: ARG002
+    def test_sets_usage_attributes_on_span(self, span_exporter) -> None:
         al = _make_logger()
-        span = MagicMock()
-        span.is_recording.return_value = True
-        al.complete(
-            success=True,
-            input_tokens=100,
-            output_tokens=50,
-            reasoning_tokens=10,
-            span=span,
-        )
-        span.set_attribute.assert_any_call("gen_ai.usage.input_tokens", 100)
-        span.set_attribute.assert_any_call("gen_ai.usage.output_tokens", 50)
-        span.set_attribute.assert_any_call("gen_ai.usage.reasoning_tokens", 10)
+        with trace.get_tracer("test").start_as_current_span("agent") as span:
+            al.complete(
+                input_tokens=100,
+                output_tokens=50,
+                reasoning_tokens=10,
+                span=span,
+            )
 
-    def test_no_reasoning_attr_when_zero(self, span_exporter) -> None:  # noqa: ARG002
-        al = _make_logger()
-        span = MagicMock()
-        span.is_recording.return_value = True
-        al.complete(success=True, input_tokens=10, output_tokens=5, span=span)
-        set_calls = {c[0][0] for c in span.set_attribute.call_args_list}
-        assert "gen_ai.usage.reasoning_tokens" not in set_calls
+        attrs = dict(span_exporter.get_finished_spans()[0].attributes)
+        assert attrs["gen_ai.usage.input_tokens"] == 100
+        assert attrs["gen_ai.usage.output_tokens"] == 50
+        assert attrs["gen_ai.usage.reasoning.output_tokens"] == 10
+        assert "gen_ai.usage.reasoning_tokens" not in attrs
+        assert "gen_ai.response.model" not in attrs
 
-    def test_error_status_on_failure(self, span_exporter) -> None:  # noqa: ARG002
+    def test_no_reasoning_attr_when_zero(self, span_exporter) -> None:
         al = _make_logger()
-        span = MagicMock()
-        span.is_recording.return_value = True
-        al.complete(success=False, input_tokens=0, output_tokens=0, span=span)
-        span.set_status.assert_called_once()
+        with trace.get_tracer("test").start_as_current_span("agent") as span:
+            al.complete(input_tokens=10, output_tokens=5, span=span)
+
+        attrs = dict(span_exporter.get_finished_spans()[0].attributes)
+        assert "gen_ai.usage.reasoning.output_tokens" not in attrs
+
+    def test_complete_preserves_existing_status(self, span_exporter) -> None:
+        al = _make_logger()
+        with trace.get_tracer("test").start_as_current_span("agent") as span:
+            span.set_status(StatusCode.ERROR, "upstream failure")
+            al.complete(input_tokens=0, output_tokens=0, span=span)
+
+        finished_span = span_exporter.get_finished_spans()[0]
+        assert finished_span.status.status_code == StatusCode.ERROR
+        assert finished_span.status.description == "upstream failure"
 
     def test_no_crash_without_span(self) -> None:
         al = _make_logger()
-        al.complete(success=True, input_tokens=0, output_tokens=0)
+        al.complete(input_tokens=0, output_tokens=0)
 
 
 class TestNoJsonEmission:
@@ -195,7 +378,7 @@ class TestNoJsonEmission:
         al = _make_logger()
         al.process_event(ToolCallEvent(name="bash", input="ls"))
         al.process_event(ToolResultEvent(output="file.txt"))
-        al.complete(success=True, input_tokens=100, output_tokens=50)
+        al.complete(input_tokens=100, output_tokens=50)
         out = capsys.readouterr().out
         assert "audit.agent" not in out
 
@@ -242,14 +425,19 @@ class TestContentCapture:
         al.process_event(ToolResultEvent(output="done", call_id="c1"))
         spans = span_exporter.get_finished_spans()
         attrs = dict(spans[0].attributes)
-        assert attrs["tool.input"] == "ls -la"
-        assert attrs["tool.output"] == "done"
+        assert json.loads(attrs["gen_ai.tool.call.arguments"]) == {"content": "ls -la"}
+        assert json.loads(attrs["gen_ai.tool.call.result"]) == {"content": "done"}
+        assert "tool.input" not in attrs
+        assert "tool.output" not in attrs
 
 
 class TestDisabledAudit:
-    def test_spans_created_when_disabled(self, span_exporter) -> None:  # noqa: ARG002
+    def test_spans_created_when_disabled(self, span_exporter) -> None:
         al = _make_logger(enabled=False)
         al.process_event(ToolCallEvent(name="bash", input="ls", call_id="c1"))
-        assert len(al._tool_spans) == 1
+        assert span_exporter.get_finished_spans() == []
+
         al.process_event(ToolResultEvent(output="done", call_id="c1"))
-        assert len(al._tool_spans) == 0
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].status.status_code == StatusCode.OK

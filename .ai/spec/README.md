@@ -19,8 +19,8 @@ These specs define the behavioral rules and codebase navigation for the lightspe
 | [provider-contract.md](what/provider-contract.md) | AgentProvider ABC, event model, structured output, thin-adapter principle, skills delegation |
 | [configuration.md](what/configuration.md) | Environment variables, provider selection, model resolution, container layout, build system |
 | [health-probes.md](what/health-probes.md) | Readiness checks at batch startup (R1); HTTP probes superseded |
-| [audit-logging.md](what/audit-logging.md) | OTel GenAI semantic conventions, span events for LLM calls and tool execution, compliance audit trail |
-| [data-collection.md](what/data-collection.md) | [PLANNED: OLS-3569] Sandbox production of full-fidelity, ordered agent-content trace events |
+| [audit-logging.md](what/audit-logging.md) | OTel GenAI invocation/tool spans, legacy choice events, and audit-log projections |
+| [data-collection.md](what/data-collection.md) | Implemented PR1 invocation/tool span profile; canonical per-generation capture planned (native ADK spans noncanonical until PR3) |
 | [e2e-testing.md](what/e2e-testing.md) | Batch cluster BDD harness: OpenShift Jobs, fixtures, live vs unit split |
 
 ### how/ — Architecture Specifications
@@ -70,7 +70,7 @@ AI agents. Content is optimized for precision and machine consumption.
 | `what/configuration.md` | `how/provider-architecture.md` (container build, implementation notes) |
 | `what/health-probes.md` | `how/project-structure.md` (readiness.py) |
 | `what/audit-logging.md` | `how/provider-architecture.md` (observability integration) |
-| `what/data-collection.md` | `how/provider-architecture.md` (provider event normalization and observability integration) |
+| `what/data-collection.md` | `how/provider-architecture.md` (shared root/tool capture and planned provider hooks) |
 
 ## Conventions
 

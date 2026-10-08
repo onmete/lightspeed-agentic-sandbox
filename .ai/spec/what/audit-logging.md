@@ -1,93 +1,95 @@
 # Audit Logging
 
-Implementation spec for compliance audit logging in the agentic sandbox. Parent spec: `ols/.ai/spec/what/audit-logging.md` (authoritative for cross-repo requirements, event semantics, correlation contract, and OTel GenAI attribute reference).
+Implementation spec for compliance logging and the sandbox PR1 trace profile. Parent spec: `ols/.ai/spec/what/audit-logging.md` remains authoritative for cross-repository audit/logging and correlation requirements; the sandbox producer exception is scoped in `data-collection.md`, without changing the parent contract.
 
-Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/README.md) (v1.41).
+Telemetry follows the named [OTel GenAI profile pinned at commit `4f85037ef86e92c510d2ef881a58f1076f6fc0e4`](https://github.com/open-telemetry/semantic-conventions-genai/tree/4f85037ef86e92c510d2ef881a58f1076f6fc0e4/docs/gen-ai). Upstream status at that revision is Development; this does not claim every optional convention or add a dependency.
 
 ## Behavioral Rules
 
 ### Span Naming and Kinds
 
-1. The sandbox MUST create a `chat {gen_ai.request.model}` span (e.g., `chat claude-sonnet-4-20250514`) as a child of the operator's span (using the received trace context). This is the **inference span** covering the full SDK inference call. Span kind MUST be `CLIENT`.
+1. The sandbox MUST create an `invoke_agent` span with `gen_ai.operation.name="invoke_agent"` and `SpanKind.INTERNAL`, as a child of the received operator context. It carries the configured request model and is not a provider inference span: it MUST NOT claim `gen_ai.provider.name` or `gen_ai.response.model`.
 
-2. The sandbox MUST create an `execute_tool {gen_ai.tool.name}` span (e.g., `execute_tool Bash`) for each tool call/result pair. These are children of the inference span. Span kind MUST be `INTERNAL`.
+2. The sandbox MUST create an `execute_tool {gen_ai.tool.name}` span for each local tool execution. Tool spans are `INTERNAL` children of the invocation span and use only actual SDK tool-call IDs.
 
-3. The sandbox does not run its own agent loop — it consumes events from the provider SDK's internal agentic loop. Spans are created alongside the existing event normalization in each provider adapter.
+3. The shared invocation/tool spans are produced by `run_agent_query()` and `AuditLogger`. New sandbox-owned canonical per-generation spans are planned for later PRs, not PR1; existing SDK-native ADK `call_llm`/`generate_content` spans remain unchanged framework detail and outside the canonical profile until PR3's exported-view normalization (see `data-collection.md`).
 
-### GenAI Attributes — Inference Span
+### GenAI Attributes — Invocation Span
 
-4. The inference span (`chat {gen_ai.request.model}`) MUST carry the following attributes and retain native start time, end time, and OTel status. A failed inference MUST also record the available native error evidence.
+4. The `invoke_agent` span MUST carry the PR1 attributes below and retain native span context, start/end time, and OTel status.
 
 | Attribute | Requirement | Description |
 |---|---|---|
-| `gen_ai.operation.name` | Required | `"chat"` |
-| `gen_ai.request.model` | Required | Model name requested (e.g., `claude-sonnet-4-20250514`) |
-| `gen_ai.response.model` | Required | Actual model from SDK response or the provider-contract fallback |
-| `gen_ai.provider.name` | Required | Provider name (e.g., `anthropic`, `openai`, `google`) |
-| `gen_ai.usage.input_tokens` | Required | Input token count for this operation, including the provider-contract fallback |
-| `gen_ai.usage.output_tokens` | Required | Output token count for this operation, including the provider-contract fallback |
-| `gen_ai.usage.reasoning_tokens` | Required | Reasoning token count for this operation, including zero when unavailable |
-| `agenticrun.uid` | Required for product eligibility | Literal AgenticRun CR `metadata.uid` received through batch correlation configuration |
-| `agenticrun.phase` | Required for product eligibility | Valid run phase received through batch correlation configuration |
-| `server.address` | Recommended | LLM API endpoint hostname |
+| `gen_ai.operation.name` | Required | `"invoke_agent"` |
+| `gen_ai.request.model` | Required | Configured request model; not an actual response model |
+| `gen_ai.input.messages` | Required | JSON message array containing the effective post-context-prefix user prompt |
+| `gen_ai.system_instructions` | Required | JSON instruction array containing the configured supplied system string |
+| `gen_ai.output.type` | Conditional | `"json"` iff `output_schema is not None` |
+| `gen_ai.output.messages` | Conditional | Exact observed `ResultEvent.text` before parsing/shaping; empty is present, no `ResultEvent` is omitted |
+| `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` | Existing aggregate | Preserve the existing terminal `ResultEvent` usage behavior |
+| `gen_ai.usage.reasoning.output_tokens` | Nonzero only | Existing aggregate reasoning count; do not write zero when absent/zero |
+| `error.type` | On operational root error | `timeout`, exception class name (including `CancelledError`), or `empty_response`; cancellation propagates unchanged. Unsuccessful domain outcomes remain output content, not span errors. |
+| `agenticrun.uid` / `agenticrun.phase` | When available | Existing run correlation values; do not invent missing values |
 
-5. When `LIGHTSPEED_AGENTICRUN_UID` and `LIGHTSPEED_AGENTICRUN_STEP` are present, the sandbox MUST propagate their values as `agenticrun.uid` and `agenticrun.phase` span attributes on every inference and tool span it creates. Product eligibility requires both attributes on the span itself; resource attributes are not a fallback. When either value is absent, the sandbox MUST NOT invent it.
+Message attributes are compact JSON strings matching the pinned schemas. The invocation captures the effective prompt and configured instructions supplied to the run, not all SDK-added instructions or repeated request history. The root output is a result projection, not another generation. Root usage remains aggregate and MUST NOT be summed with future per-generation usage.
 
 ### GenAI Attributes — Tool Span
 
-6. Each tool execution span (`execute_tool {gen_ai.tool.name}`) MUST carry the following attributes and retain native start time, end time, and OTel status. A failed tool call MUST also record the available native error evidence.
+6. Each local tool span MUST retain native span context, start/end time, and OTel status.
 
 | Attribute | Requirement | Description |
 |---|---|---|
 | `gen_ai.operation.name` | Required | `"execute_tool"` |
-| `gen_ai.tool.name` | Required | Tool name (e.g., `Bash`, `ReadFile`) |
-| `gen_ai.tool.call.id` | Required | Stable tool call ID from the SDK or the provider-contract fallback |
-| `gen_ai.tool.type` | Recommended | `"function"` |
-| `agenticrun.uid` | Required for product eligibility | Same literal run UID as the containing inference span |
-| `agenticrun.phase` | Required for product eligibility | Same valid phase as the containing inference span |
+| `gen_ai.tool.name` | Required | Tool name |
+| `gen_ai.tool.call.id` | Optional | Actual SDK ID only; omit when unavailable |
+| `gen_ai.tool.call.arguments` | When observed | JSON string encoding a JSON object |
+| `gen_ai.tool.call.result` | When observed | JSON string encoding a JSON object |
+| `agenticrun.uid` / `agenticrun.phase` | When available | Same existing correlation values as the invocation span |
 
-### Span Events
+Use strict JSON parsing for tool strings: accept standards-compliant finite JSON only; treat `NaN`, `Infinity`, `-Infinity`, exponent overflow, and parser/encoder-limit failures as non-JSON. Pass decoded dictionaries unchanged and wrap other decoded values as `{"content": value}`. On parse, encode, or limit rejection, preserve the complete original raw string in `{"content": raw_string}`; this is sandbox normalization, not a provider-native field. Never truncate it or raise a telemetry-only provider error. Preserve observed empty values and omit missing arguments/results. A missing-ID result may match only one pending call; ambiguous results stay unmatched. Unresolved calls end ERROR as `error.type="missing_tool_result"`; on cancellation, close pending tool spans without result or tool-duration histogram observation.
 
-7. The sandbox MUST emit `gen_ai.choice` span events attached to the inference span:
-   - **Text output**: a `gen_ai.choice` event with a `gen_ai.completion` attribute containing the text content.
-   - **Thinking/reasoning output**: a `gen_ai.choice` event with `gen_ai.reasoning_content` when the adapter emits thinking (DeepAgents, and Gemini/OpenAI when reasoning is configured per `provider-contract.md`). Completion and reasoning MAY share one event only when the provider exposes them together in the same observed atom; otherwise they remain separate events in provider observation order.
+### Legacy Choice Events
 
-8. There are no separate `audit.agent.started` or `audit.agent.completed` events. The data previously captured by those events (phase, model, provider, success/failure, and total tokens) MUST be recorded as span attributes on the inference span instead.
+7. Existing `gen_ai.choice` span events remain attached to the invocation span as a legacy audit projection. Preserve their existing text/reasoning mapping, emission/content gates, and buffer flush order. The buffered text is flushed before reasoning, so these events are not a canonical cross-type chronology. Cancellation does not force another choice/developer-log buffer flush or emit additional choice-derived templog records.
+
+8. Do not add separate `audit.agent.started`/`audit.agent.completed` events or custom transcript events. Canonical invocation status, output, and usage follow the span-attribute profile above; provider identity and actual response model are not inferred for the root.
 
 ### Content Capture Policy
 
-9. The compliance stdout and templog copies of `gen_ai.completion` and `gen_ai.reasoning_content` remain governed by `LIGHTSPEED_CAPTURE_CONTENT`: audit-enabled with unset defaults on; false or audit-disabled omits content attributes from those compliance copies. [PLANNED: OLS-3569] The underlying trace events are the complete source defined by `data-collection.md`; compliance processing MUST NOT mutate them before export through the shared trace endpoint.
+9. Whenever an invocation/tool span is recording, canonical PR1 attributes ignore `LIGHTSPEED_AUDIT_ENABLED` and `LIGHTSPEED_CAPTURE_CONTENT`. Existing `gen_ai.choice` event emission remains audit-gated; its text/reasoning payload retains the previous content-capture policy (unset defaults to content when audit is enabled; false or audit-disabled omits those payloads from compliance copies). Developer logs and the span-event → templog bridge retain their existing logging/endpoint/audit gates and flush order. None of these projections is a canonical transcript.
 
 ### Trace Context Reception
 
-10. The sandbox establishes trace context during each batch run. When audit or OTLP export is enabled (`otel_runtime_enabled()`), `batch.main()` calls `init_tracer()` before `run_agent_query()`. When the operator sets W3C `TRACEPARENT` on the pod (from the active phase span), `batch.main()` passes it to `run_agent_query()` so the inference span is a child of the operator phase span.
+10. When audit or OTLP export is enabled (`otel_runtime_enabled()`), `batch.main()` calls `init_tracer()` before `run_agent_query()`. When the operator sets W3C `TRACEPARENT` on the pod, `batch.main()` passes it to `run_agent_query()` so `invoke_agent` is a child of the operator phase span.
 
 11. If `TRACEPARENT` is unset or invalid, the sandbox MUST generate a new trace ID for the run (graceful degradation).
 
-### Single-Emission Rule
+### Trace and Log Projections
 
-12. Each audit-significant datum MUST be recorded exactly once as an OTel span or span event. Multiple exporters/processors on the same TracerProvider produce views of that single emission:
-    - **OTLP span exporter** sends the complete source spans and events through the shared `OTEL_EXPORTER_OTLP_ENDPOINT` when it is set.
-    - **Stdout exporter** serializes the compliance view as OTLP JSON when audit is enabled.
-    - **Span-event → log processor** forwards the compliance view as OTLP templog records only when the endpoint is set and audit is enabled.
+12. The invocation and tool spans are emitted once through the shared TracerProvider; exporters/processors project the same spans. The legacy choice events remain a separate existing audit projection. PR1 adds no OTel Logs API path for canonical span attributes.
+    - **OTLP span exporter** sends native spans and their attributes/events through the shared `OTEL_EXPORTER_OTLP_ENDPOINT` when set.
+    - **Stdout exporter** serializes its trace projection as OTLP JSON when audit is enabled.
+    - **Span-event → log processor** forwards existing audit events as OTLP templog records only when the endpoint is set and audit is enabled.
 
-13. Python `logging` MUST emit developer-debugging messages and MUST NOT be used at AuditLogger call sites to re-record span/event data. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, stdlib logging is dual-shipped to stderr and OTLP (`LoggingHandler` on the root logger). The span-event → log bridge (rule 23) also emits through that same stdlib path so templog gets dual-ship without a separate OTel Logs API emit. This collapses into:
-    - OTel spans/events for audit (stdout + OTLP traces), with templog OTLP logs (and stderr) via the bridge → LoggingHandler.
+13. Python `logging` MUST emit developer-debugging messages and MUST NOT be used at AuditLogger call sites to re-record span/event data. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, stdlib logging is dual-shipped to stderr and OTLP (`LoggingHandler` on the root logger). The span-event → log bridge also emits through that same stdlib path so templog gets dual-ship without a separate OTel Logs API emit. This collapses into:
+    - OTel spans and legacy events for audit (stdout + OTLP traces), with templog OTLP logs (and stderr) via the bridge → LoggingHandler.
     - Standard logging for developer debugging (stderr + OTLP when the endpoint is set).
 
 ### Structured Log Format
 
-14. The stdout exporter MUST emit OTLP JSON — the OTel standard wire format. There is no custom JSON format. Both the stdout and OTLP exporters are destinations for the same TracerProvider spans.
+14. The stdout exporter MUST emit OTLP JSON — the OTel standard wire format. It is a projection of the same TracerProvider spans, including PR1 attributes when enabled, not a custom transcript format.
 
-15. The stdout exporter MUST NOT truncate span attributes or event attributes. Full fidelity is preserved. The stdout signal is the compliance record.
+15. The stdout exporter MUST NOT truncate span attributes or event attributes. Full fidelity is preserved; downstream size limits remain best-effort collection constraints.
 
-### Provider-Specific Instrumentation
+### Legacy Provider Event Projection
 
-16. **DeepAgents / Anthropic** (`providers/deepagents.py`): Emit `gen_ai.choice` span event with `gen_ai.completion` from `AIMessage` text content. Emit `gen_ai.choice` span event with `gen_ai.reasoning_content` from `AIMessage.content_blocks` entries with `type == "reasoning"`. Create `execute_tool {name}` spans from `AIMessage.tool_calls` and `ToolMessage` content. Set `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` from accumulated `usage_metadata`.
+16. **DeepAgents / Anthropic** (`providers/deepagents.py`): Preserve existing `gen_ai.choice` text events from `AIMessage` and reasoning events from reasoning `content_blocks`; create tool spans from `AIMessage.tool_calls` and `ToolMessage` content. Existing aggregate usage remains on the invocation span through `ResultEvent`.
 
-17. **OpenAI** (`providers/openai.py`): Emit `gen_ai.choice` with `gen_ai.completion` from stream text deltas (buffered). Emit `gen_ai.reasoning_content` from reasoning delta items when present. Create `execute_tool {name}` spans from tool call/output items. Set token usage from the stream end.
+17. **OpenAI** (`providers/openai.py`): Preserve buffered `gen_ai.choice` text events from stream deltas and reasoning events when present; create tool spans from existing tool call/output items. Existing aggregate usage remains on the invocation span through `ResultEvent`.
 
-18. **Gemini** (`providers/gemini.py`): Emit `gen_ai.choice` with `gen_ai.completion` from text parts (buffered). Emit `gen_ai.reasoning_content` from thought parts when present. Create `execute_tool {name}` spans from function_call/response parts. Set token usage from the stream end.
+18. **Gemini** (`providers/gemini.py`): Preserve buffered `gen_ai.choice` text events from text parts and reasoning events from thought parts when present; create tool spans from function-call/response parts. Existing aggregate usage remains on the invocation span through `ResultEvent`.
+
+These legacy projections and their SDK/event behavior remain unchanged in PR1. Later PRs plan new sandbox-owned canonical per-generation capture; existing SDK-native ADK spans remain unchanged framework detail until PR3's exported-view normalization.
 
 ### Tool-Result Inspection [PLANNED: OLS-3928]
 
@@ -101,17 +103,17 @@ Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-
 
 18e. Developer logs and `tool_result.inspection` telemetry MUST NOT contain tool arguments, tool results, or tool-generated errors.
 
-18f. After inspection passes, `AuditLogger` MUST retain the complete normalized result for the approved content-event path.
+18f. After inspection passes, `AuditLogger` MUST retain the complete normalized result for the approved `gen_ai.tool.call.result` span attribute.
 
-18g. The existing content-capture and export rules control each approved audit copy of a passing result.
+18g. The canonical tool-result span attribute is recorded whenever its span is recording, independent of audit/content flags. Existing developer-log redaction and legacy choice-event/log gates remain unchanged.
 
-18h. If inspection fails, `AuditLogger` MUST receive no content event for the rejected result.
+18h. If inspection fails, `AuditLogger` MUST receive no approved result payload; the rejected result MUST NOT appear in a canonical tool-result attribute.
 
-18i. The DeepAgents adapter MUST hold normalized `ToolResultEvent` records until the model-boundary middleware accepts the associated results. If inspection rejects any result, the adapter MUST release no pending result events from that boundary. Rejected output and pending sibling output MUST NOT enter audit content events.
+18i. The DeepAgents adapter MUST hold normalized `ToolResultEvent` records until the model-boundary middleware accepts the associated results. If inspection rejects any result, the adapter MUST release no pending result events from that boundary. Rejected output and pending sibling output MUST NOT enter canonical trace attributes or legacy audit payloads.
 
 ### Metrics
 
-19. The sandbox MUST record the following `gen_ai.*` Prometheus histograms during agent execution (`metrics.py`). Histograms are **in-process only** (`prometheus_client`); the batch entrypoint MUST NOT expose a `/metrics` HTTP scrape endpoint and MUST NOT export histograms to OTLP or Pushgateway at shutdown. Short-lived one-shot pods are a poor fit for pull-based Prometheus scraping; **OTLP traces** (with `gen_ai.usage.*` on inference spans) are the operational signal when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Unit tests (`tests/test_metrics.py`) verify histogram recording.
+19. The sandbox MUST record the following `gen_ai.*` Prometheus histograms during agent execution (`metrics.py`). Histograms are **in-process only** (`prometheus_client`); the batch entrypoint MUST NOT expose a `/metrics` HTTP scrape endpoint and MUST NOT export histograms to OTLP or Pushgateway at shutdown. Short-lived one-shot pods are a poor fit for pull-based Prometheus scraping; the current aggregate `gen_ai.usage.*` values on the invocation span remain the OTLP trace usage signal. Future per-generation values are separate and MUST NOT be summed with the root aggregate. Unit tests (`tests/test_metrics.py`) verify histogram recording.
 
 | Metric | Type | Unit | Labels |
 |---|---|---|---|
@@ -119,11 +121,11 @@ Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-
 | `gen_ai_client_operation_duration_seconds` | Histogram | `s` | `gen_ai_request_model`, `gen_ai_provider_name`, `gen_ai_operation_name` |
 | `gen_ai_execute_tool_duration_seconds` | Histogram | `s` | `gen_ai_tool_name` |
 
-20. Token usage histogram bucket boundaries MUST be `[1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864]` (per semconv recommendation). Reasoning tokens are tracked separately via `gen_ai.usage.reasoning_tokens` span attribute on inference spans, not as a `gen_ai.token.type` value.
+20. Token usage histogram bucket boundaries MUST be `[1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864]` (per semconv recommendation). Root reasoning usage is recorded as `gen_ai.usage.reasoning.output_tokens` only when the existing aggregate value is nonzero; it is not a `gen_ai.token.type` value.
 
 ### Configuration
 
-21. The sandbox receives audit and shared tracing configuration through `LIGHTSPEED_AUDIT_ENABLED`, `LIGHTSPEED_CAPTURE_CONTENT`, and `OTEL_EXPORTER_OTLP_ENDPOINT`; run correlation uses `LIGHTSPEED_AGENTICRUN_UID` and `LIGHTSPEED_AGENTICRUN_STEP`. Audit is enabled only when `LIGHTSPEED_AUDIT_ENABLED` is `"true"` after strip and lowercasing. Audit-disabled suppresses compliance stdout and span-event log copies, but MUST NOT suppress tracing when the shared OTLP endpoint is configured.
+21. The sandbox receives audit and shared tracing configuration through `LIGHTSPEED_AUDIT_ENABLED`, `LIGHTSPEED_CAPTURE_CONTENT`, and `OTEL_EXPORTER_OTLP_ENDPOINT`; run correlation uses `LIGHTSPEED_AGENTICRUN_UID` and `LIGHTSPEED_AGENTICRUN_STEP`. Audit is enabled only when `LIGHTSPEED_AUDIT_ENABLED` is `"true"` after strip and lowercasing. Audit-disabled suppresses stdout and span-event log copies, but MUST NOT suppress tracing when the shared OTLP endpoint is configured. PR1 span attributes bypass audit/content payload gates only on spans that the existing runtime records.
 
 22. When `OTEL_EXPORTER_OTLP_ENDPOINT` is configured, the sandbox MUST configure OTLP exporters for traces and logs targeting that same endpoint. Trace export is active whenever the endpoint is set. The span-event → log processor is attached only when the endpoint is set and audit is enabled; the stdout span exporter emits when audit is enabled. When the endpoint is absent, no OTLP exporters or span-event log forwarding are configured.
 
@@ -137,17 +139,18 @@ Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-
 
 26. When `OTEL_EXPORTER_OTLP_ENDPOINT` is absent, no OTLP log records are emitted. Graceful degradation.
 
-### Agentic Product Trace Events
+### Agentic Trace Profile
 
-27. [PLANNED: OLS-3569] The audit/tracing layer MUST emit and export the sandbox content events according to `data-collection.md` through the existing shared trace runtime. That spec is authoritative for the event catalog, literal content, placement, correlation, and ordering; `provider-contract.md` is authoritative for adapter normalization and fallbacks. The parent `ols/.ai/spec/what/agentic-data-collection.md` owns all cross-repository collection semantics.
+27. The audit/tracing layer MUST emit the PR1 invocation/tool span attributes defined in `data-collection.md` through the existing shared trace runtime. Existing `gen_ai.choice` events and their log projections remain legacy outputs with their old gates and ordering. New sandbox-owned canonical per-generation capture is planned for later PRs, not PR1; existing SDK-native ADK spans remain unchanged framework detail until PR3's exported-view normalization. The sandbox producer exception does not change the parent collection contract outside this scope.
 
 ## Verification
 
-- Unit: `tests/test_tracing.py` — shared Resource, span-event → OTLP log forwarding (record attrs; audit gate; unresolved AgenticRun env warning), LoggingHandler dual-ship when endpoint set
-- Unit: `tests/test_audit.py` — full passing results in approved audit events and no rejected-result event
-- Unit: `tests/test_logging.py` — payload-free developer records for inspected DeepAgents results
-- Unit: `tests/test_metrics.py` — in-process histogram recording (no export path in batch)
-- Live (batch cluster): `tests/e2e/features/sandbox_e2e.feature` scenario **Batch run exports traces and audit logs to OTEL** — minimal batch Job with audit enabled; asserts the e2e OTEL collector debug exporter received spans and bridged audit log records carrying `agenticrun.uid` / `agenticrun.phase` for the run (requires `scripts/e2e-install-fixtures.sh`, `E2E_BATCH_VERIFY_FIXTURES=1`)
+- Exported regressions: [test_run_agent.py](../../../tests/test_run_agent.py), [test_audit.py](../../../tests/test_audit.py), and [test_tracing.py](../../../tests/test_tracing.py) cover exported invocation/tool attributes and unchanged audit/log projections.
+- Offline smoke proof: the controller exercised actual `run_agent_query()` plus `init_tracer()` with in-memory trace/log exporters, OTLP encode/decode with shuffled spans, and validation against the five pinned JSON schemas. Full input/system/terminal/tool attributes survived; all four audit/content-flag combinations retained exactly the prior developer/templog semantics and choice events.
+- Cancellation boundary/OTLP smoke: root ERROR/`CancelledError` and pending-tool ERROR/`missing_tool_result` survived the wire with no tool result, duration-histogram observation, or cancellation-triggered choice/log flush.
+- Scope limit: no provider API or deployed collector/FileExporter/Dataverse delivery was exercised. Existing size limits remain best effort; no producer truncation was added.
+- Existing behavior checks: [test_logging.py](../../../tests/test_logging.py) — payload-free developer records for inspected DeepAgents results; [test_metrics.py](../../../tests/test_metrics.py) — in-process histogram recording.
+- Existing live batch coverage: [sandbox_e2e.feature](../../../tests/e2e/features/sandbox_e2e.feature) checks trace and bridged audit-log export; it is not deployed FileExporter/Dataverse proof for this profile.
 
 ### MCP Semantic Conventions [UNTRACKED]
 
@@ -155,12 +158,12 @@ Telemetry aligns with [OTel GenAI Semantic Conventions](https://github.com/open-
 
 ## Cross-References
 
-- `run-api.md` — batch entrypoint where tracing and agent execution run
-- `provider-contract.md` — provider adapter event streams where spans and span events are created
-- Parent workspace `ols/.ai/spec/what/templog.md` — temporary audit log storage (cross-repo); sandbox emission tracked by OLS-3515
-- `ols/.ai/spec/what/audit-logging.md` — parent spec authoritative for correlation and OTel GenAI semantics
-- `data-collection.md` — sandbox content trace production
-- `ols/.ai/spec/what/agentic-data-collection.md` — canonical cross-repository collection contract
-- [OTel GenAI Semantic Conventions v1.41](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/README.md)
+- `run-api.md` — batch tracing lifecycle and invocation span
+- `provider-contract.md` — unchanged provider events and planned canonical generation capture
+- Parent workspace `ols/.ai/spec/what/templog.md` — temporary audit log storage; sandbox emission tracked by OLS-3515
+- `ols/.ai/spec/what/audit-logging.md` — parent cross-repository audit/logging and correlation requirements; sandbox producer exception is scoped in `data-collection.md`
+- `data-collection.md` — PR1 canonical span profile and its parent-contract scope
+- `ols/.ai/spec/what/agentic-data-collection.md` — parent collection contract, unchanged outside the sandbox producer exception
+- [Pinned OTel GenAI profile](https://github.com/open-telemetry/semantic-conventions-genai/tree/4f85037ef86e92c510d2ef881a58f1076f6fc0e4/docs/gen-ai) — Development snapshot; named alignment profile
 - [OTel MCP Semantic Conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/mcp.md)
 - Parent workspace `ols/.ai/spec/what/tool-result-inspection.md` — cross-repository tool-result inspection contract
