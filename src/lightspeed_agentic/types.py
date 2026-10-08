@@ -45,6 +45,7 @@ class ToolCallEvent:
     name: str = ""
     input: str = ""
     call_id: str = ""
+    trace_input: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class ToolResultEvent:
     type: Literal["tool_result"] = field(default="tool_result", init=False)
     output: str = ""
     call_id: str = ""
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)

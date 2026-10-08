@@ -11,11 +11,17 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
+from uuid import UUID
+
+from opentelemetry import context as otel_context
+from opentelemetry.context import Context
+from opentelemetry.trace import Span, StatusCode
 
 from lightspeed_agentic.skills import has_skills
+from lightspeed_agentic.tracing import set_json_span_attribute, start_generation_span
 from lightspeed_agentic.types import (
     MAX_TOOL_RETURN_CHARS,
     AgentProvider,
@@ -229,12 +235,258 @@ def _structured_output_method() -> str:
     return "json_schema"
 
 
+def _content_block_value(block: Any, name: str) -> Any:
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def _generation_parts(message: Any) -> list[dict[str, Any]]:
+    """Map observed chat content blocks to ordered GenAI output parts."""
+    content_blocks = getattr(message, "content_blocks", None)
+    parts: list[dict[str, Any]] = []
+    for block in content_blocks or []:
+        block_type = _content_block_value(block, "type")
+        if block_type == "text":
+            text = _content_block_value(block, "text")
+            if text is not None:
+                parts.append({"type": "text", "content": text})
+        elif block_type == "reasoning":
+            reasoning = _content_block_value(block, "reasoning")
+            if reasoning is not None:
+                parts.append({"type": "reasoning", "content": reasoning})
+        elif block_type == "tool_call":
+            part: dict[str, Any] = {"type": "tool_call"}
+            for source, target in (("id", "id"), ("name", "name"), ("args", "arguments")):
+                value = _content_block_value(block, source)
+                if value is not None and (target != "id" or value != ""):
+                    part[target] = value
+            parts.append(part)
+        elif block_type == "tool_call_chunk":
+            part = {"type": "tool_call_chunk"}
+            for key in ("id", "name", "args", "index"):
+                value = _content_block_value(block, key)
+                if value is not None:
+                    part[key] = value
+            parts.append(part)
+
+    content = getattr(message, "content", None)
+    if not content_blocks and isinstance(content, str):
+        parts.append({"type": "text", "content": content})
+    return parts
+
+
+def _generation_metadata_value(
+    generations: list[tuple[Any, Any]],
+    *keys: str,
+    llm_output: Any = None,
+) -> Any:
+    for generation, message in generations:
+        for metadata in (
+            getattr(message, "response_metadata", None),
+            getattr(generation, "generation_info", None),
+        ):
+            if isinstance(metadata, Mapping):
+                for key in keys:
+                    value = metadata.get(key)
+                    if value is not None:
+                        return value
+    if isinstance(llm_output, Mapping):
+        for key in keys:
+            value = llm_output.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _is_error_metadata_only(message: Any) -> bool:
+    metadata = getattr(message, "response_metadata", None)
+    return (
+        isinstance(metadata, Mapping)
+        and any(key in metadata for key in ("body", "headers", "status_code", "request_id"))
+        and getattr(message, "content", None) == ""
+        and not getattr(message, "content_blocks", None)
+        and not getattr(message, "tool_calls", None)
+    )
+
+
+def _record_generation_result(
+    span: Span,
+    response: Any,
+    *,
+    partial: bool = False,
+) -> None:
+    """Record only output, metadata, and usage exposed by this SDK result."""
+    generations: list[tuple[Any, Any]] = []
+    llm_output = getattr(response, "llm_output", None)
+    output_messages: list[dict[str, Any]] = []
+    for prompt_index, choices in enumerate(getattr(response, "generations", None) or []):
+        if partial and prompt_index > 0:
+            break
+        for generation in choices:
+            message = getattr(generation, "message", None)
+            if message is not None and not (partial and _is_error_metadata_only(message)):
+                generations.append((generation, message))
+                output_messages.append({"role": "assistant", "parts": _generation_parts(message)})
+
+    if output_messages:
+        set_json_span_attribute(span, "gen_ai.output.messages", output_messages)
+
+    for attribute, keys in (
+        ("gen_ai.response.model", ("model", "model_name")),
+        ("gen_ai.response.id", ("id", "response_id")),
+    ):
+        value = _generation_metadata_value(
+            generations,
+            *keys,
+            llm_output=llm_output,
+        )
+        if value is not None:
+            span.set_attribute(attribute, value)
+
+    finish_reasons: list[str] = []
+    for generation, message in generations:
+        reason = _generation_metadata_value([(generation, message)], "stop_reason", "finish_reason")
+        if reason is not None:
+            finish_reasons.append(str(reason))
+    if not finish_reasons:
+        reason = _generation_metadata_value(
+            [],
+            "stop_reason",
+            "finish_reason",
+            llm_output=llm_output,
+        )
+        if reason is not None:
+            finish_reasons.append(str(reason))
+    if finish_reasons:
+        span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
+
+    usage_attributes = (
+        ("input_tokens", "gen_ai.usage.input_tokens"),
+        ("output_tokens", "gen_ai.usage.output_tokens"),
+    )
+    for key, attribute in usage_attributes:
+        for _generation, message in generations:
+            usage = getattr(message, "usage_metadata", None)
+            if isinstance(usage, Mapping) and (value := usage.get(key)) is not None:
+                span.set_attribute(attribute, value)
+                break
+
+    for _generation, message in generations:
+        usage = getattr(message, "usage_metadata", None)
+        details = usage.get("output_token_details") if isinstance(usage, Mapping) else None
+        if isinstance(details, Mapping) and (value := details.get("reasoning")) is not None:
+            span.set_attribute("gen_ai.usage.reasoning.output_tokens", value)
+            break
+
+
+def _create_generation_callback(
+    options: ProviderQueryOptions,
+    parent_context: Context,
+    *,
+    main_name: str | None,
+) -> Any:
+    """Create per-query tracing for the main DeepAgents model generations."""
+    from langchain_core.callbacks import AsyncCallbackHandler
+
+    class GenerationCallback(AsyncCallbackHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self._spans: dict[UUID, Span] = {}
+            self._parent_context = parent_context
+            self._model = options.model
+            self._backend = _anthropic_backend()
+            self._main_name = main_name
+
+        async def on_chat_model_start(
+            self,
+            serialized: dict[str, Any],
+            messages: list[list[Any]],
+            *,
+            run_id: UUID,
+            parent_run_id: UUID | None = None,
+            tags: list[str] | None = None,
+            metadata: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            del serialized, messages, parent_run_id, kwargs
+            tags = tags or []
+            metadata = metadata or {}
+            if (
+                metadata.get("lc_agent_name") != self._main_name
+                or "nostream" in tags
+                or metadata.get("lc_source") == "summarization"
+            ):
+                return
+
+            provider = {
+                "direct": "anthropic",
+                "bedrock": "aws.bedrock",
+                "vertex": "gcp.vertex_ai",
+            }[self._backend]
+            self._spans[run_id] = start_generation_span(
+                "chat",
+                self._model,
+                provider,
+                parent_context=self._parent_context,
+            )
+
+        async def on_llm_end(
+            self,
+            response: Any,
+            *,
+            run_id: UUID,
+            **kwargs: Any,
+        ) -> None:
+            del kwargs
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            try:
+                _record_generation_result(span, response)
+            finally:
+                span.end()
+
+        async def on_llm_error(
+            self,
+            error: BaseException,
+            *,
+            run_id: UUID,
+            **kwargs: Any,
+        ) -> None:
+            from langchain_core.outputs import LLMResult
+
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            response = kwargs.get("response")
+            try:
+                if isinstance(response, LLMResult):
+                    _record_generation_result(span, response, partial=True)
+            finally:
+                try:
+                    span.set_attribute("error.type", type(error).__name__)
+                    span.set_status(StatusCode.ERROR)
+                finally:
+                    span.end()
+
+        def close_open(self, error_type: str) -> None:
+            while self._spans:
+                _run_id, span = self._spans.popitem()
+                span.set_attribute("error.type", error_type)
+                span.set_status(StatusCode.ERROR)
+                span.end()
+
+    return GenerationCallback()
+
+
 async def _shape_structured_output(
     model: str,
     schema: Any,
     system_prompt: str,
     prompt: str,
     agent_text: str,
+    generation_callback: Any,
 ) -> tuple[Any, int, int]:
     """Shape pass: tool-free structured binding on a model without thinking."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -259,8 +511,15 @@ async def _shape_structured_output(
         ),
     ]
     try:
-        result = await structured.ainvoke(shape_messages)
+        result = await structured.ainvoke(
+            shape_messages,
+            config={"callbacks": [generation_callback]},
+        )
+    except BaseException as exc:
+        generation_callback.close_open(type(exc).__name__)
+        raise
     finally:
+        generation_callback.close_open("generation_interrupted")
         await _close_model_clients(format_model)
     if isinstance(result, dict) and "parsed" in result:
         parsed = result["parsed"]
@@ -328,6 +587,8 @@ class DeepAgentsProvider(AgentProvider):
         return "deepagents"
 
     async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+        parent_context = otel_context.get_current()
+
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
 
@@ -424,6 +685,11 @@ class DeepAgentsProvider(AgentProvider):
         agent_kwargs["middleware"] = [inspection_middleware, summarization_middleware]
         subagent_spec["middleware"] = [inspection_middleware, summarization_middleware]
         agent_kwargs["subagents"] = [subagent_spec]
+        generation_callback = _create_generation_callback(
+            options,
+            parent_context,
+            main_name=agent_kwargs.get("name"),
+        )
 
         if has_skills(options.cwd):
             agent_kwargs["skills"] = [options.cwd]
@@ -471,6 +737,7 @@ class DeepAgentsProvider(AgentProvider):
             "configurable": {"thread_id": thread_id},
             "recursion_limit": options.max_turns,
         }
+        stream_config["callbacks"] = [generation_callback]
         result_text = ""
         pending_tool_results: list[tuple[str, str, str, Any, ToolResultEvent]] = []
         total_input_tokens = 0
@@ -559,6 +826,7 @@ class DeepAgentsProvider(AgentProvider):
                     tool_result_event = ToolResultEvent(
                         output=stringify(msg.content),
                         call_id=call_id,
+                        error_type=("tool_error" if result_type == "error" else None),
                     )
                     if not options.tool_output_inspection_enabled:
                         if not inspection_middleware.is_passed(
@@ -575,7 +843,12 @@ class DeepAgentsProvider(AgentProvider):
                         )
             for event in flush_pending_tool_calls():
                 yield event
+        except BaseException as exc:
+            if not isinstance(exc, GeneratorExit):
+                generation_callback.close_open(type(exc).__name__)
+            raise
         finally:
+            generation_callback.close_open("generation_interrupted")
             await _close_model_clients(chat_model)
             if classifier_model is not None:
                 await _close_model_clients(classifier_model)
@@ -587,6 +860,7 @@ class DeepAgentsProvider(AgentProvider):
                 options.system_prompt,
                 options.prompt,
                 result_text,
+                generation_callback,
             )
             result_text = stringify(structured)
             total_input_tokens += in_tok

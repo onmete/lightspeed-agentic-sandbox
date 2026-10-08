@@ -50,6 +50,8 @@ def _mock_deepagents_modules(
     *,
     mcp_client_cls: MagicMock | None = None,
 ) -> dict[str, Any]:
+    import langchain_core.callbacks
+
     mock_tool_strategy = MagicMock(side_effect=lambda schema, **_kw: schema)
     mock_provider_strategy = MagicMock(side_effect=lambda schema, **_kw: schema)
     mock_structured_output = MagicMock(
@@ -73,6 +75,7 @@ def _mock_deepagents_modules(
         "langchain": mock_langchain,
         "langchain.agents": mock_agents,
         "langchain.agents.structured_output": mock_structured_output,
+        "langchain_core.callbacks": langchain_core.callbacks,
         "langchain_anthropic": MagicMock(),
         "langchain_core": MagicMock(),
         "langchain_core.messages": MagicMock(),
@@ -395,7 +398,7 @@ async def test_shaping_prompt_requests_native_json_types_once(parsed: Any) -> No
         patch.object(mod, "_close_model_clients", new_callable=AsyncMock),
     ):
         result, _, _ = await mod._shape_structured_output(
-            "claude-sonnet-5", schema_model, "sys", "ask", "agent report"
+            "claude-sonnet-5", schema_model, "sys", "ask", "agent report", Mock()
         )
 
     assert result == parsed
@@ -618,6 +621,7 @@ class TestEventMapping:
     ) -> None:
         from langchain.agents.middleware import ModelRequest
         from langchain_core.messages import ToolMessage
+        from opentelemetry.trace import StatusCode
 
         from lightspeed_agentic.audit import AuditLogger
 
@@ -715,6 +719,7 @@ class TestEventMapping:
         assert [event.name for event in tool_call_events] == tool_names
         assert [event.call_id for event in tool_call_events] == call_ids
         assert [event.output for event in tool_result_events] == raw_results
+        assert [event.error_type for event in tool_result_events] == [None, None, "tool_error"]
         assert [event.call_id for event in tool_result_events] == call_ids
         event_types = [event.type for event in events]
         assert event_types[:6] == ["tool_call"] * 3 + ["tool_result"] * 3
@@ -737,6 +742,13 @@ class TestEventMapping:
         assert [dict(span.attributes)["gen_ai.tool.call.id"] for span in spans] == call_ids
         assert [json.loads(dict(span.attributes)["gen_ai.tool.call.result"]) for span in spans] == [
             {"content": result} for result in raw_results
+        ]
+        tool_attrs = [dict(span.attributes) for span in spans]
+        assert [attrs.get("error.type") for attrs in tool_attrs] == [None, None, "tool_error"]
+        assert [span.status.status_code for span in spans] == [
+            StatusCode.OK,
+            StatusCode.OK,
+            StatusCode.ERROR,
         ]
 
     @pytest.mark.parametrize("has_terminal_marker", [True, False])
@@ -1534,6 +1546,10 @@ async def test_provider_emits_complete_result_only_after_model_boundary_passes(
         name="execute",
         tool_call_id="accepted-call",
     )
+    tool_call_message = AIMessage(
+        content="",
+        tool_calls=[{"name": "execute", "args": {}, "id": "accepted-call", "type": "tool_call"}],
+    )
     mock_ai = MagicMock()
     mock_ai.type = "ai"
     mock_ai.content = "done"
@@ -1544,6 +1560,7 @@ async def test_provider_emits_complete_result_only_after_model_boundary_passes(
     async def mock_astream(
         *_args: Any, **_kwargs: Any
     ) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
+        yield tool_call_message, {"langgraph_node": "agent"}
         yield tool_message, {"langgraph_node": "tools"}
         middleware = mock_create.call_args.kwargs["middleware"][0]
         await middleware.awrap_model_call(
@@ -1582,6 +1599,19 @@ async def test_provider_emits_complete_result_only_after_model_boundary_passes(
 
     tool_result = next(event for event in events if isinstance(event, ToolResultEvent))
     assert tool_result.output == long_output
+    from lightspeed_agentic.audit import AuditLogger
+
+    audit = AuditLogger(phase="execution", model="test-model", provider="deepagents")
+    for event in events:
+        audit.process_event(event)
+    audit.complete(input_tokens=0, output_tokens=0)
+    tool_span = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "execute_tool execute"
+    )
+    tool_attrs = dict(tool_span.attributes)
+    assert tool_attrs["gen_ai.tool.call.id"] == "accepted-call"
+    assert json.loads(tool_attrs["gen_ai.tool.call.result"]) == {"content": long_output}
+    assert tool_span.status.status_code.name == "OK"
     inspection_spans = [
         span for span in span_exporter.get_finished_spans() if span.name == "tool_result.inspection"
     ]
@@ -1873,3 +1903,581 @@ async def test_parent_inspects_task_command_report_before_its_next_model_call() 
 
     assert observed == [("task", "result", "malicious subagent report")]
     assert model.i == 2
+
+
+@pytest.mark.asyncio
+async def test_generation_spans_export_main_subagent_and_raw_shape(
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatResult
+    from opentelemetry.trace import SpanKind
+
+    from lightspeed_agentic.providers import deepagents as mod
+    from lightspeed_agentic.run_agent import run_agent_query
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    class GenerationModel(FakeMessagesListChatModel):
+        def bind_tools(self, _tools: Any, **_kwargs: Any) -> GenerationModel:
+            return self
+
+        def _generate(
+            self,
+            messages: list[Any],
+            stop: list[str] | None = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ) -> ChatResult:
+            result = super()._generate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            response = result.generations[0].message
+            if any(
+                call.get("name") == "OutputModel" for call in getattr(response, "tool_calls", [])
+            ):
+                return ChatResult(
+                    generations=result.generations,
+                    llm_output={
+                        "model": "shape-observed-model",
+                        "id": "shape-response-id",
+                        "stop_reason": "end_turn",
+                    },
+                )
+            return result
+
+    model = GenerationModel(
+        responses=[
+            AIMessage(
+                content_blocks=[
+                    {"type": "reasoning", "reasoning": "think-first"},
+                    {"type": "text", "text": "say-second"},
+                    {
+                        "type": "tool_call",
+                        "id": "task-call",
+                        "name": "task",
+                        "args": {
+                            "description": "Inspect the deployment status",
+                            "subagent_type": "general-purpose",
+                        },
+                    },
+                ],
+                response_metadata={
+                    "output_version": "v1",
+                    "model": "observed-backend-model",
+                    "id": "response-task",
+                    "stop_reason": "tool_use",
+                },
+                usage_metadata={
+                    "input_tokens": 0,
+                    "output_tokens": 4,
+                    "total_tokens": 4,
+                    "output_token_details": {"reasoning": 0},
+                },
+            ),
+            AIMessage(
+                content_blocks=[{"type": "text", "text": "child report"}],
+                response_metadata={"output_version": "v1"},
+            ),
+            AIMessage(
+                content_blocks=[{"type": "text", "text": "main final answer"}],
+                response_metadata={"output_version": "v1"},
+            ),
+            AIMessage(
+                content_blocks=[
+                    {
+                        "type": "tool_call",
+                        "id": "shape-call",
+                        "name": "OutputModel",
+                        "args": {"status": "parsed"},
+                    }
+                ],
+                response_metadata={"output_version": "v1"},
+                usage_metadata={
+                    "input_tokens": 2,
+                    "output_tokens": 0,
+                    "total_tokens": 2,
+                },
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(mod, "_resolve_model", lambda *_args, **_kwargs: model)
+
+    result = await run_agent_query(
+        mod.DeepAgentsProvider(),
+        prompt="Summarize the deployment status using a subagent.",
+        system_prompt="Follow instructions.",
+        output_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+        },
+        context=None,
+        skills_dir=str(tmp_path),
+        model="claude-trace-test",
+        max_turns=20,
+        timeout_seconds=30,
+        tool_output_inspection_enabled=False,
+        audit_enabled=False,
+        capture_content=False,
+        agenticrun_uid="run-trace-test",
+        step="analysis",
+    )
+
+    spans = span_exporter.get_finished_spans()
+    invocation = next(span for span in spans if span.name == "invoke_agent")
+    generations = [span for span in spans if span.name == "chat claude-trace-test"]
+    assert len(generations) == 3
+    assert result.output["status"] == "parsed"
+    assert all(span.kind is SpanKind.CLIENT for span in generations)
+    assert all(
+        span.parent is not None and span.parent.span_id == invocation.context.span_id
+        for span in generations
+    )
+    assert all(
+        span.attributes["agenticrun.uid"] == "run-trace-test"
+        and span.attributes["agenticrun.phase"] == "analysis"
+        and span.attributes["gen_ai.operation.name"] == "chat"
+        and span.attributes["gen_ai.provider.name"] == "anthropic"
+        and span.attributes["gen_ai.request.model"] == "claude-trace-test"
+        for span in generations
+    )
+
+    def output_parts(span: Any) -> list[dict[str, Any]]:
+        return json.loads(span.attributes["gen_ai.output.messages"])[0]["parts"]
+
+    task_generation = next(
+        span
+        for span in generations
+        if any(part.get("id") == "task-call" for part in output_parts(span))
+    )
+    assert output_parts(task_generation) == [
+        {"type": "reasoning", "content": "think-first"},
+        {"type": "text", "content": "say-second"},
+        {
+            "type": "tool_call",
+            "id": "task-call",
+            "name": "task",
+            "arguments": {
+                "description": "Inspect the deployment status",
+                "subagent_type": "general-purpose",
+            },
+        },
+    ]
+    task_attrs = dict(task_generation.attributes)
+    assert task_attrs["gen_ai.response.model"] == "observed-backend-model"
+    assert task_attrs["gen_ai.response.id"] == "response-task"
+    assert list(task_attrs["gen_ai.response.finish_reasons"]) == ["tool_use"]
+    assert task_attrs["gen_ai.usage.input_tokens"] == 0
+    assert task_attrs["gen_ai.usage.output_tokens"] == 4
+    assert task_attrs["gen_ai.usage.reasoning.output_tokens"] == 0
+
+    final_generation = next(
+        span
+        for span in generations
+        if output_parts(span) == [{"type": "text", "content": "main final answer"}]
+    )
+    assert output_parts(final_generation) == [{"type": "text", "content": "main final answer"}]
+    shape_generation = next(
+        span
+        for span in generations
+        if any(part.get("id") == "shape-call" for part in output_parts(span))
+    )
+    assert output_parts(shape_generation) == [
+        {
+            "type": "tool_call",
+            "id": "shape-call",
+            "name": "OutputModel",
+            "arguments": {"status": "parsed"},
+        }
+    ]
+    shape_attrs = dict(shape_generation.attributes)
+    assert shape_attrs["gen_ai.response.model"] == "shape-observed-model"
+    assert shape_attrs["gen_ai.response.id"] == "shape-response-id"
+    assert list(shape_attrs["gen_ai.response.finish_reasons"]) == ["end_turn"]
+    terminal = json.loads(invocation.attributes["gen_ai.output.messages"])
+    terminal_text = terminal[0]["parts"][0]["content"]
+    assert json.loads(terminal_text) == {"status": "parsed"}
+    assert terminal[0]["parts"] != output_parts(shape_generation)
+
+
+@pytest.mark.asyncio
+async def test_generation_callback_filters_and_closes_open_spans_once(
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import uuid4
+
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind, StatusCode
+
+    from lightspeed_agentic.providers.deepagents import _create_generation_callback
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    parent = trace.get_tracer("test").start_span(
+        "invoke_agent",
+        kind=SpanKind.INTERNAL,
+        attributes={"agenticrun.uid": "parent-uid", "agenticrun.phase": "analysis"},
+    )
+    parent_context = trace.set_span_in_context(parent)
+    callback = _create_generation_callback(_base_options(), parent_context, main_name=None)
+    model = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(content=""),
+            AIMessage(content="nested"),
+            AIMessage(content="summary"),
+            AIMessage(content="classifier"),
+        ]
+    )
+
+    await model.ainvoke("main", config={"callbacks": [callback]})
+    await model.ainvoke(
+        "nested",
+        config={"callbacks": [callback], "metadata": {"lc_agent_name": "general-purpose"}},
+    )
+    await model.ainvoke(
+        "summary",
+        config={"callbacks": [callback], "metadata": {"lc_source": "summarization"}},
+    )
+    await model.ainvoke(
+        "classifier",
+        config={"callbacks": [callback], "tags": ["nostream"]},
+    )
+
+    spans = [
+        span for span in span_exporter.get_finished_spans() if span.name == "chat claude-sonnet-4-6"
+    ]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes)
+    assert json.loads(attrs["gen_ai.output.messages"]) == [
+        {"role": "assistant", "parts": [{"type": "text", "content": ""}]}
+    ]
+    for attribute in (
+        "gen_ai.response.model",
+        "gen_ai.response.id",
+        "gen_ai.response.finish_reasons",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.reasoning.output_tokens",
+    ):
+        assert attribute not in attrs
+    assert spans[0].parent is not None
+    assert spans[0].parent.span_id == parent.context.span_id
+    assert attrs["agenticrun.uid"] == "parent-uid"
+    assert attrs["agenticrun.phase"] == "analysis"
+
+    await callback.on_chat_model_start({}, [], run_id=uuid4(), tags=None, metadata=None)
+    callback.close_open("generation_interrupted")
+    finished_count = len(span_exporter.get_finished_spans())
+    callback.close_open("later_error")
+    assert len(span_exporter.get_finished_spans()) == finished_count
+    interrupted = [
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "chat claude-sonnet-4-6" and span.attributes.get("error.type")
+    ]
+    assert len(interrupted) == 1
+    assert interrupted[0].attributes["error.type"] == "generation_interrupted"
+    assert interrupted[0].status.status_code == StatusCode.ERROR
+    assert "gen_ai.output.messages" not in interrupted[0].attributes
+    parent.end()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [("error", "RuntimeError"), ("cancel", "CancelledError")],
+)
+@pytest.mark.asyncio
+async def test_generation_callback_exports_sdk_partial_result_on_failure(
+    failure: str,
+    expected_error: str,
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    from langchain_core.outputs import ChatGenerationChunk
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind, StatusCode
+
+    from lightspeed_agentic.providers.deepagents import _create_generation_callback
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    parent = trace.get_tracer("test").start_span("invoke_agent", kind=SpanKind.INTERNAL)
+    callback = _create_generation_callback(
+        _base_options(),
+        trace.set_span_in_context(parent),
+        main_name=None,
+    )
+    waiting = asyncio.Event()
+
+    class PartialModel(FakeMessagesListChatModel):
+        async def _astream(
+            self,
+            messages: list[Any],
+            stop: list[str] | None = None,
+            **kwargs: Any,
+        ) -> AsyncIterator[ChatGenerationChunk]:
+            del messages, stop, kwargs
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=[
+                        {"type": "thinking", "thinking": "partial-reasoning"},
+                        {"type": "text", "text": "partial-text"},
+                        {
+                            "type": "tool_use",
+                            "id": "partial-call",
+                            "name": "execute",
+                            "input": {},
+                        },
+                    ],
+                    tool_call_chunks=[
+                        {
+                            "id": "partial-call",
+                            "name": "execute",
+                            "args": '{"command":',
+                            "index": 0,
+                        }
+                    ],
+                    response_metadata={
+                        "model_provider": "anthropic",
+                        "model_name": "observed-partial-model",
+                        "id": "partial-response",
+                    },
+                    usage_metadata={
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "output_token_details": {"reasoning": 0},
+                    },
+                )
+            )
+            if failure == "cancel":
+                waiting.set()
+                await asyncio.Event().wait()
+            raise RuntimeError("partial generation failed")
+
+    model = PartialModel(
+        responses=[AIMessage(content="unused")],
+        output_version="v0",
+    )
+
+    async def consume() -> None:
+        async for _message in model.astream("request", config={"callbacks": [callback]}):
+            pass
+
+    task = asyncio.create_task(consume())
+    if failure == "cancel":
+        waiter = asyncio.create_task(waiting.wait())
+        done, _pending = await asyncio.wait(
+            {task, waiter},
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await task
+            pytest.fail("partial model completed before the cancellation signal")
+        if waiter not in done:
+            task.cancel()
+            waiter.cancel()
+            await asyncio.gather(task, waiter, return_exceptions=True)
+            pytest.fail("partial model did not reach the cancellation point")
+        await waiter
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(RuntimeError, match="partial generation failed"):
+            await task
+
+    parent.end()
+    generation = next(
+        span for span in span_exporter.get_finished_spans() if span.name == "chat claude-sonnet-4-6"
+    )
+    attrs = dict(generation.attributes)
+    assert json.loads(attrs["gen_ai.output.messages"]) == [
+        {
+            "role": "assistant",
+            "parts": [
+                {"type": "reasoning", "content": "partial-reasoning"},
+                {"type": "text", "content": "partial-text"},
+                {
+                    "type": "tool_call_chunk",
+                    "id": "partial-call",
+                    "name": "execute",
+                    "args": '{"command":',
+                    "index": 0,
+                },
+            ],
+        }
+    ]
+    assert attrs["gen_ai.response.model"] == "observed-partial-model"
+    assert attrs["gen_ai.response.id"] == "partial-response"
+    assert attrs["gen_ai.usage.input_tokens"] == 0
+    assert attrs["gen_ai.usage.output_tokens"] == 0
+    assert attrs["gen_ai.usage.reasoning.output_tokens"] == 0
+    assert attrs["error.type"] == expected_error
+    assert generation.status.status_code == StatusCode.ERROR
+    assert (
+        len(
+            [
+                span
+                for span in span_exporter.get_finished_spans()
+                if span.name == "chat claude-sonnet-4-6"
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("reject_result", [False, True], ids=["passes", "rejects"])
+@pytest.mark.asyncio
+async def test_inspection_gate_exports_only_admitted_results(
+    reject_result: bool,
+    span_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import deepagents
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import tool
+
+    from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
+    from lightspeed_agentic.providers import deepagents as mod
+    from lightspeed_agentic.run_agent import run_agent_query
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+
+    class GenerationModel(FakeMessagesListChatModel):
+        def bind_tools(self, _tools: Any, **_kwargs: Any) -> GenerationModel:
+            return self
+
+    approved_call = {
+        "type": "tool_call",
+        "id": "approved-call",
+        "name": "approved_lookup",
+        "args": {},
+    }
+    rejected_call = {
+        "type": "tool_call",
+        "id": "rejected-call",
+        "name": "rejected_lookup",
+        "args": {},
+    }
+    tool_calls = [approved_call]
+    if reject_result:
+        tool_calls.append(rejected_call)
+    responses = [
+        AIMessage(
+            content_blocks=tool_calls,
+            response_metadata={"output_version": "v1"},
+        )
+    ]
+    if not reject_result:
+        responses.append(AIMessage(content="Approved result released"))
+    model = GenerationModel(responses=responses)
+
+    @tool("approved_lookup")
+    def approved_lookup() -> str:
+        """Return a result that passes the test inspector."""
+        return "APPROVED-SIBLING-SECRET"
+
+    @tool("rejected_lookup")
+    def rejected_lookup() -> str:
+        """Return a result that the test inspector rejects."""
+        return "REJECTED-RESULT-SECRET"
+
+    create_agent = deepagents.create_deep_agent
+
+    def create_agent_with_tools(**kwargs: Any) -> Any:
+        kwargs["tools"] = [approved_lookup, rejected_lookup]
+        return create_agent(**kwargs)
+
+    class ClassifierModel:
+        profile: ClassVar[dict[str, int] | None] = None
+
+    async def inspect_result(
+        _client: Any,
+        *,
+        value: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        if reject_result and value == "REJECTED-RESULT-SECRET":
+            return SimpleNamespace(passed=False)
+        return SimpleNamespace(passed=True)
+
+    monkeypatch.setattr(deepagents, "create_deep_agent", create_agent_with_tools)
+    monkeypatch.setattr(mod, "_resolve_model", Mock(side_effect=[model, ClassifierModel()]))
+    with (
+        patch(
+            "lightspeed_agentic.inspection.client.LangChainClassifierClient",
+            return_value=Mock(),
+        ),
+        patch(
+            "lightspeed_agentic.inspection.inspector.inspect_tool_result",
+            new=inspect_result,
+        ),
+    ):
+        query = run_agent_query(
+            mod.DeepAgentsProvider(),
+            prompt="Inspect the two local lookup results.",
+            system_prompt="Follow instructions.",
+            output_schema=None,
+            context=None,
+            skills_dir=str(tmp_path),
+            model="claude-inspection-test",
+            max_turns=20,
+            timeout_seconds=30,
+            tool_output_inspection_enabled=True,
+            audit_enabled=True,
+            capture_content=False,
+        )
+        if reject_result:
+            with pytest.raises(ToolResultSafetyInspectionFailed):
+                await query
+        else:
+            result = await query
+            assert result.output["summary"] == "Approved result released"
+
+    spans = span_exporter.get_finished_spans()
+    tool_spans = [
+        span
+        for span in spans
+        if span.name in ("execute_tool approved_lookup", "execute_tool rejected_lookup")
+    ]
+    if reject_result:
+        assert len(tool_spans) == 2
+        assert {span.attributes["gen_ai.tool.call.id"] for span in tool_spans} == {
+            "approved-call",
+            "rejected-call",
+        }
+        assert all("gen_ai.tool.call.result" not in span.attributes for span in tool_spans)
+        exported_attributes = str([dict(span.attributes) for span in spans])
+        assert "APPROVED-SIBLING-SECRET" not in exported_attributes
+        assert "REJECTED-RESULT-SECRET" not in exported_attributes
+    else:
+        assert len(tool_spans) == 1
+        tool_attrs = dict(tool_spans[0].attributes)
+        assert tool_attrs["gen_ai.tool.call.id"] == "approved-call"
+        assert json.loads(tool_attrs["gen_ai.tool.call.result"]) == {
+            "content": "APPROVED-SIBLING-SECRET"
+        }
