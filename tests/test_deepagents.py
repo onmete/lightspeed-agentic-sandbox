@@ -136,6 +136,169 @@ def _deepagents_provider(
             yield mod.DeepAgentsProvider()
 
 
+def _real_deepagents_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    model: Any,
+) -> Any:
+    pytest.importorskip("deepagents")
+    import lightspeed_agentic.providers.deepagents as provider_module
+
+    monkeypatch.setattr(
+        provider_module,
+        "_resolve_model",
+        lambda *_args, **_kwargs: model,
+    )
+    return provider_module.DeepAgentsProvider()
+
+
+def _capturing_fake_chat_model(responses: list[Any]) -> tuple[Any, list[list[Any]]]:
+    fake_models = pytest.importorskip("langchain_core.language_models.fake_chat_models")
+    model_inputs: list[list[Any]] = []
+
+    class CapturingToolCallingModel(fake_models.FakeMessagesListChatModel):
+        def bind_tools(
+            self,
+            _tools: Any,
+            **_kwargs: Any,
+        ) -> CapturingToolCallingModel:
+            return self
+
+        def _generate(
+            self,
+            messages: list[Any],
+            stop: list[str] | None = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            model_inputs.append(messages)
+            return super()._generate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+
+    return CapturingToolCallingModel(responses=responses), model_inputs
+
+
+def _read_file_call(call_id: str, file_path: str) -> dict[str, Any]:
+    return {
+        "name": "read_file",
+        "args": {"file_path": file_path},
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Scenario: A mounted skill is available to the agent.
+
+    Given a skills root containing a skill and its reference file
+    When the agent runs and reads both files using virtual paths
+    Then the model receives the skill's name and description
+    And the tool results contain the instructions and reference content.
+    """
+    ai_message = pytest.importorskip("langchain_core.messages").AIMessage
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+
+    # Given a skills root containing a skill and its reference file.
+    skill_name = "deepagents-regression-skill"
+    skill_description = "Read the regression reference before answering."
+    skill_dir = tmp_path / skill_name
+    reference_dir = skill_dir / "references"
+    reference_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill_name}\ndescription: {skill_description}\n---\n"
+        "SKILL_MD_READ_MARKER\n"
+        "Consult references/guide.md for the required reference.\n"
+    )
+    (reference_dir / "guide.md").write_text("REFERENCE_READ_MARKER\n")
+
+    # And an offline model that requests the instructions and reference.
+    model, model_inputs = _capturing_fake_chat_model(
+        [
+            ai_message(
+                content="",
+                tool_calls=[
+                    _read_file_call(
+                        "read-skill-md",
+                        f"/{skill_name}/SKILL.md",
+                    )
+                ],
+            ),
+            ai_message(
+                content="",
+                tool_calls=[
+                    _read_file_call(
+                        "read-reference",
+                        f"/{skill_name}/references/guide.md",
+                    )
+                ],
+            ),
+            ai_message(content="The skill and its reference were readable."),
+        ]
+    )
+    provider = _real_deepagents_provider(monkeypatch, model)
+
+    # When the agent runs against that physical skills root.
+    events = await _collect_events(
+        provider,
+        _base_options(cwd=str(tmp_path), tool_output_inspection_enabled=False),
+    )
+
+    # Then the model receives the discovered skill's name and description.
+    system_prompt = str(
+        next(message.content for message in model_inputs[0] if message.type == "system")
+    )
+    assert f"**{skill_name}**: {skill_description}" in system_prompt
+
+    # And both files are readable through the backend's virtual paths.
+    tool_results = {
+        event.call_id: event.output for event in events if isinstance(event, ToolResultEvent)
+    }
+    assert "SKILL_MD_READ_MARKER" in tool_results["read-skill-md"]
+    assert "REFERENCE_READ_MARKER" in tool_results["read-reference"]
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_advertise_skills_when_only_an_empty_agents_directory_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Scenario: An empty .agents directory is not a skill.
+
+    Given a skills root containing only an empty .agents directory
+    When the agent runs
+    Then the model receives no skills section in its system prompt.
+    """
+    ai_message = pytest.importorskip("langchain_core.messages").AIMessage
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    # Given a skills root containing only an empty .agents directory.
+    (tmp_path / ".agents").mkdir()
+    model, model_inputs = _capturing_fake_chat_model([ai_message(content="No skill is enabled.")])
+    provider = _real_deepagents_provider(monkeypatch, model)
+
+    # When the agent runs against that skills root.
+    await _collect_events(
+        provider,
+        _base_options(cwd=str(tmp_path), tool_output_inspection_enabled=False),
+    )
+
+    # Then the model receives no skills section in its system prompt.
+    system_prompt = str(
+        next(message.content for message in model_inputs[0] if message.type == "system")
+    )
+    assert "## Skills System" not in system_prompt
+
+
 @pytest.mark.asyncio
 async def test_close_model_clients_closes_only_initialized_clients() -> None:
     from lightspeed_agentic.providers.deepagents import _close_model_clients
@@ -1211,73 +1374,6 @@ class TestEventMapping:
         assert create_kwargs["tools"] == [allowed_tool]
         mock_mcp_client.get_tools.assert_awaited_once_with(server_name="test-server")
         assert callable(server_config["test-server"]["httpx_client_factory"])
-
-
-class TestSkillsGating:
-    """Test that skills= is only passed when SKILL.md files exist under cwd."""
-
-    @pytest.mark.asyncio
-    async def test_skills_passed_when_skill_md_exists(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """skills= should be set when a SKILL.md exists under cwd."""
-        monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
-        monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
-
-        (tmp_path / "my-skill" / "SKILL.md").parent.mkdir(parents=True)
-        (tmp_path / "my-skill" / "SKILL.md").write_text("# skill")
-
-        mock_ai = MagicMock()
-        mock_ai.type = "ai"
-        mock_ai.content = "ok"
-        mock_ai.tool_calls = []
-        mock_ai.usage_metadata = None
-        mock_ai.content_blocks = []
-
-        async def mock_astream(
-            *_args: Any, **_kwargs: Any
-        ) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
-            yield (mock_ai, {"langgraph_node": "agent"})
-
-        mock_agent = MagicMock()
-        mock_agent.astream = mock_astream
-        mock_create = MagicMock(return_value=mock_agent)
-        with _deepagents_provider(mock_create, MagicMock()) as provider:
-            await _collect_events(provider, _base_options(cwd=str(tmp_path)))
-
-        create_kwargs = mock_create.call_args[1]
-        assert create_kwargs["skills"] == [str(tmp_path)]
-
-    @pytest.mark.asyncio
-    async def test_skills_omitted_when_no_skill_md(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """skills= must not be passed when no SKILL.md exists under cwd."""
-        monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
-        monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
-
-        assert not (tmp_path / "SKILL.md").exists()
-
-        mock_ai = MagicMock()
-        mock_ai.type = "ai"
-        mock_ai.content = "ok"
-        mock_ai.tool_calls = []
-        mock_ai.usage_metadata = None
-        mock_ai.content_blocks = []
-
-        async def mock_astream(
-            *_args: Any, **_kwargs: Any
-        ) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
-            yield (mock_ai, {"langgraph_node": "agent"})
-
-        mock_agent = MagicMock()
-        mock_agent.astream = mock_astream
-        mock_create = MagicMock(return_value=mock_agent)
-        with _deepagents_provider(mock_create, MagicMock()) as provider:
-            await _collect_events(provider, _base_options(cwd=str(tmp_path)))
-
-        create_kwargs = mock_create.call_args[1]
-        assert "skills" not in create_kwargs
 
 
 @pytest.mark.asyncio
