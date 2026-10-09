@@ -111,7 +111,11 @@ class AuditLogger:
                     context=self._parent_context,
                     attributes=attrs,
                 )
-                _set_tool_payload(span, "gen_ai.tool.call.arguments", event.input)
+                _set_tool_payload(
+                    span,
+                    "gen_ai.tool.call.arguments",
+                    event.trace_input if event.trace_input is not None else event.input,
+                )
                 self._tool_spans[call_key] = (span, time.monotonic())
             case "tool_result":
                 call_id = event.call_id
@@ -132,7 +136,11 @@ class AuditLogger:
                         time.monotonic() - start
                     )
                     _set_tool_payload(tool_span, "gen_ai.tool.call.result", event.output)
-                    tool_span.set_status(StatusCode.OK)
+                    if event.error_type is not None:
+                        tool_span.set_attribute("error.type", event.error_type)
+                        tool_span.set_status(StatusCode.ERROR)
+                    else:
+                        tool_span.set_status(StatusCode.OK)
                     tool_span.end()
             case "result":
                 self._flush_buffers()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import os
 import tempfile
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
+    from opentelemetry.context import Context
 
     class AgentOutputSchemaBase:
         """Type-checker stub for the optional openai-agents base class."""
@@ -231,6 +233,199 @@ async def _build_mcp_function_tools(servers: list[Any]) -> list[Any]:
     return function_tools
 
 
+def _model_field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return number
+
+
+def _decode_tool_arguments(arguments: Any) -> Any:
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        return json.loads(
+            arguments,
+            parse_float=_finite_json_float,
+            parse_constant=_finite_json_float,
+        )
+    except (ValueError, RecursionError):
+        return arguments
+
+
+def _generation_output_messages(response: Any) -> list[dict[str, Any]] | None:
+    output = _model_field(response, "output")
+    if output is None:
+        return None
+
+    parts: list[dict[str, Any]] = []
+    for item in output:
+        item_type = _model_field(item, "type")
+        if item_type == "message":
+            for content in _model_field(item, "content") or []:
+                content_type = _model_field(content, "type")
+                if content_type == "output_text":
+                    text = _model_field(content, "text")
+                    if isinstance(text, str):
+                        parts.append({"type": "text", "content": text})
+                elif content_type == "refusal":
+                    refusal = _model_field(content, "refusal")
+                    if isinstance(refusal, str):
+                        parts.append({"type": "refusal", "content": refusal})
+        elif item_type == "reasoning":
+            for field, part_type in (
+                ("content", "reasoning_text"),
+                ("summary", "summary_text"),
+            ):
+                for reasoning in _model_field(item, field) or []:
+                    text = _model_field(reasoning, "text")
+                    if _model_field(reasoning, "type") == part_type and isinstance(text, str):
+                        parts.append({"type": "reasoning", "content": text})
+        elif item_type in {"function_call", "custom_tool_call"}:
+            name = _model_field(item, "name")
+            if name is None:
+                continue
+            part: dict[str, Any] = {"type": "tool_call", "name": name}
+            call_id = _model_field(item, "call_id")
+            if call_id:
+                part["id"] = call_id
+            if item_type == "function_call":
+                arguments = _model_field(item, "arguments")
+                if arguments is not None:
+                    part["arguments"] = _decode_tool_arguments(arguments)
+            else:
+                tool_input = _model_field(item, "input")
+                if tool_input is not None:
+                    part["arguments"] = tool_input
+            parts.append(part)
+
+    return [{"role": "assistant", "parts": parts}]
+
+
+def _generation_response_id(response: Any, api_type: str) -> str | None:
+    if api_type == "responses":
+        response_id = _model_field(response, "response_id")
+        return response_id if isinstance(response_id, str) and response_id else None
+
+    response_ids: set[str] = set()
+    for item in _model_field(response, "output") or []:
+        provider_data = _model_field(item, "provider_data")
+        response_id = _model_field(provider_data, "response_id")
+        if isinstance(response_id, str) and response_id:
+            response_ids.add(response_id)
+    return next(iter(response_ids)) if len(response_ids) == 1 else None
+
+
+def _record_generation_response(span: Any, response: Any, api_type: str) -> None:
+    from lightspeed_agentic.tracing import set_json_span_attribute
+
+    if not span.is_recording():
+        return
+
+    messages = _generation_output_messages(response)
+    if messages is not None:
+        set_json_span_attribute(span, "gen_ai.output.messages", messages)
+
+    response_id = _generation_response_id(response, api_type)
+    if response_id is not None:
+        span.set_attribute("gen_ai.response.id", response_id)
+
+    usage = _model_field(response, "usage")
+    if usage is not None and _model_field(usage, "requests", 0) > 0:
+        for attribute, field in (
+            ("gen_ai.usage.input_tokens", "input_tokens"),
+            ("gen_ai.usage.output_tokens", "output_tokens"),
+        ):
+            value = _model_field(usage, field)
+            if value is not None:
+                span.set_attribute(attribute, value)
+
+        output_details = _model_field(usage, "output_tokens_details")
+        reasoning_tokens = _model_field(output_details, "reasoning_tokens")
+        if reasoning_tokens:
+            span.set_attribute("gen_ai.usage.reasoning.output_tokens", reasoning_tokens)
+
+
+def _create_generation_hooks(
+    main_agent: Any,
+    options: ProviderQueryOptions,
+    parent_context: Context,
+    *,
+    api_type: str,
+) -> Any:
+    """Capture completed main-agent OpenAI model responses as GenAI spans."""
+    from agents import RunHooks
+    from opentelemetry.trace import StatusCode
+
+    from lightspeed_agentic.tracing import start_generation_span
+
+    class GenerationHooks(RunHooks[Any]):
+        def __init__(self) -> None:
+            self._active_span: Any = None
+            self._terminal = False
+
+        def _close_active(self, error_type: str) -> None:
+            span = self._active_span
+            self._active_span = None
+            if span is None:
+                return
+            if span.is_recording():
+                span.set_attribute("error.type", error_type)
+                span.set_status(StatusCode.ERROR)
+            span.end()
+
+        def close_open(self, error_type: str) -> None:
+            self._terminal = True
+            self._close_active(error_type)
+
+        async def on_llm_start(
+            self,
+            context: Any,
+            agent: Any,
+            system_prompt: str | None,
+            input_items: list[Any],
+        ) -> None:
+            del context, system_prompt, input_items
+            if self._terminal or agent is not main_agent:
+                return
+            self._close_active("generation_interrupted")
+            span = start_generation_span(
+                "chat",
+                options.model,
+                "openai",
+                parent_context=parent_context,
+            )
+            if span.is_recording():
+                span.set_attribute("openai.api.type", api_type)
+            self._active_span = span
+
+        async def on_llm_end(
+            self,
+            context: Any,
+            agent: Any,
+            response: Any,
+        ) -> None:
+            del context
+            if self._terminal or agent is not main_agent:
+                return
+            span = self._active_span
+            self._active_span = None
+            if span is None:
+                return
+            try:
+                _record_generation_response(span, response, api_type)
+            finally:
+                span.end()
+
+    return GenerationHooks()
+
+
 class OpenAIProvider(AgentProvider):
     _client: Any = None
     _azure_credentials: dict[str, str] | None = None
@@ -370,6 +565,10 @@ class OpenAIProvider(AgentProvider):
         For vLLM/custom endpoints: Uses OpenAIChatCompletionsModel with manually
         implemented filesystem and MCP function tools (ChatCompletions compatible).
         """
+        from opentelemetry import context as otel_context
+
+        parent_context = otel_context.get_current()
+
         _ensure_openai_init()
 
         is_azure = os.environ.get("LIGHTSPEED_PROVIDER", "").strip().lower() == "azure"
@@ -523,6 +722,8 @@ class OpenAIProvider(AgentProvider):
                 mcp_manager = None
                 raise
 
+        generation_hooks: Any = None
+
         try:
             if not uses_responses_api and mcp_servers_for_agent and function_tools_list is not None:
                 function_tools_list.extend(await _build_mcp_function_tools(mcp_servers_for_agent))
@@ -552,6 +753,12 @@ class OpenAIProvider(AgentProvider):
                 )
 
             agent = SandboxAgent(**agent_kwargs)
+            generation_hooks = _create_generation_hooks(
+                agent,
+                options,
+                parent_context,
+                api_type="responses" if uses_responses_api else "chat_completions",
+            )
 
             run_config = RunConfig(
                 sandbox=SandboxRunConfig(
@@ -567,6 +774,7 @@ class OpenAIProvider(AgentProvider):
                 agent,
                 options.prompt,
                 max_turns=options.max_turns,
+                hooks=generation_hooks,
                 run_config=run_config,
             )
 
@@ -598,10 +806,28 @@ class OpenAIProvider(AgentProvider):
                             or ""
                         )
                         args = getattr(raw, "arguments", None) or ""
+                        raw_input = (
+                            raw.get("input")
+                            if isinstance(raw, dict)
+                            else getattr(raw, "input", None)
+                        )
+                        raw_arguments = (
+                            raw.get("arguments")
+                            if isinstance(raw, dict)
+                            else getattr(raw, "arguments", None)
+                        )
+                        trace_input = None
+                        if raw_input is not None:
+                            trace_input = stringify(raw_input)
+                        elif raw_arguments is not None and (
+                            isinstance(raw, dict) or isinstance(raw_arguments, dict)
+                        ):
+                            trace_input = stringify(raw_arguments)
                         yield ToolCallEvent(
                             name=name,
                             input=args,
                             call_id=getattr(event.item, "call_id", "") or "",
+                            trace_input=trace_input,
                         )
                     elif isinstance(event.item, ToolCallOutputItem):
                         full_output = stringify(event.item.output)
@@ -626,6 +852,12 @@ class OpenAIProvider(AgentProvider):
                 reasoning_tokens=reasoning,
                 response_model=resp_model,
             )
+        except BaseException as error:
+            if generation_hooks is not None:
+                generation_hooks.close_open(type(error).__name__)
+            raise
         finally:
+            if generation_hooks is not None:
+                generation_hooks.close_open("generation_interrupted")
             if mcp_manager:
                 await mcp_manager.__aexit__(None, None, None)

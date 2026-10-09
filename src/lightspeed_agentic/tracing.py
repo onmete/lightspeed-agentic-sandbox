@@ -52,7 +52,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
     SpanExportResult,
 )
-from opentelemetry.trace import NonRecordingSpan, Span, SpanContext, TraceFlags
+from opentelemetry.trace import NonRecordingSpan, Span, SpanContext, SpanKind, TraceFlags
 
 _DEFAULT_SERVICE_NAME = "lightspeed-agentic-sandbox"
 _TRACER_NAME = "lightspeed_agentic"
@@ -312,6 +312,28 @@ def shutdown_tracer() -> None:
 def get_tracer() -> trace.Tracer:
     """Get a tracer instance for creating spans."""
     return trace.get_tracer(_TRACER_NAME)
+
+
+def start_generation_span(
+    operation: str, model: str, provider: str, *, parent_context: Context
+) -> Span:
+    """Start a model generation without changing the active SDK/log context."""
+    attributes = {
+        "gen_ai.operation.name": operation,
+        "gen_ai.request.model": model,
+        "gen_ai.provider.name": provider,
+    }
+    parent = trace.get_current_span(parent_context)
+    parent_attributes = getattr(parent, "attributes", None) or {}
+    for key in (_ATTR_AGENTICRUN_UID, _ATTR_AGENTICRUN_PHASE):
+        if value := parent_attributes.get(key):
+            attributes[key] = value
+    return get_tracer().start_span(
+        f"{operation} {model}",
+        kind=SpanKind.CLIENT,
+        context=parent_context,
+        attributes=attributes,
+    )
 
 
 def set_json_span_attribute(span: Span, name: str, value: object) -> None:

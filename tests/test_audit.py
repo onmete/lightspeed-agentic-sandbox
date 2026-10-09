@@ -109,6 +109,43 @@ class TestToolSpanNaming:
         spans = span_exporter.get_finished_spans()
         assert spans[0].kind == trace.SpanKind.INTERNAL
 
+    @pytest.mark.parametrize("trace_input", ['{"patch":"雪\\n"}', ""])
+    def test_trace_arguments_do_not_change_developer_logs(
+        self, span_exporter, caplog, trace_input: str
+    ) -> None:
+        from lightspeed_agentic.logging import EventLogger
+
+        event = ToolCallEvent(
+            name="apply_patch", input="legacy input", call_id="patch-1", trace_input=trace_input
+        )
+        al = _make_logger()
+        al.process_event(event)
+        al.process_event(ToolResultEvent(output="done", call_id="patch-1"))
+        with caplog.at_level("INFO", logger="lightspeed_agentic"):
+            EventLogger("analysis").log(event)
+
+        attrs = span_exporter.get_finished_spans()[0].attributes
+        expected = json.loads(trace_input) if trace_input else {"content": ""}
+        assert json.loads(attrs["gen_ai.tool.call.arguments"]) == expected
+        assert caplog.messages == ["[provider:analysis] tool_use: apply_patch(legacy input)"]
+
+    @pytest.mark.parametrize("error_type", [None, "tool_error"])
+    def test_tool_error_requires_explicit_provider_evidence(
+        self, span_exporter, error_type: str | None
+    ) -> None:
+        al = _make_logger()
+        al.process_event(ToolCallEvent(name="lookup", input="{}", call_id="call-1"))
+        al.process_event(
+            ToolResultEvent(
+                output='{"error":"literal result"}', call_id="call-1", error_type=error_type
+            )
+        )
+
+        span = span_exporter.get_finished_spans()[0]
+        assert json.loads(span.attributes["gen_ai.tool.call.result"]) == {"error": "literal result"}
+        assert span.status.status_code == (StatusCode.ERROR if error_type else StatusCode.OK)
+        assert span.attributes.get("error.type") == error_type
+
 
 class TestToolPayloadBoundaries:
     @pytest.mark.parametrize(
