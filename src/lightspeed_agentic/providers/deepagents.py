@@ -620,6 +620,7 @@ class DeepAgentsProvider(AgentProvider):
         chat_model = _resolve_model(options.model, options.reasoning_config)
         backend = LocalShellBackend(
             root_dir=options.cwd,
+            virtual_mode=False,
             inherit_env=True,
             max_output_bytes=MAX_TOOL_RETURN_CHARS,
         )
@@ -692,8 +693,8 @@ class DeepAgentsProvider(AgentProvider):
         )
 
         if has_skills(options.cwd):
-            # SkillsMiddleware paths are virtual to this backend; "/" maps to root_dir.
-            agent_kwargs["skills"] = ["/"]
+            # Skill paths must be physical so file and shell tools share them.
+            agent_kwargs["skills"] = [options.cwd]
 
         schema_model: Any | None = None
         if options.output_schema:

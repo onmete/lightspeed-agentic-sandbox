@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,7 +156,11 @@ def _real_deepagents_provider(
     return provider_module.DeepAgentsProvider()
 
 
-def _capturing_fake_chat_model(responses: list[Any]) -> tuple[Any, list[list[Any]]]:
+def _capturing_fake_chat_model(
+    responses: list[Any],
+    *,
+    response_factory: Callable[[list[Any]], Any] | None = None,
+) -> tuple[Any, list[list[Any]]]:
     fake_models = pytest.importorskip("langchain_core.language_models.fake_chat_models")
     model_inputs: list[list[Any]] = []
 
@@ -174,6 +180,10 @@ def _capturing_fake_chat_model(responses: list[Any]) -> tuple[Any, list[list[Any
             **kwargs: Any,
         ) -> Any:
             model_inputs.append(messages)
+            if response_factory is not None:
+                from langchain_core.outputs import ChatGeneration, ChatResult
+
+                return ChatResult(generations=[ChatGeneration(message=response_factory(messages))])
             return super()._generate(
                 messages,
                 stop=stop,
@@ -201,7 +211,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
     """Scenario: A mounted skill is available to the agent.
 
     Given a skills root containing a skill and its reference file
-    When the agent runs and reads both files using virtual paths
+    When the agent runs and reads both files using physical paths
     Then the model receives the skill's name and description
     And the tool results contain the instructions and reference content.
     """
@@ -231,7 +241,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
                 tool_calls=[
                     _read_file_call(
                         "read-skill-md",
-                        f"/{skill_name}/SKILL.md",
+                        str(skill_dir / "SKILL.md"),
                     )
                 ],
             ),
@@ -240,7 +250,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
                 tool_calls=[
                     _read_file_call(
                         "read-reference",
-                        f"/{skill_name}/references/guide.md",
+                        str(reference_dir / "guide.md"),
                     )
                 ],
             ),
@@ -261,12 +271,102 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
     )
     assert f"**{skill_name}**: {skill_description}" in system_prompt
 
-    # And both files are readable through the backend's virtual paths.
+    # And both files are readable through the backend's physical paths.
     tool_results = {
         event.call_id: event.output for event in events if isinstance(event, ToolResultEvent)
     }
     assert "SKILL_MD_READ_MARKER" in tool_results["read-skill-md"]
     assert "REFERENCE_READ_MARKER" in tool_results["read-reference"]
+
+
+@pytest.mark.asyncio
+async def test_agent_executes_skill_script_from_the_advertised_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Scenario: A skill script runs through the path advertised by DeepAgents.
+
+    Given a skills root containing an executable check script
+    When the model reads the advertised SKILL.md and runs the script
+    Then the shell tool result contains the script's marker.
+    """
+    ai_message = pytest.importorskip("langchain_core.messages").AIMessage
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+
+    # Given a skills root containing an executable check script.
+    skill_name = "deepagents-shell-regression-skill"
+    skill_dir = tmp_path / skill_name
+    script_dir = skill_dir / "scripts"
+    script_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill_name}\ndescription: Run the shell regression check.\n---\n"
+        "SKILL_MD_READ_MARKER\n"
+    )
+    (script_dir / "check.sh").write_text("#!/bin/sh\nprintf 'SKILL_SCRIPT_EXECUTED_MARKER\\n'\n")
+
+    skill_md_path: str | None = None
+    script_call_issued = False
+
+    def respond_to_model(messages: list[Any]) -> Any:
+        nonlocal skill_md_path, script_call_issued
+        if skill_md_path is None:
+            system_prompt = str(
+                next(message.content for message in messages if message.type == "system")
+            )
+            path_match = re.search(
+                rf"(?P<skill_path>/[^\s`]*{re.escape(skill_name)}/SKILL\.md)",
+                system_prompt,
+            )
+            assert path_match is not None, system_prompt
+            skill_md_path = path_match.group("skill_path")
+            return ai_message(
+                content="",
+                tool_calls=[_read_file_call("read-skill-md", skill_md_path)],
+            )
+
+        if not script_call_issued:
+            assert any(
+                message.type == "tool" and "SKILL_MD_READ_MARKER" in str(message.content)
+                for message in messages
+            ), messages
+            script_call_issued = True
+            script_path = Path(skill_md_path).parent / "scripts" / "check.sh"
+            return ai_message(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "execute",
+                        "args": {"command": f"bash {shlex.quote(str(script_path))}"},
+                        "id": "execute-skill-script",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+
+        return ai_message(content="The skill script completed.")
+
+    # And an offline model that follows the advertised SKILL.md path with shell execution.
+    model, _model_inputs = _capturing_fake_chat_model(
+        [ai_message(content="unused")],
+        response_factory=respond_to_model,
+    )
+    provider = _real_deepagents_provider(monkeypatch, model)
+
+    # When the agent reads the discovered instructions and executes the skill script.
+    events = await _collect_events(
+        provider,
+        _base_options(cwd=str(tmp_path), tool_output_inspection_enabled=False),
+    )
+
+    # Then both the file and script tool results contain their expected markers.
+    tool_results = {
+        event.call_id: event.output for event in events if isinstance(event, ToolResultEvent)
+    }
+    assert "SKILL_MD_READ_MARKER" in tool_results["read-skill-md"]
+    execution_output = tool_results["execute-skill-script"]
+    assert "SKILL_SCRIPT_EXECUTED_MARKER" in execution_output, execution_output
 
 
 @pytest.mark.asyncio
