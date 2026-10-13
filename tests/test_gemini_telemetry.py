@@ -14,8 +14,6 @@ from opentelemetry.trace import SpanKind, StatusCode
 
 from lightspeed_agentic.providers.gemini import GeminiProvider
 from lightspeed_agentic.types import (
-    MAX_TOOL_RETURN_CHARS,
-    TOOL_RETURN_PREVIEW_CHARS,
     ContentBlockStopEvent,
     ProviderQueryOptions,
     ResultEvent,
@@ -124,7 +122,7 @@ async def test_runner_ends_generation_before_local_tool_and_records_trimmed_resu
     from google.genai import types
 
     monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
-    command = "printf '%05000d' 0"
+    command = "printf '%040000d' 0"
     tool_call = LlmResponse(
         content=types.Content(
             role="model",
@@ -191,9 +189,16 @@ async def test_runner_ends_generation_before_local_tool_and_records_trimmed_resu
     assert first.attributes["gen_ai.usage.reasoning.output_tokens"] == 0
 
     tool_result = json.loads(tool.attributes["gen_ai.tool.call.result"])
+    expected_tool_output = json.dumps(
+        {
+            "stdout": "0" * 40_000,
+            "stderr": "<no stderr captured>",
+            "returncode": 0,
+        }
+    )
     assert tool_result["status"] == "truncated"
-    assert len(tool_result["preview"]) == TOOL_RETURN_PREVIEW_CHARS
-    assert tool_result["original_size"] > MAX_TOOL_RETURN_CHARS
+    assert tool_result["preview"] == expected_tool_output[:32_000]
+    assert tool_result["original_size"] == len(expected_tool_output)
 
     assert _messages(second) == [
         {

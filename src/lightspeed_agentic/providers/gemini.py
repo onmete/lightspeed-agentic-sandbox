@@ -16,8 +16,6 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
 from lightspeed_agentic.types import (
-    MAX_TOOL_RETURN_CHARS,
-    TOOL_RETURN_PREVIEW_CHARS,
     AgentProvider,
     ContentBlockStopEvent,
     ProviderEvent,
@@ -32,6 +30,8 @@ from lightspeed_agentic.types import (
 
 logger = logging.getLogger(__name__)
 
+GEMINI_MAX_TOOL_RETURN_CHARS = 32_000
+
 
 def _trim_tool_response(
     tool: Any,
@@ -42,14 +42,17 @@ def _trim_tool_response(
     """Replace oversized Gemini tool results with a bounded preview."""
     _ = tool, args, tool_context
     serialized = stringify(tool_response)
-    if len(serialized) <= MAX_TOOL_RETURN_CHARS:
+    if len(serialized) <= GEMINI_MAX_TOOL_RETURN_CHARS:
         return None
 
     return {
         "status": "truncated",
-        "preview": serialized[:TOOL_RETURN_PREVIEW_CHARS],
+        "preview": serialized[:GEMINI_MAX_TOOL_RETURN_CHARS],
         "original_size": len(serialized),
-        "message": "Tool output was truncated; request a narrower result if needed.",
+        "message": (
+            f"Tool output was truncated to {GEMINI_MAX_TOOL_RETURN_CHARS} characters; "
+            "request a narrower result if needed."
+        ),
     }
 
 
