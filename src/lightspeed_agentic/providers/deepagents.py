@@ -591,7 +591,7 @@ class DeepAgentsProvider(AgentProvider):
         parent_context = otel_context.get_current()
 
         from deepagents import create_deep_agent
-        from deepagents.backends import CompositeBackend, LocalShellBackend
+        from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 
         from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
 
@@ -626,10 +626,15 @@ class DeepAgentsProvider(AgentProvider):
             max_output_bytes=MAX_TOOL_RETURN_CHARS,
         )
         skills_root = str(local_backend.cwd)
-        # Native physical paths; artifacts belong in the writable agent home.
+        # SDK-native skills layout: the skills root is a virtual CompositeBackend
+        # route, so file tools advertise /skills/<name>/... while the SDK's
+        # FilesystemMiddleware injects the virtual-to-host path mapping that the
+        # shell needs (deepagents #3050/#3762 pattern). The default backend keeps
+        # physical paths for general work; artifacts stay in the agent home.
+        skills_backend = FilesystemBackend(root_dir=skills_root, virtual_mode=True)
         backend = CompositeBackend(
             default=local_backend,
-            routes={},
+            routes={"/skills/": skills_backend},
             artifacts_root=os.path.join(os.environ.get("HOME", "/home/agent"), ".deepagents"),
         )
 
@@ -701,7 +706,7 @@ class DeepAgentsProvider(AgentProvider):
         )
 
         if has_skills(skills_root):
-            agent_kwargs["skills"] = [f"{skills_root}/"]
+            agent_kwargs["skills"] = ["/skills/"]
 
         schema_model: Any | None = None
         if options.output_schema:

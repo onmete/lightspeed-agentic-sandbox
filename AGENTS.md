@@ -139,8 +139,8 @@ src/lightspeed_agentic/
 
 | Feature | DeepAgents (`deepagents`) | Gemini (`google-adk`) | OpenAI (`openai-agents`) |
 | --- | --- | --- | --- |
-| Tools | `LocalShellBackend` + MCP tools | Native `ExecuteBashTool` plus built-in web tools | Native `SandboxAgent` shell/filesystem/skills |
-| Skills | Skills dirs passed to `create_deep_agent()` | Native `SkillToolset` | Native `Skills` capability |
+| Tools | `LocalShellBackend` (default) + `/skills/` `FilesystemBackend` route + MCP tools | Native `ExecuteBashTool` plus built-in web tools | Native `SandboxAgent` shell/filesystem/skills |
+| Skills | `/skills/` virtual route passed to `create_deep_agent()` | Native `SkillToolset` | Native `Skills` capability |
 | Structured output | `ProviderStrategy` when thinking configured, else `ToolStrategy` via `response_format` | Native response schema path | `output_type` wrapper |
 | Streaming | `astream(stream_mode="messages")` | `StreamingMode.SSE` | `Runner.run_streamed()` |
 

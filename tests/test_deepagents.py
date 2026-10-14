@@ -198,7 +198,7 @@ def _read_file_call(call_id: str, file_path: str) -> dict[str, Any]:
 @pytest.mark.parametrize("relative_cwd", [False, True])
 @pytest.mark.parametrize("delegate", [False, True])
 @pytest.mark.parametrize("skill_relative", [False, True])
-async def test_agent_reads_and_executes_skill_using_advertised_physical_paths(
+async def test_agent_reads_and_executes_skill_through_the_skills_route(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     relative_cwd: bool,
@@ -216,13 +216,17 @@ async def test_agent_reads_and_executes_skill_using_advertised_physical_paths(
     skill_md = skill_dir / "SKILL.md"
     skill_md.write_text("---\nname: shell-skill\ndescription: Run a script.\n---\nSKILL_READ\n")
 
+    # The model follows the SDK's advertised virtual path for file tools and the
+    # SDK-injected host mapping for the shell.
     command = (
         f"cd {shlex.quote(str(skill_dir))} && bash scripts/probe.sh expected"
         if skill_relative
         else f"bash {shlex.quote(str(script))} expected"
     )
     responses = [
-        ai_message(content="", tool_calls=[_read_file_call("read-skill", str(skill_md))]),
+        ai_message(
+            content="", tool_calls=[_read_file_call("read-skill", "/skills/shell-skill/SKILL.md")]
+        ),
         ai_message(
             content="",
             tool_calls=[
@@ -245,7 +249,7 @@ async def test_agent_reads_and_executes_skill_using_advertised_physical_paths(
                     {
                         "name": "task",
                         "args": {
-                            "description": f"Read {skill_md} and run its probe script.",
+                            "description": "Read the shell-skill instructions and run the probe.",
                             "subagent_type": "general-purpose",
                         },
                         "id": "delegate-script",
@@ -268,7 +272,8 @@ async def test_agent_reads_and_executes_skill_using_advertised_physical_paths(
     system_prompt = str(
         next(message.content for message in model_inputs[0] if message.type == "system")
     )
-    assert str(skill_md) in system_prompt
+    assert "/skills/shell-skill/SKILL.md" in system_prompt
+    assert f"`/skills/` -> `{skill_dir.parent}/`" in system_prompt
     tool_results = {
         event.call_id: event.output for event in events if isinstance(event, ToolResultEvent)
     }
@@ -295,7 +300,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
     """Scenario: A mounted skill is available to the agent.
 
     Given a skills root containing a skill and its reference file
-    When the agent runs and reads both files using advertised physical paths
+    When the agent runs and reads both files through the /skills/ virtual route
     Then the model receives the skill's name and description
     And the tool results contain the instructions and reference content.
     """
@@ -325,7 +330,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
                 tool_calls=[
                     _read_file_call(
                         "read-skill-md",
-                        str(skill_dir / "SKILL.md"),
+                        f"/skills/{skill_name}/SKILL.md",
                     )
                 ],
             ),
@@ -334,7 +339,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
                 tool_calls=[
                     _read_file_call(
                         "read-reference",
-                        str(reference_dir / "guide.md"),
+                        f"/skills/{skill_name}/references/guide.md",
                     )
                 ],
             ),
@@ -343,7 +348,7 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
     )
     provider = _real_deepagents_provider(monkeypatch, model)
 
-    # When the agent runs against that physical skills root.
+    # When the agent runs against that skills root.
     events = await _collect_events(
         provider,
         _base_options(cwd=str(tmp_path), tool_output_inspection_enabled=False),
@@ -355,9 +360,9 @@ async def test_agent_discovers_a_skill_and_reads_its_instructions_and_reference(
     )
     assert f"**{skill_name}**: {skill_description}" in system_prompt
 
-    assert str(skill_dir / "SKILL.md") in system_prompt
+    assert f"/skills/{skill_name}/SKILL.md" in system_prompt
 
-    # And both files are readable through the advertised physical paths.
+    # And both files are readable through the /skills/ virtual route.
     tool_results = {
         event.call_id: event.output for event in events if isinstance(event, ToolResultEvent)
     }
@@ -403,14 +408,17 @@ async def test_provider_shell_output_uses_32k_limit(
 
 
 @pytest.mark.asyncio
-async def test_provider_file_tools_use_absolute_host_paths_without_rebasing(
+async def test_provider_routes_skills_virtual_and_keeps_default_physical(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     deepagents = pytest.importorskip("deepagents")
     ai_message = pytest.importorskip("langchain_core.messages").AIMessage
     root = tmp_path / "skills"
-    root.mkdir()
+    (root / "probe-skill").mkdir(parents=True)
+    (root / "probe-skill" / "SKILL.md").write_text(
+        "---\nname: probe-skill\ndescription: Probe.\n---\nSKILL_MD"
+    )
     outside = tmp_path / "outside.txt"
     outside.write_text("OUTSIDE_CONTENT")
     model, _ = _capturing_fake_chat_model([ai_message(content="Done.")])
@@ -421,10 +429,16 @@ async def test_provider_file_tools_use_absolute_host_paths_without_rebasing(
         )
     backend = create.call_args.kwargs["backend"]
 
+    # The skills route is a virtual mount: readable through /skills/, host paths
+    # and traversal rejected.
+    assert backend.read("/skills/probe-skill/SKILL.md").file_data["content"].endswith("SKILL_MD")
+    with pytest.raises(ValueError, match="Path traversal not allowed"):
+        backend.read(f"/skills/{'../' * 8}outside.txt")
+
+    # The default backend stays physical for general agent work.
     assert backend.read(str(outside)).file_data["content"] == "OUTSIDE_CONTENT"
     assert backend.write("inside.txt", "INSIDE_CONTENT").error is None
     assert backend.read("inside.txt").file_data["content"] == "INSIDE_CONTENT"
-    assert backend.read(str(root / "inside.txt")).file_data["content"] == "INSIDE_CONTENT"
 
 
 @pytest.mark.asyncio

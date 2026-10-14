@@ -121,7 +121,7 @@ Each adapter is a thin wrapper. The SDK owns tool execution, skill discovery, an
 
 | Provider | SDK | Structured Output | Skills | Tools |
 |---|---|---|---|---|
-| DeepAgents | `deepagents` + `langchain-anthropic` | `ProviderStrategy` when thinking configured, else `ToolStrategy` via `response_format` | Skills dirs passed to `create_deep_agent()` | `LocalShellBackend` + MCP tools |
+| DeepAgents | `deepagents` + `langchain-anthropic` | `ProviderStrategy` when thinking configured, else `ToolStrategy` via `response_format` | `/skills/` virtual `CompositeBackend` route (SDK injects virtual→host mapping into prompt) | `LocalShellBackend` (default) + `/skills/` `FilesystemBackend` route + MCP tools |
 | Gemini | `google-adk` | Response schema on content config | `SkillToolset` from directory | `ExecuteBashTool` + web tools |
 | OpenAI | `openai-agents` | `output_type` wrapper | `Skills` capability | `SandboxAgent` shell/filesystem |
 
