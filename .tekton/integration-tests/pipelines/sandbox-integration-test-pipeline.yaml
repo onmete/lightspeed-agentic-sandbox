@@ -1,5 +1,6 @@
 ---
 # Keep tekton.dev/v1beta1 for the git-resolved StepActions used by this pipeline.
+# No-op change to exercise the Konflux E2E PR path.
 apiVersion: tekton.dev/v1beta1
 kind: Pipeline
 metadata:
